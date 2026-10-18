@@ -1,4 +1,4 @@
-# Hermetic
+# hermetic
 
 A status-bar popover for the [Hermes](https://github.com/NousResearch/hermes-agent) desktop app. It shows what your agent costs, where its calls go, and whether its skills and replies are getting better or worse.
 

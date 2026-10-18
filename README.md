@@ -5,9 +5,9 @@ A status-bar popover for the [Hermes](https://github.com/NousResearch/hermes-age
 It has two views in the same popover. The arrow at the top right switches between them.
 
 <p align="center">
-  <img src="docs/costs.png" alt="Costs view: spend, cache hit rate and pricing drift" width="400">
+  <img src="docs/hermetic-costs.png" alt="Costs view: spend, cache hit rate and pricing drift" width="400">
   &nbsp;
-  <img src="docs/aai.png" alt="AAI view: skill changes, rate limits and the actions that need you" width="400">
+  <img src="docs/hermetic-aai.png" alt="AAI view: skill changes, rate limits and the actions that need you" width="400">
 </p>
 
 ## Costs
@@ -17,9 +17,9 @@ It has two views in the same popover. The arrow at the top right switches betwee
 - Pricing drift: what you were billed compared with list prices.
 - **Providers** (OpenRouter): which providers actually served your calls, where they are based, and your routing rules, with an editor for them.
 <p align="center">
-  <img src="docs/providers.png" alt="Which model, providers and regions served your calls" width="400">
+  <img src="docs/hermetic-providers.png" alt="Which model, providers and regions served your calls" width="400">
   &nbsp;
-  <img src="docs/routing-rules.png" alt="OpenRouter routing rules editor" width="400">
+  <img src="docs/hermetic-routing-rules.png" alt="OpenRouter routing rules editor" width="400">
 </p>
 
 - **Improve**: one-click config fixes, for example routing to the cheapest provider, running background tasks on a cheaper model, or turning fallback on when calls fail on rate limits. Every fix shows the exact `config.yaml` change before it writes anything, and writes on top of the config as it is at that moment.
@@ -38,7 +38,7 @@ It has two views in the same popover. The arrow at the top right switches betwee
 - **Settings**: test skill changes automatically when the background review makes them (off, ask me, or revert), and grade replays with a judge model. Each skill's grading rubric is written from the skill itself the first time it is graded.
 
 <p align="center">
-  <img src="docs/aai-settings.png" alt="Changed skills and settings for automatic tests and the judge" width="400">
+  <img src="docs/hermetic-aai-settings.png" alt="Changed skills and settings for automatic tests and the judge" width="400">
 </p>
 
 Parts that only make sense with OpenRouter (provider routing, provider comparison, fallback) hide themselves when the profile does not use it. Spend, cache, sessions, ratings, corrections, the timeline and skill history work with any provider. Replays, fix drafts and the judge call models through OpenRouter, so they need an OpenRouter key set up in Hermes.

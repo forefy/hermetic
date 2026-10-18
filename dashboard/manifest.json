@@ -1,0 +1,10 @@
+{
+  "name": "hermetic",
+  "label": "Hermetic",
+  "description": "API routes for the hermetic desktop status-bar plugin",
+  "version": "1.0.0",
+  "tab": {
+    "hidden": true
+  },
+  "api": "plugin_api.py"
+}

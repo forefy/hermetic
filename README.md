@@ -58,7 +58,3 @@ cd hermetic
 | `plugin.yaml` | Package manifest |
 
 Check the package with `hermes plugins validate .`
-
-## License
-
-MIT

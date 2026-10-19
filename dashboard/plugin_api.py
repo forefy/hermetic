@@ -2138,3 +2138,422 @@ async def aai_job(id: str = Query(...), profile: Optional[str] = None):
     if not j:
         return {"done": True, "result": {"ok": False, "error": "This job is gone (Hermes may have restarted). Run it again."}}
     return {"done": j["done"], "result": j.get("result"), "secs": round(time.time() - j["ts"], 1)}
+
+
+# ==== HDR: harness detection and response, recording only ========================================
+# What the harness touched (files, domains, local services), what shapes every prompt, what runs on
+# its own, and the settings that decide how exposed it is. Read from Hermes' own records; nothing is
+# blocked or changed here.
+
+_HDR_URL = _aai_re.compile(r"https?://([A-Za-z0-9.-]+\.[A-Za-z]{2,})(?::\d+)?", _aai_re.I)
+_HDR_PATH = _aai_re.compile(r"(?<![\w.-])(~/[^\s'\"`|;&<>()]+|/(?:Users|tmp|private|etc|var|opt|Library|Applications|usr/local)[^\s'\"`|;&<>()]*)")
+_HDR_TLDS = {"com", "net", "org", "io", "dev", "ai", "app", "co", "me", "gov", "edu", "cloud", "tech", "xyz", "info", "biz",
+             "sh", "so", "gg", "ly", "to", "page", "site", "online", "example", "test", "local", "internal"}
+
+
+def _hdr_host_ok(h):
+    last = h.rsplit(".", 1)[-1].lower()
+    return len(last) == 2 or last in _HDR_TLDS
+
+
+def _hdr_op(cmd, raw):
+    """write when the command redirects into, edits, or copies onto this path; otherwise read."""
+    q = _aai_re.escape(raw)
+    if _aai_re.search(r"(>>?|\btee(\s+-a)?)\s*['\"]?" + q, cmd):
+        return "write"
+    if _aai_re.search(r"\b(rm|chmod|chown|touch|mkdir|truncate|sed\s+-i\S*)\b[^|;&\n]*" + q, cmd):
+        return "write"
+    for seg in _aai_re.split(r"[|;&\n]+", cmd):
+        toks = seg.split()
+        if toks and toks[0] in ("cp", "mv", "install", "rsync", "ln", "ditto") and toks[-1].strip("'\"") == raw:
+            return "write"
+    return "read"
+_HDR_SENSITIVE = [
+    ("~/.ssh", "SSH keys", 70), ("~/.aws", "cloud keys", 70), ("~/.gnupg", "signing keys", 70),
+    ("~/.config/gh", "GitHub login", 70), ("~/.netrc", "saved logins", 70), ("~/.docker/config.json", "registry logins", 70),
+    ("~/.kube", "cluster access", 70), ("~/Library/Keychains", "keychain", 80),
+    ("~/Library/LaunchAgents", "starts programs at login", 90), ("/Library/LaunchAgents", "starts programs at login", 90),
+    ("/Library/LaunchDaemons", "starts programs at boot", 95),
+    ("~/.zshrc", "runs in every shell", 85), ("~/.bashrc", "runs in every shell", 85), ("~/.zprofile", "runs in every shell", 85),
+    ("~/.bash_profile", "runs in every shell", 85), ("~/.profile", "runs in every shell", 85),
+    ("~/.hermes/auth.json", "Hermes logins", 75), ("~/.hermes/vault", "Hermes vault", 75), ("~/.hermes/.env", "Hermes keys", 75),
+    ("/etc/", "system settings", 60),
+]
+_HDR_CRED = {"SSH keys", "cloud keys", "signing keys", "GitHub login", "saved logins", "registry logins", "cluster access",
+             "keychain", "Hermes logins", "Hermes vault", "Hermes keys", "keys file"}
+_HDR_FILE_TOOLS = {"read_file": "read", "search_files": "read", "write_file": "write", "patch": "write"}
+
+
+def _hdr_yaml(path):
+    """A YAML file through Hermes' own loader (its venv has no PyYAML)."""
+    from utils import fast_safe_load
+    with open(path, encoding="utf-8") as f:
+        return fast_safe_load(f) or {}
+
+
+def _hdr_flatten(calls):
+    """(name, args) for every tool call, opening the batch wrapper `tool_call`."""
+    for t in calls if isinstance(calls, list) else []:
+        if not isinstance(t, dict):
+            continue
+        f = t.get("function") if isinstance(t.get("function"), dict) else t
+        name = f.get("name") or f.get("tool")
+        args = f.get("arguments", f.get("args"))
+        if isinstance(args, str):
+            try:
+                args = _aai_json.loads(args)
+            except Exception:
+                args = {"_raw": args}
+        args = args if isinstance(args, dict) else {}
+        if name == "tool_call" and isinstance(args.get("calls"), list):
+            yield from _hdr_flatten(args["calls"])
+            continue
+        yield name, args
+
+
+def _hdr_tilde(p):
+    home = os.path.expanduser("~")
+    p = str(p or "").strip().rstrip(".,:")
+    return "~" + p[len(home):] if p.startswith(home) else p
+
+
+def _hdr_root(p):
+    parts = p.split("/")
+    if p.startswith("~/"):
+        if len(parts) > 1 and parts[1].startswith("."):
+            return "~/" + parts[1]
+        return "/".join(parts[:3]) if len(parts) > 3 else "/".join(parts[:2])
+    if p.startswith("/private/") or p.startswith("/var/folders"):
+        return "/".join(parts[:3])
+    return "/" + (parts[1] if len(parts) > 1 else "")
+
+
+def _hdr_sensitive(p):
+    for prefix, why, score in _HDR_SENSITIVE:
+        if p == prefix or p.startswith(prefix.rstrip("/") + "/") or (prefix.endswith("/") and p.startswith(prefix)):
+            return why, score
+    if p.endswith("/.env") or p.endswith(".env") and "/" in p:
+        return "keys file", 70
+    return None
+
+
+def _hdr_calls(profile, since):
+    """(session_id, title, ts, tool, args, base_url) for every tool call since a time."""
+    db = _open_sessions_db(profile)
+    try:
+        c = db._conn
+        meta = {r[0]: (r[1] or r[0], r[2] or "") for r in c.execute("SELECT id, title, billing_base_url FROM sessions")}
+        rows = c.execute("SELECT session_id, tool_calls, timestamp FROM messages WHERE timestamp > ? AND tool_calls IS NOT NULL AND tool_calls != ''", (since,)).fetchall()
+    finally:
+        db.close()
+    for sid, tc, ts in rows:
+        try:
+            calls = _aai_json.loads(tc)
+        except Exception:
+            continue
+        title, base = meta.get(sid, (sid, ""))
+        for name, args in _hdr_flatten(calls):
+            yield sid, title, float(ts or 0), name, args, base
+
+
+def _hdr_touches(name, args):
+    """(paths with op, hosts) one tool call names."""
+    paths, hosts = [], set()
+    texts = []
+    if name in _HDR_FILE_TOOLS and args.get("path"):
+        paths.append((_hdr_tilde(args["path"]), _HDR_FILE_TOOLS[name]))
+    elif name == "terminal":
+        cmd = str(args.get("command") or "")
+        paths += [(_hdr_tilde(m.group(1)), _hdr_op(cmd, m.group(1))) for m in _HDR_PATH.finditer(cmd)]
+        if args.get("workdir"):
+            paths.append((_hdr_tilde(args["workdir"]), "workdir"))
+        texts.append(cmd)
+    elif name in ("execute_code", "browser_exec"):
+        code = str(args.get("code") or "")
+        paths += [(_hdr_tilde(m.group(1)), "code") for m in _HDR_PATH.finditer(code)]
+        texts.append(code)
+    else:
+        texts += [v if isinstance(v, str) else _aai_json.dumps(v) for v in args.values() if isinstance(v, (str, list))]
+    for t in texts:
+        hosts.update(h.lower() for h in _HDR_URL.findall(t) if _hdr_host_ok(h))
+    return paths, hosts
+
+
+def _hdr_services(calls):
+    """Listening TCP ports of processes started under Hermes, with the chat whose command named the port."""
+    import subprocess
+    try:
+        ps = subprocess.run(["ps", "-axo", "pid=,ppid=,command="], capture_output=True, text=True, timeout=5).stdout
+        ls = subprocess.run(["lsof", "-nP", "-iTCP", "-sTCP:LISTEN", "-F", "pcn"], capture_output=True, text=True, timeout=8).stdout
+    except Exception:
+        return []
+    procs = {}
+    for line in ps.splitlines():
+        parts = line.strip().split(None, 2)
+        if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
+            procs[int(parts[0])] = (int(parts[1]), parts[2] if len(parts) > 2 else "")
+
+    def under_hermes(pid):
+        for _ in range(40):
+            if pid not in procs:
+                return False
+            ppid, cmd = procs[pid]
+            if "/.hermes/" in cmd or "Hermes.app" in cmd:
+                return True
+            pid = ppid
+        return False
+
+    out, seen, pid = [], set(), None
+    for line in ls.splitlines():
+        if line.startswith("p"):
+            pid = int(line[1:]) if line[1:].isdigit() else None
+        elif line.startswith("n") and pid is not None and under_hermes(pid):
+            addr = line[1:]
+            if (pid, addr) in seen:
+                continue
+            seen.add((pid, addr))
+            cmd = procs.get(pid, (0, ""))[1]
+            port = addr.rsplit(":", 1)[-1]
+            by = None
+            for sid, title, ts, name, args, _b in calls:
+                if name == "terminal" and port in str(args.get("command") or "") and (by is None or ts > by[1]):
+                    by = (title, ts)
+            core = "hermes_cli" in cmd or "Hermes.app" in cmd or "web_server" in cmd
+            out.append({"addr": addr, "port": port, "pid": pid, "command": cmd[:140], "hermes": core,
+                        "exposed": addr.startswith("*:") or addr.startswith("0.0.0.0") or addr.startswith("[::]"),
+                        "chat": by[0] if by else None, "since": by[1] if by else None})
+    out.sort(key=lambda s: (s["hermes"], s["port"]))
+    return out
+
+
+def _hdr_plugins(home, cfg):
+    """Enabled plugins and every installed user plugin: hooks and middleware declared vs registered."""
+    pl = cfg.get("plugins") or {}
+    enabled, disabled = set(pl.get("enabled") or []), set(pl.get("disabled") or [])
+    roots = [(home / "plugins", "installed")]
+    try:
+        import hermes_cli as _hc
+        roots.append((Path(_hc.__file__).resolve().parent.parent / "plugins", "bundled"))
+    except Exception:
+        pass
+    reg_hook = _aai_re.compile(r"register_hook\(\s*['\"]([a-z_]+)['\"]")
+    reg_mw = _aai_re.compile(r"register_middleware\(\s*['\"]([a-z_]+)['\"]")
+    out, seen = [], set()
+    for root, origin in roots:
+        if not root.is_dir():
+            continue
+        for d in sorted(root.iterdir()):
+            man = d / "plugin.yaml"
+            if not man.exists():
+                continue
+            try:
+                meta = _hdr_yaml(man)
+            except Exception:
+                meta = {}
+            name = meta.get("name") or d.name
+            on = name in enabled and name not in disabled
+            if name in seen or (origin == "bundled" and not on):
+                continue
+            seen.add(name)
+            src = ""
+            for f in [d / "__init__.py"] + sorted(d.glob("*.py"))[:8]:
+                try:
+                    src += f.read_text(encoding="utf-8", errors="ignore")
+                except Exception:
+                    pass
+            hooks, mws = sorted(set(reg_hook.findall(src))), sorted(set(reg_mw.findall(src)))
+            declared_h, declared_m = set(meta.get("provides_hooks") or []), set(meta.get("provides_middleware") or [])
+            out.append({"name": name, "origin": origin, "enabled": on, "hooks": hooks, "middleware": mws,
+                        "undeclared": sorted((set(hooks) - declared_h) | (set(mws) - declared_m)),
+                        "desktop": (d / "desktop" / "plugin.js").exists() or (home / "desktop-plugins" / name).exists(),
+                        "shapes_prompt": bool({"pre_llm_call", "transform_tool_result", "transform_terminal_output", "transform_llm_output"} & set(hooks)) or bool({"llm_request", "tool_request"} & set(mws))})
+    return out
+
+
+def _hdr_watch(home, paths):
+    """Size and last change of files that go into every prompt; remembers their hash to date changes."""
+    import hashlib
+    state_p = _data_dir(home) / "hdr" / "files.json"
+    state_p.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        state = _aai_json.loads(state_p.read_text())
+    except Exception:
+        state = {}
+    out = []
+    for p in paths:
+        try:
+            data = p.read_bytes()
+        except Exception:
+            continue
+        sha = hashlib.sha256(data).hexdigest()[:16]
+        key = str(p)
+        prev = state.get(key)
+        if not prev:
+            state[key] = {"sha": sha, "changed": None, "first": time.time()}
+        elif prev["sha"] != sha:
+            state[key] = {"sha": sha, "changed": time.time(), "first": prev.get("first")}
+        out.append({"file": _hdr_tilde(key), "bytes": len(data), "modified": p.stat().st_mtime, "changed": state[key]["changed"]})
+    state_p.write_text(_aai_json.dumps(state))
+    return out
+
+
+def _hdr_posture(cfg):
+    g, b, t = cfg.get("gateway") or {}, cfg.get("browser") or {}, cfg.get("terminal") or {}
+    api = g.get("api_server") if isinstance(g.get("api_server"), dict) else {}
+    plats = [k for k, v in (cfg.get("platforms") or {}).items() if isinstance(v, dict) and v.get("enabled")]
+    mode = str((cfg.get("approvals") or {}).get("mode") or "manual")
+    allow = cfg.get("command_allowlist") or []
+    rows = [
+        {"key": "approvals", "label": "Approvals", "value": mode, "tone": "bad" if mode in ("off", "yolo") else "ok",
+         "why": "Nothing can ask you: every approval request, including a plugin's, is approved automatically." if mode in ("off", "yolo") else "Risky commands ask you first."},
+        {"key": "allowlist", "label": "Saved always-allow", "value": str(len(allow)), "tone": "warn" if allow else "ok", "items": [str(a)[:120] for a in allow],
+         "why": "Commands you allowed permanently; they never ask again."},
+        {"key": "terminal", "label": "Terminal", "value": str(t.get("backend") or "local"), "tone": "warn" if (t.get("backend") or "local") == "local" else "ok",
+         "why": "Commands run directly on this Mac, with your files and logins." if (t.get("backend") or "local") == "local" else "Commands run in a separate environment."},
+        {"key": "browser", "label": "Browser", "value": "your profile" if b.get("use_real_profile") else "separate profile", "tone": "warn" if b.get("use_real_profile") else "ok",
+         "why": "The agent browses logged in as you." if b.get("use_real_profile") else "The agent's browser has its own logins."},
+        {"key": "inbound", "label": "Who can message it", "value": "anyone" if g.get("allow_all_users") else ("you, " + ", ".join(plats)) if plats else "only you",
+         "tone": "bad" if g.get("allow_all_users") else "warn" if plats else "ok", "why": "Messages from other people reach the agent." if g.get("allow_all_users") or plats else "Only you talk to it."},
+        {"key": "api", "label": "API server", "value": (str(api.get("host") or "on") if api.get("enabled") else "off"),
+         "tone": "bad" if api.get("enabled") and str(api.get("host") or "").startswith("0.") else "warn" if api.get("enabled") else "ok",
+         "why": "Other programs can drive the agent over HTTP." if api.get("enabled") else "No HTTP access from outside."},
+    ]
+    hooks = cfg.get("hooks") or {}
+    n = sum(len(v) if isinstance(v, list) else 1 for v in hooks.values()) if isinstance(hooks, dict) else 0
+    rows.append({"key": "shell_hooks", "label": "Shell hooks", "value": str(n), "tone": "warn" if n else "ok",
+                 "why": "Shell commands Hermes runs on its own events." if n else "No shell commands run on Hermes events."})
+    return rows
+
+
+@router.get("/hdr")
+async def hdr(days: int = Query(7, ge=1, le=90), profile: Optional[str] = None):
+    """Everything HDR shows, from Hermes' own records. Recording only."""
+    def _run():
+        from urllib.parse import urlparse
+        _n, home = _profile_home(profile)
+        cfg = _aai_load_cfg() if not profile or profile in ("default", "current") else {}
+        if profile and profile not in ("default", "current"):
+            try:
+                cfg = _hdr_yaml(home / "config.yaml")
+            except Exception:
+                cfg = {}
+        now = time.time()
+        since, learn = now - days * 86400, now - 90 * 86400
+        calls = list(_hdr_calls(profile, learn))
+        first_call = min((c[2] for c in calls), default=now)
+        learning = first_call > now - 7 * 86400
+
+        # where data went: tool calls that named a host, and the model endpoint of each chat
+        doms = {}
+        def dom(h, ts, via, title):
+            d = doms.setdefault(h, {"domain": h, "calls": 0, "via": set(), "chats": {}, "first": ts})
+            d["first"] = min(d["first"], ts)
+            if ts >= since:
+                d["calls"] += 1
+                d["via"].add(via)
+                d["chats"][title] = d["chats"].get(title, 0) + 1
+        files, sensitive = {}, []
+        mem_writes, skill_edits, subagents, vault = [], 0, 0, []
+        for sid, title, ts, name, args, base in calls:
+            paths, hosts = _hdr_touches(name, args)
+            for h in hosts:
+                dom(h, ts, name, title)
+            if ts < since:
+                continue
+            for p, op in paths:
+                r = _hdr_root(p)
+                files[r] = files.get(r, 0) + 1
+                s = _hdr_sensitive(p)
+                if s:
+                    # reading keys is risky in itself; reading startup or system folders is mostly inspection
+                    cred = s[0] in _HDR_CRED
+                    score = min(100, s[1] + 10) if op in ("write", "code") else (s[1] if cred else 30)
+                    sensitive.append({"path": p, "op": op, "tool": name, "chat": title, "ts": ts, "why": s[0], "score": score})
+            if name == "memory":
+                mem_writes.append({"ts": ts, "chat": title})
+            elif name == "skill_manage":
+                skill_edits += 1
+            elif name == "delegate_task":
+                subagents += len(args.get("tasks") or []) or 1
+            elif str(name).startswith("browser_vault"):
+                vault.append({"ts": ts, "chat": title, "tool": name})
+        db = _open_sessions_db(profile)
+        try:
+            for sid, title, base, n, started in db._conn.execute("SELECT id, title, billing_base_url, api_call_count, started_at FROM sessions WHERE started_at > ?", (learn,)):
+                host = (urlparse(base or "").hostname or "").lower()
+                if host:
+                    d = doms.setdefault(host, {"domain": host, "calls": 0, "via": set(), "chats": {}, "first": float(started or now)})
+                    d["first"] = min(d["first"], float(started or now))
+                    if float(started or 0) >= since:
+                        d["calls"] += int(n or 0)
+                        d["via"].add("model requests")
+                        d["chats"][title or sid] = d["chats"].get(title or sid, 0) + int(n or 0)
+        finally:
+            db.close()
+        upstream = sorted({r.get("upstream") for r in _aai_read(_data_dir(home) / "routing.jsonl") if r.get("ts", 0) > since and r.get("upstream")})
+        domains = []
+        for d in doms.values():
+            if not d["calls"]:
+                continue
+            d["via"] = sorted(d["via"])
+            d["new"] = (not learning) and d["first"] > now - 2 * 86400
+            d["chats"] = [{"title": k, "calls": v} for k, v in sorted(d["chats"].items(), key=lambda kv: -kv[1])[:8]]
+            if "model requests" in d["via"] and upstream and "openrouter" in d["domain"]:
+                d["passed_to"] = upstream
+            domains.append(d)
+        domains.sort(key=lambda d: (not d["new"], -d["calls"]))
+
+        # what runs on its own
+        jobs = []
+        try:
+            raw = _aai_json.loads((home / "cron" / "jobs.json").read_text())
+            for j in raw.get("jobs", raw) if isinstance(raw, dict) else raw:
+                created = j.get("created_at")
+                try:
+                    created = float(created) if created is not None and not isinstance(created, str) else __import__("datetime").datetime.fromisoformat(str(created).replace("Z", "+00:00")).timestamp()
+                except Exception:
+                    created = None
+                origin = j.get("origin")
+                jobs.append({"name": j.get("name") or j.get("id"), "schedule": j.get("schedule_display") or str(j.get("schedule") or ""),
+                             "enabled": j.get("enabled", True) and not j.get("paused_at"), "script": bool(j.get("script") or j.get("monitor_script")),
+                             "toolsets": j.get("enabled_toolsets") or [], "created": created, "new": bool(created and created > now - 2 * 86400),
+                             "origin": origin.get("kind") or origin.get("source") if isinstance(origin, dict) else (str(origin) if origin else None),
+                             "last_status": j.get("last_status")})
+        except Exception:
+            pass
+        try:
+            procs = _aai_json.loads((home / "processes.json").read_text())
+        except Exception:
+            procs = []
+        services = _hdr_services([c for c in calls if c[2] >= since])
+
+        # what shapes every prompt
+        watched = [home / "SOUL.md"] + sorted((home / "memories").glob("*"))[:12] if (home / "memories").is_dir() else [home / "SOUL.md"]
+        prompt_files = _hdr_watch(home, [p for p in watched if p.is_file() and not p.name.endswith(".lock")])
+        plugins = _hdr_plugins(home, cfg)
+
+        posture = _hdr_posture(cfg)
+        grouped = {}
+        for x in sensitive:
+            g = grouped.setdefault((x["path"], x["op"]), dict(x, times=0, chats=[]))
+            g["times"] += 1
+            g["ts"] = max(g["ts"], x["ts"])
+            if x["chat"] not in g["chats"]:
+                g["chats"].append(x["chat"])
+        sensitive = sorted(grouped.values(), key=lambda s: (-s["score"], -s["ts"]))
+        roots = sorted(files.items(), key=lambda kv: -kv[1])
+        return {
+            "days": days, "learning": learning, "learning_since": first_call,
+            "posture": posture,
+            "domains": domains,
+            "files": {"roots": [{"root": r, "touches": n} for r, n in roots[:12]], "total": sum(files.values()), "sensitive": sensitive[:30]},
+            "runs": {"jobs": jobs, "processes": procs if isinstance(procs, list) else [], "services": services, "subagents": subagents},
+            "prompt": {"files": prompt_files, "memory_writes": mem_writes[-20:], "skill_edits": skill_edits,
+                       "shapers": [p["name"] for p in plugins if p["enabled"] and p["shapes_prompt"]]},
+            "plugins": plugins,
+            "secrets": {"vault": vault[-20:], "sensitive_reads": [s for s in sensitive if s["op"] in ("read", "code")][:10]},
+        }
+    try:
+        return await asyncio.to_thread(_run)
+    except Exception as exc:
+        return {"error": f"{type(exc).__name__}: {exc}"[:240]}

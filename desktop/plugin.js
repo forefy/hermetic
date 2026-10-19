@@ -2525,6 +2525,132 @@ const AaiView2 = ({ profile, period, yaml, orProfile, auxOn, onChanged }) => {
     el(Section, { id: 'aai2-settings', title: 'Settings' }, el(AaiSettings, { profile, ratings })))
 }
 
+// ---- HDR: harness detection and response (recording only) ----------------------------------------
+const HDR_TONE = { bad: C.bad, warn: C.warn, ok: C.ok }
+const hdrScore = s => el('span', { style: { display: 'inline-flex', alignItems: 'center', gap: 5, flex: 'none' } },
+  el('span', { style: { width: 44, height: 5, borderRadius: 3, background: 'rgba(255,255,255,.07)', overflow: 'hidden', display: 'inline-block' } },
+    el('i', { style: { display: 'block', height: '100%', width: s + '%', background: s >= 80 ? C.bad : s >= 50 ? C.warn : C.ok } })),
+  el('span', { style: { fontSize: 10.5, color: s >= 80 ? C.bad : s >= 50 ? C.warn : C.ok, width: 18, textAlign: 'right' } }, s))
+const hdrLine = (key, ...kids) => el('div', { key, style: { display: 'flex', alignItems: 'center', gap: 8, fontSize: 11.5, padding: '5px 0', borderTop: '1px solid ' + C.stroke, minWidth: 0 } }, ...kids)
+const hdrGrow = (main, sub) => el('span', { style: { flex: 1, minWidth: 0 } },
+  el('div', { style: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: C.text } }, main),
+  sub ? el('div', { style: { fontSize: 10.5, color: C.dim, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, sub) : null)
+const hdrTag = (t, col) => el('span', { style: { fontSize: 10, padding: '1px 6px', borderRadius: 8, border: '1px solid ' + (col || C.stroke), color: col || C.sub, flex: 'none', whiteSpace: 'nowrap' } }, t)
+const hdrMore = (list, n, open, setOpen) => list.length > n ? el(ALink, { onClick: () => setOpen(!open) }, open ? 'show less' : 'show all ' + list.length) : null
+
+const HdrPosture = ({ rows }) => el('div', null, rows.map(r =>
+  el('div', { key: r.key, style: { padding: '6px 0', borderTop: '1px solid ' + C.stroke } },
+    el('div', { style: { display: 'flex', alignItems: 'center', gap: 8, fontSize: 11.5 } },
+      el(Dot, { tone: r.tone }), el('span', { style: { flex: 1, color: C.text } }, r.label), el('span', { style: { color: HDR_TONE[r.tone] || C.sub } }, r.value)),
+    el('div', { style: { fontSize: 10.5, color: C.dim, marginLeft: 15, marginTop: 2, lineHeight: 1.4 } }, r.why),
+    (r.items || []).map((x, i) => el('div', { key: i, className: 'mono', style: { fontSize: 10.5, color: C.sub, marginLeft: 15, marginTop: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, x)))))
+
+const HdrDomains = ({ list }) => {
+  const [open, setOpen] = useState(null)
+  const [all, setAll] = useState(false)
+  if (!list.length) return aSmall('No destinations recorded in this period')
+  return el('div', null,
+    list.slice(0, all ? 80 : 10).map(d => el('div', { key: d.domain },
+      el('div', { onClick: () => setOpen(open === d.domain ? null : d.domain), style: { cursor: 'pointer' } },
+        hdrLine(d.domain, el('span', { style: { width: 7, height: 7, borderRadius: 4, flex: 'none', background: d.new ? C.warn : C.ok } }),
+          hdrGrow(d.domain, d.via.join(', ')), d.new ? hdrTag('new', C.warn) : null,
+          el('span', { style: { width: 46, textAlign: 'right', color: C.sub, fontVariantNumeric: 'tabular-nums', paddingRight: 4 } }, d.calls.toLocaleString()))),
+      open === d.domain
+        ? el('div', { style: { margin: '0 0 6px 15px' } },
+            d.passed_to ? el('div', { style: { fontSize: 10.5, color: C.sub, marginBottom: 3 } }, 'OpenRouter passed them on to ' + d.passed_to.join(', ')) : null,
+            d.chats.map(c => el('div', { key: c.title, style: { display: 'flex', fontSize: 10.5, color: C.dim, padding: '1px 0' } }, el('span', { style: { flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, '↳ ' + c.title), c.calls)))
+        : null)),
+    hdrMore(list, 10, all, setAll),
+    el('div', { style: { fontSize: 10.5, color: C.dim, marginTop: 6 } }, 'Click a destination for the chats that reached it.'))
+}
+
+const HdrFiles = ({ files }) => {
+  const [all, setAll] = useState(false)
+  const max = Math.max(1, ...files.roots.map(r => r.touches))
+  return el('div', null,
+    el('div', { style: { fontSize: 10.5, color: C.dim, marginBottom: 4 } }, 'Where tools worked, ' + files.total.toLocaleString() + ' touches'),
+    files.roots.map(r => hdrLine(r.root, el('span', { className: 'mono', style: { flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 10.5, color: C.text } }, r.root),
+      el('span', { style: { width: 80, height: 5, borderRadius: 3, background: 'rgba(255,255,255,.06)', overflow: 'hidden', flex: 'none' } }, el('i', { style: { display: 'block', height: '100%', width: (r.touches / max) * 100 + '%', background: C.sub, opacity: 0.6 } })),
+      el('span', { style: { width: 40, textAlign: 'right', color: C.sub, paddingRight: 4 } }, r.touches.toLocaleString()))),
+    el('div', { style: { fontSize: 10.5, color: C.dim, margin: '10px 0 4px' } }, files.sensitive.length ? 'Sensitive places' : 'No sensitive places touched'),
+    files.sensitive.slice(0, all ? 30 : 6).map((s, i) => hdrLine('s' + i,
+      hdrGrow(el('span', { className: 'mono', style: { fontSize: 10.5 } }, s.path), s.op + ' by ' + s.tool + (s.times > 1 ? ', ' + s.times + ' times' : '') + ' in ' + s.chats.slice(0, 2).join(', ') + ', ' + s.why),
+      hdrScore(s.score))),
+    hdrMore(files.sensitive, 6, all, setAll))
+}
+const HdrRuns = ({ runs }) => {
+  const groups = {}
+  for (const s of runs.services) { const k = s.command.split(/\s+/)[0].split('/').pop() || 'process'; (groups[k] = groups[k] || []).push(s) }
+  return el('div', null,
+    el('div', { style: { fontSize: 10.5, color: C.dim, marginBottom: 4 } }, 'Scheduled jobs'),
+    runs.jobs.length ? runs.jobs.map(j => hdrLine(j.name, el(Dot, { tone: j.new ? 'warn' : j.enabled ? 'ok' : null }),
+      hdrGrow(j.name, j.schedule + (j.toolsets.length ? ', tools: ' + j.toolsets.slice(0, 4).join(', ') : '') + (j.last_status ? ', last ' + j.last_status : '')),
+      j.script ? hdrTag('runs a script', C.warn) : null, j.new ? hdrTag('new', C.warn) : null, hdrTag(j.enabled ? 'on' : 'paused'))) : aSmall('None'),
+    el('div', { style: { fontSize: 10.5, color: C.dim, margin: '10px 0 4px' } }, 'Local services started under Hermes'),
+    Object.keys(groups).length ? Object.entries(groups).map(([k, list]) => hdrLine(k,
+      el(Dot, { tone: list.some(s => s.exposed) ? 'bad' : list.some(s => s.hermes) ? 'ok' : null }),
+      hdrGrow(list.some(s => s.hermes) ? 'Hermes backend' : k, list.map(s => s.port).join(', ') + (list.find(s => s.chat) ? ', from chat "' + list.find(s => s.chat).chat + '"' : '')),
+      list.some(s => s.exposed) ? hdrTag('open to network', C.bad) : null,
+      el('span', { style: { color: C.sub, paddingRight: 4 } }, list.length))) : aSmall('None'),
+    el('div', { style: { display: 'flex', gap: 14, fontSize: 10.5, color: C.dim, marginTop: 10 } },
+      el('span', null, runs.subagents + ' subagents this period'), el('span', null, runs.processes.length + ' background processes')))
+}
+
+const HdrPrompt = ({ prompt }) => el('div', null,
+  el('div', { style: { fontSize: 10.5, color: C.dim, marginBottom: 4 } }, 'Files sent with every prompt'),
+  prompt.files.map(f => hdrLine(f.file, el(Dot, { tone: f.changed ? 'warn' : 'ok' }),
+    hdrGrow(el('span', { className: 'mono', style: { fontSize: 10.5 } }, f.file), (f.bytes / 1000).toFixed(1) + ' KB, edited ' + ago(f.modified)),
+    f.changed ? hdrTag('changed ' + ago(f.changed), C.warn) : null)),
+  el('div', { style: { fontSize: 10.5, color: C.dim, margin: '10px 0 4px' } }, 'Written by chats this period'),
+  hdrLine('mem', hdrGrow('Memory', prompt.memory_writes.length ? [...new Set(prompt.memory_writes.map(w => w.chat))].slice(0, 3).join(', ') : 'no writes'), el('span', { style: { color: C.sub, paddingRight: 4 } }, prompt.memory_writes.length)),
+  hdrLine('sk', hdrGrow('Skills', 'edits made from chats'), el('span', { style: { color: C.sub, paddingRight: 4 } }, prompt.skill_edits)),
+  el('div', { style: { fontSize: 10.5, color: C.dim, margin: '10px 0 4px' } }, 'Plugins that can rewrite prompts or tool results'),
+  hdrLine('sh', hdrGrow(prompt.shapers.join(', ') || 'none'), null))
+
+const HdrPlugins = ({ list }) => el('div', null, list.map(p => hdrLine(p.name, el(Dot, { tone: p.undeclared.length ? 'bad' : p.enabled ? 'ok' : null }),
+  hdrGrow(p.name + (p.origin === 'bundled' ? '  (built in)' : ''), [p.hooks.length ? p.hooks.length + ' hooks: ' + p.hooks.join(', ') : 'no hooks', p.middleware.length ? 'middleware: ' + p.middleware.join(', ') : ''].filter(Boolean).join('; ')),
+  p.undeclared.length ? el(Tip, { label: 'Registers without declaring: ' + p.undeclared.join(', ') }, hdrTag('undeclared', C.bad)) : null,
+  p.desktop ? hdrTag('desktop') : null, hdrTag(p.enabled ? 'on' : 'off', p.enabled ? C.ok : null))))
+
+const HdrSecrets = ({ secrets }) => el('div', null,
+  hdrLine('v', hdrGrow('Browser vault', secrets.vault.length ? [...new Set(secrets.vault.map(v => v.chat))].slice(0, 3).join(', ') : 'not used'), el('span', { style: { color: secrets.vault.length ? C.warn : C.sub, paddingRight: 4 } }, secrets.vault.length)),
+  secrets.sensitive_reads.filter(s => s.score >= 70).map((s, i) => hdrLine('r' + i, hdrGrow(el('span', { className: 'mono', style: { fontSize: 10.5 } }, s.path), s.why + ', ' + s.chats.slice(0, 2).join(', ')), hdrScore(s.score))))
+
+const HdrView = ({ profile, period }) => {
+  const days = AAI_DAYS[period] || 7
+  const [d, setD] = useState(null)
+  const [err, setErr] = useState(null)
+  useEffect(() => {
+    let live = true
+    api(profileReq(profile, { path: '/api/plugins/hermetic/hdr?days=' + days }))
+      .then(r => live && (r && r.error ? setErr(r.error) : (setD(r), setErr(null))))
+      .catch(e => live && setErr(/404|Not Found/i.test(String(e && e.message)) ? 'Restart Hermes to load HDR: Hermes menu, Quit and Keep Windows, then reopen.' : (e && e.message) || 'Backend plugin off'))
+    return () => { live = false }
+  }, [profile, days])
+  if (err) return el('div', { style: { fontSize: 11, color: C.faint, marginTop: 14 } }, err)
+  if (!d) return el('div', { style: { fontSize: 11, color: C.faint, marginTop: 14 } }, 'Loading…')
+  const issues = d.posture.filter(p => p.tone !== 'ok')
+  const newDom = d.domains.filter(x => x.new).length
+  const risky = d.files.sensitive.filter(s => s.score >= 70)
+  const exposed = d.runs.services.filter(s => s.exposed).length
+  const sub = t => el('span', { style: { fontSize: 11, fontWeight: 400, color: C.dim, marginLeft: 5 } }, t)
+  const dots = list => el('span', { style: { display: 'flex', alignItems: 'center', gap: 4 } }, list.map((t, i) => el('span', { key: i, style: { width: 6, height: 6, borderRadius: 3, background: HDR_TONE[t] || C.dim } })))
+  return el('div', null,
+    el('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0,1fr))', gap: 8, marginTop: 14 } },
+      el(Cell, { tone: issues.some(p => p.tone === 'bad') ? 'bad' : issues.length ? 'warn' : 'ok', label: 'Posture', value: String(issues.length), sub: sub(issues.length === 1 ? 'setting to look at' : 'settings to look at'), tip: issues.map(p => p.label + ': ' + p.value).join(', ') || 'All settings look safe' }),
+      el(Cell, { tone: newDom ? 'warn' : 'ok', label: 'Destinations', value: String(d.domains.length), sub: sub(newDom + ' new'), tip: 'Hosts that model requests and tools reached in this period; new = first seen in the last 2 days' }),
+      el(Cell, { tone: risky.length ? 'warn' : 'ok', label: 'Sensitive places', value: String(d.files.sensitive.length), sub: sub(risky.length + ' scored 70+'), tip: 'Keys, logins, startup folders and shell settings that tools read or wrote' }),
+      el(Cell, { tone: exposed ? 'bad' : 'ok', label: 'Runs on its own', value: String(d.runs.jobs.length + d.runs.services.length), sub: sub(d.runs.jobs.length + (d.runs.jobs.length === 1 ? ' job, ' : ' jobs, ') + d.runs.services.length + (d.runs.services.length === 1 ? ' port' : ' ports')), tip: 'Scheduled jobs and listening ports started under Hermes' })),
+    el(Section, { id: 'hdr-posture', title: 'Posture', right: dots(issues.map(p => p.tone)) }, el(HdrPosture, { rows: d.posture })),
+    el(Section, { id: 'hdr-net', title: 'Where data went', right: el('span', { style: { display: 'flex', gap: 8 } }, newDom ? el('span', { style: { color: C.warn } }, newDom + ' new') : null, String(d.domains.length)) }, el(HdrDomains, { list: d.domains })),
+    el(Section, { id: 'hdr-files', title: 'Files and folders', right: risky.length ? el('span', { style: { color: C.warn } }, risky.length + ' sensitive') : null }, el(HdrFiles, { files: d.files })),
+    el(Section, { id: 'hdr-runs', title: 'What runs on its own', right: exposed ? el('span', { style: { color: C.bad } }, exposed + ' open') : String(d.runs.jobs.length + d.runs.services.length) }, el(HdrRuns, { runs: d.runs })),
+    el(Section, { id: 'hdr-prompt', title: 'What shapes every prompt', right: d.prompt.files.some(f => f.changed) ? el('span', { style: { color: C.warn } }, 'changed') : null }, el(HdrPrompt, { prompt: d.prompt })),
+    el(Section, { id: 'hdr-plugins', title: 'Plugins and middleware', right: d.plugins.some(p => p.undeclared.length) ? el('span', { style: { color: C.bad } }, 'undeclared') : String(d.plugins.filter(p => p.enabled).length) }, el(HdrPlugins, { list: d.plugins })),
+    el(Section, { id: 'hdr-secrets', title: 'Secrets', right: d.secrets.vault.length ? el('span', { style: { color: C.warn } }, d.secrets.vault.length + ' vault uses') : null }, el(HdrSecrets, { secrets: d.secrets })),
+    el('div', { style: { fontSize: 10.5, color: C.dim, marginTop: 14, lineHeight: 1.45 } }, 'Recording only: nothing is blocked or changed. ' + (d.learning ? 'Still learning what is normal.' : '')))
+}
+
 const Body = ({ meter, prices, threshold, retries, yaml, profile, profileLabel, refresh, rates, defaultModel, account, onPeriod, cheapest, orProfile = true, orAny = true, view = 'costs', onView }) => {
   const currentId = useValue(host.state.focusedStoredSessionId) || null
   const [period, setPeriod] = useState(() => sget('period', '7d'))
@@ -2697,13 +2823,16 @@ const Body = ({ meter, prices, threshold, retries, yaml, profile, profileLabel, 
   const topPrice = m.top ? priceOf(prices, m.top.model) : null
   const cacheCheaper = topPrice && topPrice.cache > 0 && topPrice.in > topPrice.cache ? topPrice.in / topPrice.cache : null
 
-  // header shared by both views: title, period, and the arrow that switches Costs and AAI
+  // header shared by the views: title, period, a dot per view, and the arrow to the next one
   const cardStyle = { padding: 16, fontSize: 12, color: C.text, width: 400, maxWidth: '100%', height: 'min(480px, calc(100vh - 72px))', boxSizing: 'border-box', overflowY: 'auto', scrollbarGutter: 'stable', overscrollBehavior: 'contain' }
   const isAai = view === 'aai'
+  const VIEWS = [['costs', 'Costs', 'Spend, cache and provider routing'], ['aai', 'AAI', 'Skills, replies and tests'], ['hdr', 'HDR', 'What the harness touched and how exposed it is']]
+  const vi = Math.max(0, VIEWS.findIndex(v => v[0] === view))
+  const next = VIEWS[(vi + 1) % VIEWS.length]
   const head = el(
     'div',
     { style: { display: 'flex', alignItems: 'center', gap: 8 } },
-    el('span', { style: { fontSize: 11, color: C.sub } }, 'Hermetic', el('span', { style: { color: C.dim, marginLeft: 6 } }, isAai ? 'AAI' : 'Costs')),
+    el('span', { style: { fontSize: 11, color: C.sub } }, 'Hermetic', el('span', { style: { color: C.dim, marginLeft: 6 } }, VIEWS[vi][1])),
     el('span', { style: { flex: 1 } }),
     el(SegmentedControl, {
       value: period,
@@ -2714,16 +2843,20 @@ const Body = ({ meter, prices, threshold, retries, yaml, profile, profileLabel, 
         { id: '30d', label: '30d' }
       ]
     }),
+    el('span', { style: { display: 'inline-flex', gap: 4, alignItems: 'center' } },
+      VIEWS.map(([id, name, what], i) => el(Tip, { key: id, label: name + ': ' + what },
+        el('button', { type: 'button', 'aria-label': 'Show the ' + name + ' view', onClick: () => onView && onView(id), style: { width: 6, height: 6, padding: 0, border: 'none', borderRadius: 3, cursor: 'pointer', background: i === vi ? C.text : C.faint } })))),
     el(
       Tip,
-      { label: isAai ? 'Costs view' : 'AAI view: skills, routing changes and work to improve them' },
+      { label: next[1] + ': ' + next[2] },
       el(
         'button',
-        { type: 'button', 'aria-label': isAai ? 'Switch to Costs view' : 'Switch to AAI view', onClick: () => onView && onView(isAai ? 'costs' : 'aai'), className: 'hover:bg-(--ui-bg-tertiary) hover:text-(--ui-text-primary)', style: { width: 22, height: 22, display: 'inline-flex', alignItems: 'center', justifyContent: 'center', borderRadius: 5, border: 'none', background: 'transparent', color: C.sub, cursor: 'pointer', padding: 0 } },
-        el('svg', { width: 12, height: 12, viewBox: '0 0 16 16', 'aria-hidden': true }, el('path', { d: isAai ? 'm10 3-5 5 5 5' : 'm6 3 5 5-5 5', fill: 'none', stroke: 'currentColor', strokeWidth: 1.6, strokeLinecap: 'round', strokeLinejoin: 'round' }))
+        { type: 'button', 'aria-label': 'Switch to ' + next[1] + ' view', onClick: () => onView && onView(next[0]), className: 'hover:bg-(--ui-bg-tertiary) hover:text-(--ui-text-primary)', style: { width: 22, height: 22, display: 'inline-flex', alignItems: 'center', justifyContent: 'center', borderRadius: 5, border: 'none', background: 'transparent', color: C.sub, cursor: 'pointer', padding: 0 } },
+        el('svg', { width: 12, height: 12, viewBox: '0 0 16 16', 'aria-hidden': true }, el('path', { d: 'm6 3 5 5-5 5', fill: 'none', stroke: 'currentColor', strokeWidth: 1.6, strokeLinecap: 'round', strokeLinejoin: 'round' }))
       )
     )
   )
+  if (view === 'hdr') return el('div', { style: cardStyle }, head, el(HdrView, { profile, period }))
   if (isAai) return el('div', { style: cardStyle }, head, el(AaiView2, { profile, period, yaml, orProfile, auxOn: !!(meter.aux && meter.aux.enabled), onChanged: refresh }))
   return el(
     'div',

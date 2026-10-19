@@ -1,12 +1,12 @@
 """hermetic backend plugin (formerly openrouter-meter).
 
 Two halves:
-  * ``dashboard/plugin_api.py`` — a FastAPI router the dashboard mounts at
+  * ``dashboard/plugin_api.py`` - a FastAPI router the dashboard mounts at
     ``/api/plugins/hermetic/`` (account usage, per-session cost rows, provider routing rows).
-  * the ``post_api_request`` hook below — records which upstream provider OpenRouter routed each
+  * the ``post_api_request`` hook below - records which upstream provider OpenRouter routed each
     call to. Hermes only exposes that field at response time, so it is appended to
     ``$HERMES_HOME/hermetic/routing.jsonl`` (metadata only: no prompt or response text).
-  * the ``llm_request`` middleware below — Hermes forwards only six ``provider_routing`` keys to
+  * the ``llm_request`` middleware below - Hermes forwards only six ``provider_routing`` keys to
     OpenRouter (only/ignore/order/sort/require_parameters/data_collection). This adds the rest of
     OpenRouter's provider-routing object from the same config block (and its ``models.<id>``
     overrides): allow_fallbacks, zdr, enforce_distillable_text, quantizations, max_price,
@@ -25,7 +25,7 @@ _KEEP_DAYS = 90
 
 # Self-check: the llm_request middleware notes every OpenRouter request id it sees; the recorder
 # marks each recorded call with whether that happened ("mw": 1/0). If a Hermes update stops calling
-# the middleware, the routing extras (zdr, fallback, ...) silently stop reaching OpenRouter — the
+# the middleware, the routing extras (zdr, fallback, ...) silently stop reaching OpenRouter - the
 # popover warns when recent calls carry mw=0.
 import collections
 import threading

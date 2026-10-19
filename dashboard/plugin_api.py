@@ -2412,7 +2412,7 @@ def _hdr_posture(cfg):
          "why": "Commands run directly on this Mac, with your files and logins." if (t.get("backend") or "local") == "local" else "Commands run in a separate environment."},
         {"key": "browser", "label": "Browser", "value": "your profile" if b.get("use_real_profile") else "separate profile", "tone": "warn" if b.get("use_real_profile") else "ok",
          "why": "The agent browses logged in as you." if b.get("use_real_profile") else "The agent's browser has its own logins."},
-        {"key": "inbound", "label": "Who can message it", "value": "anyone" if g.get("allow_all_users") else ("you, " + ", ".join(plats)) if plats else "only you",
+        {"key": "inbound", "label": "Inbound", "value": "anyone" if g.get("allow_all_users") else ("you, " + ", ".join(plats)) if plats else "only you",
          "tone": "bad" if g.get("allow_all_users") else "warn" if plats else "ok", "why": "Messages from other people reach the agent." if g.get("allow_all_users") or plats else "Only you talk to it."},
         {"key": "api", "label": "API server", "value": (str(api.get("host") or "on") if api.get("enabled") else "off"),
          "tone": "bad" if api.get("enabled") and str(api.get("host") or "").startswith("0.") else "warn" if api.get("enabled") else "ok",
@@ -2446,11 +2446,12 @@ async def hdr(days: int = Query(7, ge=1, le=90), profile: Optional[str] = None):
         # where data went: tool calls that named a host, and the model endpoint of each chat
         doms = {}
         def dom(h, ts, via, title):
-            d = doms.setdefault(h, {"domain": h, "calls": 0, "via": set(), "chats": {}, "first": ts})
+            d = doms.setdefault(h, {"domain": h, "calls": 0, "via": set(), "via_n": {}, "chats": {}, "first": ts})
             d["first"] = min(d["first"], ts)
             if ts >= since:
                 d["calls"] += 1
                 d["via"].add(via)
+                d["via_n"][via] = d["via_n"].get(via, 0) + 1
                 d["chats"][title] = d["chats"].get(title, 0) + 1
         files, sensitive = {}, []
         mem_writes, skill_edits, subagents, vault = [], 0, 0, []
@@ -2482,11 +2483,12 @@ async def hdr(days: int = Query(7, ge=1, le=90), profile: Optional[str] = None):
             for sid, title, base, n, started in db._conn.execute("SELECT id, title, billing_base_url, api_call_count, started_at FROM sessions WHERE started_at > ?", (learn,)):
                 host = (urlparse(base or "").hostname or "").lower()
                 if host:
-                    d = doms.setdefault(host, {"domain": host, "calls": 0, "via": set(), "chats": {}, "first": float(started or now)})
+                    d = doms.setdefault(host, {"domain": host, "calls": 0, "via": set(), "via_n": {}, "chats": {}, "first": float(started or now)})
                     d["first"] = min(d["first"], float(started or now))
                     if float(started or 0) >= since:
                         d["calls"] += int(n or 0)
                         d["via"].add("model requests")
+                        d["via_n"]["model requests"] = d["via_n"].get("model requests", 0) + int(n or 0)
                         d["chats"][title or sid] = d["chats"].get(title or sid, 0) + int(n or 0)
         finally:
             db.close()
@@ -2518,7 +2520,7 @@ async def hdr(days: int = Query(7, ge=1, le=90), profile: Optional[str] = None):
                              "enabled": j.get("enabled", True) and not j.get("paused_at"), "script": bool(j.get("script") or j.get("monitor_script")),
                              "toolsets": j.get("enabled_toolsets") or [], "created": created, "new": bool(created and created > now - 2 * 86400),
                              "origin": origin.get("kind") or origin.get("source") if isinstance(origin, dict) else (str(origin) if origin else None),
-                             "last_status": j.get("last_status")})
+                             "last_status": j.get("last_status"), "next_run": j.get("next_run_at"), "last_run": j.get("last_run_at")})
         except Exception:
             pass
         try:
@@ -2549,6 +2551,7 @@ async def hdr(days: int = Query(7, ge=1, le=90), profile: Optional[str] = None):
             "files": {"roots": [{"root": r, "touches": n} for r, n in roots[:12]], "total": sum(files.values()), "sensitive": sensitive[:30]},
             "runs": {"jobs": jobs, "processes": procs if isinstance(procs, list) else [], "services": services, "subagents": subagents},
             "prompt": {"files": prompt_files, "memory_writes": mem_writes[-20:], "skill_edits": skill_edits,
+                       "limits": {"MEMORY.md": (cfg.get("memory") or {}).get("memory_char_limit"), "USER.md": (cfg.get("memory") or {}).get("user_char_limit")},
                        "shapers": [p["name"] for p in plugins if p["enabled"] and p["shapes_prompt"]]},
             "plugins": plugins,
             "secrets": {"vault": vault[-20:], "sensitive_reads": [s for s in sensitive if s["op"] in ("read", "code")][:10]},

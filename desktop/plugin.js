@@ -2651,6 +2651,9 @@ const HdrView = ({ profile, period }) => {
     el('div', { style: { fontSize: 10.5, color: C.dim, marginTop: 14, lineHeight: 1.45 } }, 'Recording only: nothing is blocked or changed. ' + (d.learning ? 'Still learning what is normal.' : '')))
 }
 
+// direction of the view arrow, kept across renders (see the header in Body)
+let navDir = 1
+
 const Body = ({ meter, prices, threshold, retries, yaml, profile, profileLabel, refresh, rates, defaultModel, account, onPeriod, cheapest, orProfile = true, orAny = true, view = 'costs', onView }) => {
   const currentId = useValue(host.state.focusedStoredSessionId) || null
   const [period, setPeriod] = useState(() => sget('period', '7d'))
@@ -2828,7 +2831,13 @@ const Body = ({ meter, prices, threshold, retries, yaml, profile, profileLabel, 
   const isAai = view === 'aai'
   const VIEWS = [['costs', 'Costs', 'Spend, cache and provider routing'], ['aai', 'AAI', 'Skills, replies and tests'], ['hdr', 'HDR', 'What the harness touched and how exposed it is']]
   const vi = Math.max(0, VIEWS.findIndex(v => v[0] === view))
-  const next = VIEWS[(vi + 1) % VIEWS.length]
+  // one arrow on the right that keeps its direction and turns around at either end:
+  // Costs > AAI > HDR, then back AAI < Costs, then forward again
+  const dir = vi === 0 ? 1 : vi === VIEWS.length - 1 ? -1 : navDir
+  const to = VIEWS[vi + dir]
+  const arrow = (to, d) => el(Tip, { key: to[0], label: to[1] + ': ' + to[2] },
+    el('button', { type: 'button', 'aria-label': 'Switch to ' + to[1] + ' view', onClick: () => { navDir = dir; onView && onView(to[0]) }, className: 'hover:bg-(--ui-bg-tertiary) hover:text-(--ui-text-primary)', style: { width: 22, height: 22, display: 'inline-flex', alignItems: 'center', justifyContent: 'center', borderRadius: 5, border: 'none', background: 'transparent', color: C.sub, cursor: 'pointer', padding: 0 } },
+      el('svg', { width: 12, height: 12, viewBox: '0 0 16 16', 'aria-hidden': true }, el('path', { d, fill: 'none', stroke: 'currentColor', strokeWidth: 1.6, strokeLinecap: 'round', strokeLinejoin: 'round' }))))
   const head = el(
     'div',
     { style: { display: 'flex', alignItems: 'center', gap: 8 } },
@@ -2846,15 +2855,7 @@ const Body = ({ meter, prices, threshold, retries, yaml, profile, profileLabel, 
     el('span', { style: { display: 'inline-flex', gap: 4, alignItems: 'center' } },
       VIEWS.map(([id, name, what], i) => el(Tip, { key: id, label: name + ': ' + what },
         el('button', { type: 'button', 'aria-label': 'Show the ' + name + ' view', onClick: () => onView && onView(id), style: { width: 6, height: 6, padding: 0, border: 'none', borderRadius: 3, cursor: 'pointer', background: i === vi ? C.text : C.faint } })))),
-    el(
-      Tip,
-      { label: next[1] + ': ' + next[2] },
-      el(
-        'button',
-        { type: 'button', 'aria-label': 'Switch to ' + next[1] + ' view', onClick: () => onView && onView(next[0]), className: 'hover:bg-(--ui-bg-tertiary) hover:text-(--ui-text-primary)', style: { width: 22, height: 22, display: 'inline-flex', alignItems: 'center', justifyContent: 'center', borderRadius: 5, border: 'none', background: 'transparent', color: C.sub, cursor: 'pointer', padding: 0 } },
-        el('svg', { width: 12, height: 12, viewBox: '0 0 16 16', 'aria-hidden': true }, el('path', { d: 'm6 3 5 5-5 5', fill: 'none', stroke: 'currentColor', strokeWidth: 1.6, strokeLinecap: 'round', strokeLinejoin: 'round' }))
-      )
-    )
+    arrow(to, dir > 0 ? 'm6 3 5 5-5 5' : 'm10 3-5 5 5 5')
   )
   if (view === 'hdr') return el('div', { style: cardStyle }, head, el(HdrView, { profile, period }))
   if (isAai) return el('div', { style: cardStyle }, head, el(AaiView2, { profile, period, yaml, orProfile, auxOn: !!(meter.aux && meter.aux.enabled), onChanged: refresh }))

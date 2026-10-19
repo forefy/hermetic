@@ -1,8 +1,8 @@
 # hermetic
 
-A status-bar popover for the [Hermes](https://github.com/NousResearch/hermes-agent) desktop app. It shows what your agent costs, where its calls go, and whether its skills and replies are getting better or worse.
+A status-bar popover for the [Hermes](https://github.com/NousResearch/hermes-agent) desktop app. It shows what your agent costs, whether its skills and replies are getting better or worse, and what the harness itself touched.
 
-It has two views in the same popover. The arrow at the top right switches between them.
+It has three views in the same popover: Costs, AAI and HDR. The dots at the top right show which one you are on, and the arrow steps through them.
 
 <p align="center">
   <img src="docs/hermetic-costs.png" alt="Costs view: spend, cache hit rate and pricing drift" width="400">
@@ -43,6 +43,25 @@ It has two views in the same popover. The arrow at the top right switches betwee
 
 Parts that only make sense with OpenRouter (provider routing, provider comparison, fallback) hide themselves when the profile does not use it. Spend, cache, sessions, ratings, corrections, the timeline and skill history work with any provider. Replays, fix drafts and the judge call models through OpenRouter, so they need an OpenRouter key set up in Hermes.
 
+## HDR (harness detection and response)
+
+What the harness touched and how exposed it is. For now it records and shows; it does not block anything.
+
+<p align="center">
+  <img src="docs/hermetic-hdr.png" alt="HDR view: posture, destinations, sensitive places and what runs on its own" width="400">
+  &nbsp;
+  <img src="docs/hermetic-hdr-pipeline.png" alt="Where each plugin acts on a model request and on a tool call" width="400">
+</p>
+
+- **Posture**: the settings that decide how exposed you are. Approvals, commands you allowed permanently, whether the terminal runs directly on your machine, whether the browser uses your real profile, who can message the agent, the API server and shell hooks. One strip shows them all, and the worst one is spelled out.
+- **Where data went**: every host that model requests and tools reached. Tool traffic is drawn as a flow from tool kind to destination to known or new, and each host lists the chats behind it.
+- **Files and secrets**: where tools worked, and the sensitive places they touched (keys and logins, startup items, shell settings, system files, the browser vault), each scored. Reading keys scores high; writing to startup items scores highest.
+- **What runs on its own**: scheduled jobs with their schedule and next run, ports opened under Hermes and the chats that opened them, subagents and background processes.
+- **What shapes every prompt**: SOUL.md and the memory files against Hermes' own size limits, when each last changed, and memory and skill writes made from chats.
+- **Plugins and middleware**: where each enabled plugin acts on the path of a model request and of a tool call, and anything it registers without declaring it.
+
+Next: asking or blocking before a risky tool call runs, through Hermes' own approval prompt, and a low-cost judge that checks web pages and new skills before the model reads them.
+
 ## Install
 
 ```bash
@@ -62,6 +81,7 @@ cd hermetic
 ## Costs of its own and your data
 
 - Hermetic makes model calls only when you press replay, compare, draft or judge, or when you turn on automatic tests. Those use your own OpenRouter key through Hermes, follow your routing rules (zero data retention, no data collection), and appear in your spend like any other call. A replay costs about $0.01 per test. Automatic tests stop at $0.50 a day.
+- HDR reads Hermes' own records and runs `ps` and `lsof` locally to list ports. Nothing it finds leaves your machine.
 - Everything it records stays on your machine in `$HERMES_HOME/hermetic/` (ratings, tests, replay results, saved skill versions, routing history). No API key ever reaches the popover.
 
 ## Layout
@@ -72,5 +92,6 @@ cd hermetic
 | `__init__.py` | Hooks and middleware: per-call cost and routing records, provider errors, empty-reply debugging |
 | `dashboard/plugin_api.py` | Backend routes under `/api/plugins/hermetic/` |
 | `plugin.yaml` | Package manifest |
+| `tests/test_hdr.py` | HDR detection rules; run with the Python that runs Hermes: `python tests/test_hdr.py` |
 
 Check the package with `hermes plugins validate .`

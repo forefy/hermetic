@@ -878,7 +878,7 @@ function liveRates(prices, fallbackModel) {
 
 // ---- model ------------------------------------------------------------------
 
-function computeModel(data, period, hoverDay, prices, threshold, defaultModel) {
+function computeModel(data, period, hoverDay, prices, threshold, defaultModel, billed) {
   const pdata = (data.periods && data.periods[period]) || { aux: new Map(), byModel: new Map(), total: 0 }
   const days = period === 'today' ? lastNDays(1) : period === '7d' ? lastNDays(7) : lastNDays(DEFAULT_DAYS)
   const dayset = new Set(days)
@@ -886,7 +886,7 @@ function computeModel(data, period, hoverDay, prices, threshold, defaultModel) {
   const start = dayStart(hoverDay || days[0])
   const end = hoverDay ? dayStart(hoverDay) + 86400 : Infinity
 
-  const billedMap = sget('billed', null) || {}
+  const billedMap = billed || {}
   const series = days.map(d => ({ ...(data.daily.get(d) || { day: d, cost: 0, input: 0, output: 0, cache: 0, calls: 0, sessions: 0 }), billed: billedMap[d] != null ? billedMap[d] : null }))
   const periodCost = series.filter(r => focusDays.has(r.day)).reduce((a, r) => a + r.cost, 0)
   const periodCalls = series.filter(r => focusDays.has(r.day)).reduce((a, r) => a + r.calls, 0)
@@ -2964,7 +2964,22 @@ const Body = ({ meter, prices, threshold, retries, yaml, profile, profileLabel, 
   // a bar and swaps the headline figure, so moving the mouse never rebuilds the sections below.
   const focus = pinned
   const shown = hover || pinned
-  const m = useMemo(() => computeModel(meter, period, focus, prices, threshold, defaultModel), [meter, period, focus, prices, threshold, defaultModel])
+  // OpenRouter's daily bill, drawn over the bars only where it belongs: none for a profile that is not
+  // billed by OpenRouter; for one profile sharing the key, its part of each day's bill (its share of that
+  // day's OpenRouter list cost), like the headline
+  const billed = useMemo(() => {
+    if (account == null) return null
+    const raw = sget('billed', null) || {}
+    if (scope === 'all' || !meter.orDaily) return raw
+    const out = {}
+    for (const [day, usd] of Object.entries(raw)) {
+      const all = num((meter.orDaily.get(day) || {}).cost)
+      const mine = num((meter.daily.get(day) || {}).cost)
+      if (all > 0) out[day] = usd * Math.min(1, mine / all)
+    }
+    return out
+  }, [account, scope, meter])
+  const m = useMemo(() => computeModel(meter, period, focus, prices, threshold, defaultModel, billed), [meter, period, focus, prices, threshold, defaultModel, billed])
 
   const liveRate = rates.reduce((a, r) => a + r.rate, 0)
   const agents = rates.length
@@ -3008,7 +3023,7 @@ const Body = ({ meter, prices, threshold, retries, yaml, profile, profileLabel, 
   // days of the month before Monday. Recomputed on every load, never stored. Drawn dashed / striped.
   const estBilled = useMemo(() => {
     const out = {}
-    if (!account) return out
+    if (!account || (scope !== 'all' && meter.orDaily)) return out
     const weekStart = accountWindowStart('7d')
     const monthStart = accountWindowStart('30d')
     const fill = (rows, total) => {
@@ -3023,7 +3038,7 @@ const Body = ({ meter, prices, threshold, retries, yaml, profile, profileLabel, 
     fill(m.series.filter(r => r.day >= weekStart), account.week)
     fill(m.series.filter(r => r.day >= monthStart && r.day < weekStart), account.month != null && account.week != null ? Math.max(0, account.month - account.week) : null)
     return out
-  }, [m.series, account])
+  }, [m.series, account, scope, meter.orDaily])
   const driftTrend = m.series
     .filter(r => r.cost > 0.2 && (r.billed != null || estBilled[r.day] != null))
     .map(r => ({ v: (r.billed != null ? r.billed : estBilled[r.day]) / r.cost, est: r.billed == null }))

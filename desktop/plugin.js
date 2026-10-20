@@ -2898,6 +2898,7 @@ const HdrGuard = ({ g, profile, days, onChanged }) => {
     el('div', { style: { fontSize: 10.5, color: C.dim, marginTop: 8 } }, effect),
     g.level === 'ask' && guardNoAsk(g) ? el('div', { style: { marginTop: 8, padding: '7px 10px', borderRadius: 8, background: 'rgba(201,147,74,.1)', border: '1px solid rgba(201,147,74,.35)', fontSize: 11, color: C.sub, lineHeight: 1.45 } },
       el('span', { style: { color: C.warn } }, 'Approvals are off'), ', so Hermes can’t ask you and Ask lets the call through. Turn approvals to Smart or Ask me in Posture above.') : null,
+    g.level === 'ask' && !guardNoAsk(g) ? el('div', { style: { fontSize: 10.5, color: C.dim, marginTop: 4 } }, 'Scheduled jobs and other runs with nobody to ask treat Ask as Block.') : null,
     err ? el('div', { style: { fontSize: 10.5, color: C.bad, marginTop: 6 } }, err) : null,
     (g.stops || []).length ? el('div', { style: { marginTop: 10 } },
       hdrHead(g.stops.length === 1 ? 'Stopped once' : 'Stopped ' + g.stops.length + ' times'),

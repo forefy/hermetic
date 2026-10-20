@@ -101,8 +101,21 @@ Everything Hermetic records stays in `$HERMES_HOME/hermetic/` (ratings, tests, r
 | `__init__.py` | Hooks and middleware: per-call cost and routing records, provider errors, empty-reply debugging |
 | `dashboard/plugin_api.py` | Backend routes under `/api/plugins/hermetic/` |
 | `plugin.yaml` | Package manifest |
-| `tests/test_hdr.py` | HDR detection rules; run with the Python that runs Hermes: `python tests/test_hdr.py` |
-| `tests/test_credentials.py` | Hermetic's own model calls go through Hermes (`ctx.llm`, secret scope): `python tests/test_credentials.py` |
-| `tests/test_detect.mjs` | How a profile's provider is read from its config: `node tests/test_detect.mjs` |
+| `tests/test_hdr.py` | HDR detection rules |
+| `tests/test_credentials.py` | Hermetic's own model calls go through Hermes (`ctx.llm`, secret scope) |
+| `tests/test_detect.mjs` | How a profile's provider is read from its config |
+| `scripts/release.sh` | Tests, validates and pushes a release, then prints the catalog entry; `--pr` opens the catalog PR |
+| `catalog/hermetic.yaml.in` | Template for the catalog entry |
+
+Run the Python tests inside Hermes' environment, and the rest with node:
+
+```bash
+bash ~/.hermes/hermes-agent/scripts/run-in-hermes-env python3 tests/test_hdr.py
+node tests/test_detect.mjs
+```
 
 Check the package with `hermes plugins validate .`
+
+## Releasing
+
+Bump `version` in `plugin.yaml`, commit, then run `scripts/release.sh --pr`. It runs the tests and Hermes' validation, pushes, fills the catalog entry with the new commit, and opens the pin-bump PR on NousResearch/hermes-agent from your fork, asking before it pushes and before it opens the PR. Catalog users get the update once a maintainer merges it.

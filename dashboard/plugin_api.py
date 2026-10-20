@@ -2563,3 +2563,83 @@ async def hdr(days: int = Query(7, ge=1, le=90), profile: Optional[str] = None):
         return await asyncio.to_thread(_run)
     except Exception as exc:
         return {"error": f"{type(exc).__name__}: {exc}"[:240]}
+
+
+# ==== Updates: check and apply from the popover ===================================================
+# A git checkout (the dev-link setup) updates with a fast-forward pull; an install made by
+# `hermes plugins install` updates through Hermes' own plugin updater.
+
+def _upd_root():
+    return Path(__file__).resolve().parent.parent
+
+
+def _upd_run(args, cwd=None, timeout=60):
+    import subprocess
+    r = subprocess.run(args, cwd=cwd, capture_output=True, text=True, timeout=timeout)
+    return r.returncode, ((r.stdout or "") + (r.stderr or "")).strip()
+
+
+def _upd_hermes():
+    import shutil
+    import sys
+    exe = shutil.which("hermes")
+    if exe:
+        return [exe]
+    try:
+        import hermes_cli as _hc
+        local = Path(_hc.__file__).resolve().parent.parent / "hermes"
+        if local.exists():
+            return [str(local)]
+    except Exception:
+        pass
+    return [sys.executable, "-m", "hermes_cli.main"]
+
+
+def _upd_check():
+    root = _upd_root()
+    if (root / ".git").exists():
+        code, out = _upd_run(["git", "fetch", "--quiet"], cwd=root, timeout=30)
+        if code:
+            return {"ok": False, "mode": "git", "error": "Could not reach the repository"}
+        code, behind = _upd_run(["git", "rev-list", "--count", "HEAD..@{u}"], cwd=root)
+        if code:
+            return {"ok": False, "mode": "git", "error": "This checkout has no upstream branch"}
+        incoming = _upd_run(["git", "log", "--format=%s", "-n", "6", "HEAD..@{u}"], cwd=root)[1].splitlines()
+        dirty = bool(_upd_run(["git", "status", "--porcelain", "--untracked-files=no"], cwd=root)[1])
+        return {"ok": True, "mode": "git", "available": int(behind or 0) > 0, "behind": int(behind or 0),
+                "incoming": incoming, "dirty": dirty, "current": _upd_run(["git", "log", "-1", "--format=%h"], cwd=root)[1]}
+    code, out = _upd_run(_upd_hermes() + ["plugins", "check-updates", "--json"], timeout=120)
+    try:
+        rows = _aai_json.loads(out[out.index("["):])
+        me = next(r for r in rows if r.get("name") == _PLUGIN_NAME)
+    except Exception:
+        return {"ok": False, "mode": "hermes", "error": "Hermes could not check for updates"}
+    return {"ok": True, "mode": "hermes", "available": bool(me.get("update_available")),
+            "current": me.get("current"), "latest": me.get("latest"), "reason": me.get("reason")}
+
+
+def _upd_apply():
+    root = _upd_root()
+    if (root / ".git").exists():
+        if _upd_run(["git", "status", "--porcelain", "--untracked-files=no"], cwd=root)[1]:
+            return {"ok": False, "error": "This checkout has local changes; commit or stash them first"}
+        code, out = _upd_run(["git", "pull", "--ff-only", "--quiet"], cwd=root, timeout=120)
+        if code:
+            return {"ok": False, "error": "git pull failed: " + out[-200:]}
+        return {"ok": True, "current": _upd_run(["git", "log", "-1", "--format=%h"], cwd=root)[1], "restart": True}
+    code, out = _upd_run(_upd_hermes() + ["plugins", "update", _PLUGIN_NAME], timeout=300)
+    if code:
+        return {"ok": False, "error": "Hermes could not update the plugin: " + out[-200:]}
+    return {"ok": True, "restart": True}
+
+
+@router.post("/aai/update")
+async def aai_update(payload: Dict[str, Any] = Body(default={}), profile: Optional[str] = None):
+    """Check for a newer Hermetic, or apply it. Runs as a background job: both can take a while."""
+    fn = _upd_apply if (payload or {}).get("action") == "apply" else _upd_check
+    if (payload or {}).get("background"):
+        return _aai_spawn(fn)
+    try:
+        return await asyncio.to_thread(fn)
+    except Exception as exc:
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:240]}

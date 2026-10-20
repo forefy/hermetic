@@ -46,11 +46,13 @@ Hermetic turns itself on in your other Hermes profiles the first time the popove
 
 ## Update
 
+The bottom of the popover checks for a newer Hermetic once a day. When one is out, it says how many updates are available (hover for the list) and shows an **Update** button. Or from a terminal:
+
 ```bash
 hermes plugins update hermetic
 ```
 
-Then restart Hermes as in step 1.
+Either way, restart Hermes afterwards as in step 1.
 
 ## Remove
 

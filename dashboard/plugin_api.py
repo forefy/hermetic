@@ -103,11 +103,31 @@ def _profile_home(profile):
     raise ValueError(f"unknown profile {profile!r}")
 
 
+class _NoSessions:
+    """A profile that has not run a chat yet has no session store: nothing to list."""
+
+    def list_sessions_rich(self, **kw):
+        return []
+
+    def get_messages(self, *a, **kw):
+        return []
+
+    def get_session(self, *a):
+        return None
+
+    def auxiliary_usage_by_task(self, *a):
+        return {}
+
+    def close(self):
+        pass
+
+
 def _open_sessions_db(profile):
     """The profile's session store, read-only, through Hermes' public SessionDB."""
     from hermes_state import SessionDB
     _name, home = _profile_home(profile)
-    return SessionDB(home / "state.db", read_only=True)
+    path = home / "state.db"
+    return SessionDB(path, read_only=True) if path.exists() else _NoSessions()
 
 
 def _db_sessions(db, since=0.0):

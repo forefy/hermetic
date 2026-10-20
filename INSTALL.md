@@ -10,8 +10,10 @@ Hermes installs plugins switched off by default. The install command below turns
 ## Install
 
 ```bash
-hermes plugins install forefy/hermetic --enable
+hermes plugins install forefy/hermetic --enable --force
 ```
+
+Why `--force`: Hermes scans every plugin before installing it. Hermetic's HDR view watches sensitive places such as `~/.ssh`, cloud keys and startup folders, so its code names those paths, and the scan reads a list of them as a possible credential grab. That gives a "caution" verdict, which Hermes blocks for plugins from GitHub unless you pass `--force`. Hermetic never opens those files: it only checks whether a tool call touched them. The list is `_HDR_SENSITIVE` in `dashboard/plugin_api.py`, and you can read the scan yourself by running the command without `--force` first.
 
 Then:
 
@@ -37,6 +39,7 @@ Click it. A popover opens with **Hermetic Costs** at the top; the arrow at the t
 
 | What you see | Why | Fix |
 |---|---|---|
+| The install stops with "Blocked (community source + caution verdict)" | Hermes' install scan flags HDR's list of watched paths | Review the findings, then add `--force` as shown above |
 | The agent says it is installed, but there is no button | The Desktop half is off | Capabilities, Plugins, Hermetic: switch **Desktop** on |
 | The Plugins page shows "copying…" next to Desktop | Hermes has not restarted since the install | Quit and Keep Windows, then open Hermes |
 | The button is there, but AAI or HDR asks you to restart | The backend is not loaded in this profile | Restart Hermes, and check that **Agent** is on for this profile |

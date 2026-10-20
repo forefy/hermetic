@@ -2,7 +2,7 @@
 
 A status-bar popover for the [Hermes](https://github.com/NousResearch/hermes-agent) desktop app. It shows what your agent costs, whether its skills and replies are getting better or worse, and what the harness itself touched.
 
-**Install:** `hermes plugins install forefy/hermetic --enable`, then see [INSTALL.md](INSTALL.md) (two more steps and how to check it worked).
+**Install:** `hermes plugins install forefy/hermetic --enable --force`, then see [INSTALL.md](INSTALL.md) (why `--force`, two more steps, and how to check it worked).
 
 It has three views in the same popover: Costs, AAI and HDR. The dots at the top right show which one you are on, and the arrow steps through them.
 
@@ -67,10 +67,10 @@ Next: asking or blocking before a risky tool call runs, through Hermes' own appr
 ## Install
 
 ```bash
-hermes plugins install forefy/hermetic --enable
+hermes plugins install forefy/hermetic --enable --force
 ```
 
-Then restart Hermes and switch on Hermetic's **Desktop** half under Capabilities, Plugins. Hermes installs it switched off, so this is the step that makes the button appear. [INSTALL.md](INSTALL.md) has the steps, what you should see when it worked, and fixes for what can go wrong.
+`--force` is needed because Hermes' install scan flags the list of sensitive paths HDR watches; [INSTALL.md](INSTALL.md) explains it. Then restart Hermes and switch on Hermetic's **Desktop** half under Capabilities, Plugins. Hermes installs it switched off, so this is the step that makes the button appear. [INSTALL.md](INSTALL.md) has the steps, what you should see when it worked, and fixes for what can go wrong.
 
 ## Costs of its own and your data
 

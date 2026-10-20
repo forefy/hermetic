@@ -176,32 +176,52 @@ async function loadProfiles() {
   }
 }
 
-async function loadAnalytics(profiles, days) {
+async function loadAnalytics(profiles, days, prices) {
   const daily = new Map() // day -> merged record
   const aux = new Map() // model -> { task -> {input, output, cost} }
   const byModel = new Map() // model -> {input, output, cost, calls}
   let total = 0
+  const estimated = new Map() // model Hermes had no price for -> OpenRouter id it was priced at
+  let unpriced = false
   await Promise.all(
     profiles.map(async p => {
       try {
         const q = '/api/analytics/usage?days=' + days + (p.isDefault ? '' : '&profile=' + encodeURIComponent(p.name))
         const r = await api({ path: q })
+        // a profile Hermes priced at $0 despite tokens (custom endpoints): blend list prices of its models
+        const priced = ((r && r.daily) || []).reduce((a, d) => a + num(d.estimated_cost), 0) > 0
+        let blend = null
+        if (!priced) {
+          const w = { in: 0, out: 0, cache: 0, tin: 0, tout: 0, tcache: 0 }
+          for (const m of (r && r.by_model) || []) {
+            const id = priceIdOf(prices, m.model)
+            const pr = id ? prices[id] : null
+            const tin = num(m.input_tokens), tout = num(m.output_tokens), tc = num(m.cache_read_tokens)
+            if (!pr) { if (tin + tout + tc > 0) unpriced = true; continue }
+            if (tin + tout + tc > 0) estimated.set(m.model, id)
+            w.in += tin * pr.in; w.tin += tin
+            w.out += tout * pr.out; w.tout += tout
+            w.cache += tc * (pr.cache != null ? pr.cache : pr.in); w.tcache += tc
+          }
+          if (w.tin + w.tout + w.tcache > 0) blend = { in: w.tin ? w.in / w.tin : 0, out: w.tout ? w.out / w.tout : 0, cache: w.tcache ? w.cache / w.tcache : 0 }
+        }
         for (const d of (r && r.daily) || []) {
           const cur = daily.get(d.day) || { day: d.day, cost: 0, input: 0, output: 0, cache: 0, calls: 0, sessions: 0 }
-          cur.cost += num(d.estimated_cost)
+          const dayCost = num(d.estimated_cost) || (blend ? costAt(blend, d.input_tokens, d.output_tokens, d.cache_read_tokens) : 0)
+          cur.cost += dayCost
           cur.input += num(d.input_tokens)
           cur.output += num(d.output_tokens)
           cur.cache += num(d.cache_read_tokens)
           cur.calls += num(d.api_calls)
           cur.sessions += num(d.sessions)
           daily.set(d.day, cur)
-          total += num(d.estimated_cost)
+          total += dayCost
         }
         for (const m of (r && r.by_model) || []) {
           const cur = byModel.get(m.model) || { input: 0, output: 0, cost: 0, calls: 0 }
           cur.input += num(m.input_tokens)
           cur.output += num(m.output_tokens)
-          cur.cost += num(m.estimated_cost)
+          cur.cost += num(m.estimated_cost) || (!priced ? costAt(priceOf(prices, m.model), m.input_tokens, m.output_tokens, m.cache_read_tokens) || 0 : 0)
           cur.calls += num(m.api_calls)
           byModel.set(m.model, cur)
           for (const t of m.aux_tasks || []) {
@@ -220,11 +240,11 @@ async function loadAnalytics(profiles, days) {
       }
     })
   )
-  return { daily, aux, byModel, total }
+  return { daily, aux, byModel, total, estimated, unpriced }
 }
 
-async function loadAllAnalytics(profiles) {
-  const [d1, d7, d30] = await Promise.all([loadAnalytics(profiles, 1), loadAnalytics(profiles, 7), loadAnalytics(profiles, DEFAULT_DAYS)])
+async function loadAllAnalytics(profiles, prices) {
+  const [d1, d7, d30] = await Promise.all([loadAnalytics(profiles, 1, prices), loadAnalytics(profiles, 7, prices), loadAnalytics(profiles, DEFAULT_DAYS, prices)])
   return { daily: d30.daily, periods: { today: d1, '7d': d7, '30d': d30 } }
 }
 
@@ -775,7 +795,24 @@ async function loadAccount(sid) {
 
 // ---- pricing math -----------------------------------------------------------
 
-const priceOf = (prices, model) => prices[model] || null
+// Exact OpenRouter id first; otherwise the same model under another vendor prefix or casing, as a
+// custom endpoint names it ("deepinfra/DeepSeek-V4-Pro" -> "deepseek/deepseek-v4-pro").
+let priceTail = null
+let priceTailOf = null
+const priceIdOf = (prices, model) => {
+  if (!model || !prices) return null
+  if (prices[model]) return model
+  if (priceTailOf !== prices) {
+    priceTail = new Map()
+    priceTailOf = prices
+    for (const id of Object.keys(prices)) {
+      const t = id.split('/').pop().toLowerCase()
+      if (!priceTail.has(t)) priceTail.set(t, id)
+    }
+  }
+  return priceTail.get(String(model).split('/').pop().toLowerCase()) || null
+}
+const priceOf = (prices, model) => { const id = priceIdOf(prices, model); return id ? prices[id] : null }
 const costAt = (p, input, output, cache) =>
   p ? (num(input) * p.in + num(output) * p.out + num(cache) * (p.cache != null ? p.cache : p.in)) / 1e6 : null
 
@@ -1089,7 +1126,7 @@ function useMeterData() {
       const scoped = scope === 'all' ? profiles : profiles.filter(p => p.name === profile)
       const shown = scoped.length ? scoped : profiles
       const [analytics, sessionsResult, retries, account, routingAll, aux, billedHistory, health] = await Promise.all([
-        loadAllAnalytics(shown),
+        loadAllAnalytics(shown, prices),
         loadSessions(profiles),
         loadRetries(lastNDays(DEFAULT_DAYS)[0]),
         loadAccount(sidRef.current),
@@ -1098,6 +1135,12 @@ function useMeterData() {
         loadBilledHistory(),
         loadHealth()
       ])
+      for (const x of sessionsResult.sessions) {
+        if (!x.cost && x.input + x.output + x.cache > 0) {
+          const c = costAt(priceOf(prices, x.model), x.input, x.output, x.cache)
+          if (c) { x.cost = c; x.estimated = true }
+        }
+      }
       const inScope = new Set(shown.map(p => p.name))
       const routing = { ...routingAll, rows: routingAll.rows.filter(r => inScope.has(r.profile)) }
       // OpenRouter-only parts show for a profile that routes through OpenRouter (or, on "auto",
@@ -1115,7 +1158,7 @@ function useMeterData() {
       // OpenRouter bills the whole key, so the bill is compared with every profile that uses it
       const orList = profiles.filter(p => orNames.has(p.name))
       const sameSet = orList.length === shown.length && orList.every(p => inScope.has(p.name))
-      const orAnalytics = account && orList.length && !sameSet ? await loadAllAnalytics(orList) : null
+      const orAnalytics = account && orList.length && !sameSet ? await loadAllAnalytics(orList, prices) : null
       const topModel = (sessionsResult.sessions.slice().sort((a, b) => b.cost - a.cost)[0] || {}).model || ''
       const routeModels = Array.from(
         new Set(
@@ -2947,6 +2990,8 @@ const Body = ({ meter, prices, threshold, retries, yaml, profile, profileLabel, 
   // all profiles get the bill plus the list cost of profiles billed elsewhere
   const share = acct != null && !!meter.orDaily && scope !== 'all'
   const nonOR = acct != null && meter.orDaily && scope === 'all' ? Math.max(0, periodHermes - periodOR) : 0
+  const pinfo = (meter.periods && meter.periods[period]) || {}
+  const est = pinfo.estimated && pinfo.estimated.size ? Array.from(pinfo.estimated.entries()) : []
   const headline = shown ? hermesCost : acct != null ? (share ? (drift != null ? periodHermes * drift : periodHermes) : acct + nonOR) : periodHermes
   const lastDay = m.days[m.days.length - 1]
   const rangeLabel = period === 'today' ? 'today' : windowStart ? dayLabel(windowStart) + ' – ' + dayLabel(lastDay) : dayLabel(m.days[0]) + ' – ' + dayLabel(lastDay)
@@ -3121,7 +3166,7 @@ const Body = ({ meter, prices, threshold, retries, yaml, profile, profileLabel, 
         el('button', { type: 'button', 'aria-label': 'Show the ' + name + ' view', onClick: () => onView && onView(id), style: { width: 6, height: 6, padding: 0, border: 'none', borderRadius: 3, cursor: 'pointer', background: i === vi ? C.text : C.faint } })))),
     arrow(to, dir > 0 ? 'm6 3 5 5-5 5' : 'm10 3-5 5 5 5')
   )
-  const foot = el(UpdateLine, { profile })
+  const foot = el(UpdateLine, { profile: null })
   if (view === 'hdr') return el('div', { style: cardStyle }, head, el(HdrView, { profile, period }), foot)
   if (isAai) return el('div', { style: cardStyle }, head, el(AaiView2, { profile, period, yaml, orProfile, auxOn: !!(meter.aux && meter.aux.enabled), onChanged: refresh }), foot)
   return el(
@@ -3137,8 +3182,8 @@ const Body = ({ meter, prices, threshold, retries, yaml, profile, profileLabel, 
     el(
       'div',
       { style: { display: 'flex', alignItems: 'baseline', gap: 10, minHeight: 34, whiteSpace: 'nowrap' } },
-      el(Tip, { label: shown ? 'List-price estimate for that day' : share ? 'Share of the OpenRouter bill for this profile: list cost times the pricing drift' : nonOR > 0 ? 'OpenRouter bill plus the list cost of profiles billed elsewhere (' + fmtUsd(nonOR) + ')' : '' },
-        el('span', { style: { fontSize: 26, fontWeight: 500, letterSpacing: '-0.01em', fontVariantNumeric: 'tabular-nums' } }, fmtUsd(headline, { approx: !shown && ((share && drift != null) || nonOR > 0) }))),
+      el(Tip, { label: (est.length ? 'Hermes has no price for ' + est.map(([m]) => m).join(', ') + '; estimated at OpenRouter list price for ' + est.map(([, id]) => id).join(', ') + '. ' : pinfo.unpriced && !headline ? 'Hermes has no price for this provider and no matching OpenRouter price was found. ' : '') + (shown ? 'List-price estimate for that day' : share ? 'Share of the OpenRouter bill for this profile: list cost times the pricing drift' : nonOR > 0 ? 'OpenRouter bill plus the list cost of profiles billed elsewhere (' + fmtUsd(nonOR) + ')' : '') },
+        el('span', { style: { fontSize: 26, fontWeight: 500, letterSpacing: '-0.01em', fontVariantNumeric: 'tabular-nums' } }, (pinfo.unpriced && !est.length && !headline ? 'no price' : fmtUsd(headline, { approx: est.length > 0 || (!shown && ((share && drift != null) || nonOR > 0)) })))),
       provSplit.length > 1
         ? el(Tip, { label: 'List cost by provider: ' + provSplit.map(([k, v]) => k + ' ' + fmtUsd(v)).join(', ') }, el('span', { style: { fontSize: 11, color: C.sub, cursor: 'help', borderBottom: '1px dotted ' + C.faint } }, headlineLabel))
         : el('span', { style: { fontSize: 11, color: C.sub } }, headlineLabel),

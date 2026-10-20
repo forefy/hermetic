@@ -1,4 +1,4 @@
-// OpenRouter detection from a profile's config. Run: node tests/test_detect.mjs
+// OpenRouter detection and price lookup from desktop/plugin.js. Run: node tests/test_detect.mjs
 import fs from 'fs'
 import path from 'path'
 import { fileURLToPath } from 'url'
@@ -21,7 +21,23 @@ const cases = [
   ['nested key not read', 'model:\n  extra:\n    provider: openrouter\n  provider: anthropic', false, 'Anthropic'],
   ['no model block', 'other:\n  a: 1', null, 'Hermes']
 ]
+// price lookup: a custom endpoint's model name finds the same model on OpenRouter's list
+const grabConst = name => { const a = src.indexOf('const ' + name + ' = '); return src.slice(a, src.indexOf('\n}\n', a) + 2) }
+const priceIdOf = new Function('let priceTail = null\nlet priceTailOf = null\n' + grabConst('priceIdOf') + '\nreturn priceIdOf')()
+const prices = { 'deepseek/deepseek-v4-pro': {}, 'z-ai/glm-5.3': {} }
+const priceCases = [
+  ['exact id', 'z-ai/glm-5.3', 'z-ai/glm-5.3'],
+  ['other vendor and casing', 'deepinfra/DeepSeek-V4-Pro', 'deepseek/deepseek-v4-pro'],
+  ['unknown model', 'acme/secret-model', null],
+  ['no model', '', null]
+]
+
 let failed = 0
+for (const [name, model, want] of priceCases) {
+  const got = priceIdOf(prices, model)
+  if (got !== want) failed++
+  console.log(got === want ? 'ok  ' : 'FAIL', 'price: ' + name, got === want ? '' : JSON.stringify(got))
+}
 for (const [name, yaml, uses, label] of cases) {
   const got = [configUsesOpenRouter(yaml), providerLabel(yaml)]
   const ok = got[0] === uses && got[1] === label

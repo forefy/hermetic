@@ -4641,6 +4641,19 @@ const Chip = () => {
   const ctxSrc = (liveFocused && typeof liveFocused.context_percent === 'number' ? liveFocused : focusedUsage) || null
   const ctxPct = ctxSrc && typeof ctxSrc.context_percent === 'number' && ctxSrc.context_percent > 0 ? ctxSrc.context_percent : null
   const [open, setOpen] = useState(false)
+  // Radix closes the popover on clicks inside the app's page. Clicks into an embedded view (the
+  // browser pane) or another app never reach that page, so also close when focus leaves for one.
+  useEffect(() => {
+    if (!open) return
+    const close = () => setOpen(false)
+    const onFocusIn = e => { if (e.target && /^(IFRAME|WEBVIEW)$/.test(e.target.tagName)) close() }
+    window.addEventListener('blur', close)
+    document.addEventListener('focusin', onFocusIn)
+    return () => {
+      window.removeEventListener('blur', close)
+      document.removeEventListener('focusin', onFocusIn)
+    }
+  }, [open])
 
   const week = lastNDays(7)
   const spark = data ? week.map(d => (data.daily.get(d) || { cost: 0 }).cost) : week.map(() => 0)

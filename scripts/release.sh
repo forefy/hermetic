@@ -10,6 +10,9 @@
 #                                      from the commits since the last release
 #   --yes                              skip the confirmation prompts
 #
+# If a Hermetic catalog PR of yours is still open, --pr re-pins that PR (a new commit on its
+# branch and a comment listing what changed) instead of opening another one. Run it on main,
+# or on a release/* branch cut from the pinned commit to keep a review fix small.
 # Bump `version` in plugin.yaml and commit before running it. Needs git, node, gh (logged
 # in as the repo owner) and a Hermes checkout (HERMES_AGENT, default ~/.hermes/hermes-agent).
 set -euo pipefail
@@ -46,7 +49,8 @@ yaml_list() {
 
 command -v gh >/dev/null || die "gh is required"
 [ -d "$HERMES_AGENT/scripts" ] || die "no Hermes checkout at $HERMES_AGENT (set HERMES_AGENT)"
-[ "$(git branch --show-current)" = main ] || die "run it on main"
+BR=$(git branch --show-current)
+case "$BR" in main|release/*) ;; *) die "run it on main or a release/* branch" ;; esac
 [ -z "$(git status --porcelain)" ] || die "commit or stash your changes first"
 
 VERSION=$(field version); REQUIRES=$(field requires_hermes)
@@ -78,14 +82,14 @@ printf '%s\n' "$out" | grep -A2 '^⚠' || true
 printf '%s\n' "$out" | tail -1
 
 step "Push"
-git fetch -q origin main
-if [ "$(git rev-parse HEAD)" != "$(git rev-parse origin/main)" ]; then
-  git log --oneline origin/main..HEAD
-  confirm "Push these commits to origin/main?" || die "stopped before pushing"
-  git push -q origin main
+git fetch -q origin "$BR" 2>/dev/null || true
+if [ "$(git rev-parse HEAD)" != "$(git rev-parse -q --verify "origin/$BR" || true)" ]; then
+  if git rev-parse -q --verify "origin/$BR" >/dev/null; then git log --oneline "origin/$BR..HEAD"; else git log --oneline -5; fi
+  confirm "Push these commits to origin/$BR?" || die "stopped before pushing"
+  git push -q origin "HEAD:$BR"
 fi
 SHA=$(git rev-parse HEAD); SHORT=${SHA:0:7}
-echo "origin/main is at $SHORT"
+echo "origin/$BR is at $SHORT"
 
 step "New catalog entry"
 OUT=$(mktemp -d "${TMPDIR:-/tmp}/hermetic-release.XXXXXX")
@@ -108,6 +112,33 @@ echo; echo "Entry written to $OUT/hermetic.yaml"
 [ "$PR" = 1 ] || exit 0
 
 step "Pull request"
+ME=$(gh api user --jq .login); FORK=$ME/hermes-agent
+OPEN=$(gh pr list --repo "$UPSTREAM" --author "$ME" --state open --json number,headRefName \
+  --jq '.[] | select(.headRefName | startswith("hermetic-")) | "\(.number) \(.headRefName)"' | head -1)
+if [ -n "$OPEN" ]; then
+  NUM=${OPEN%% *}; BRANCH=${OPEN#* }
+  PINNED=$(gh api "repos/$FORK/contents/$ENTRY?ref=$BRANCH" -H "Accept: application/vnd.github.raw" | sed -n 's/^sha: *//p')
+  [ "$PINNED" != "$SHA" ] || die "PR #$NUM already pins $SHORT"
+  {
+    echo "Re-pinned from ${PINNED:0:7} to $SHORT ($VERSION):"
+    echo
+    git log --format='- %s' "$PINNED..$SHA"
+    echo
+    echo "Full range: https://github.com/forefy/hermetic/compare/$PINNED...$SHA"
+  } > "$OUT/comment.md"
+  echo "PR #$NUM is open: it gets a new commit on $BRANCH and this comment"; echo; cat "$OUT/comment.md"; echo
+  [ -z "$BODY" ] || echo "and its description is replaced with $BODY"
+  confirm "Update PR #$NUM?" || die "stopped before updating the PR (entry is in $OUT)"
+  EXISTING=$(gh api "repos/$FORK/contents/$ENTRY?ref=$BRANCH" --jq .sha)
+  gh api -X PUT "repos/$FORK/contents/$ENTRY" -f message="plugin-catalog: pin hermetic $VERSION to $SHORT" \
+    -f branch="$BRANCH" -f sha="$EXISTING" -f content="$(base64 < "$OUT/hermetic.yaml" | tr -d '\n')" >/dev/null
+  if [ -n "$BODY" ]; then
+    sed -e "s/{{SHA}}/$SHA/g" -e "s/{{SHORT}}/$SHORT/g" "$BODY" > "$OUT/body.md"
+    gh pr edit "$NUM" --repo "$UPSTREAM" --body-file "$OUT/body.md" >/dev/null
+  fi
+  gh pr comment "$NUM" --repo "$UPSTREAM" --body-file "$OUT/comment.md"
+  exit 0
+fi
 if [ -n "$OLD_SHA" ]; then TITLE="plugin-catalog: bump hermetic to $VERSION"; else TITLE="feat(plugin-catalog): add hermetic"; fi
 if [ -n "$BODY" ]; then
   sed -e "s/{{SHA}}/$SHA/g" -e "s/{{SHORT}}/$SHORT/g" "$BODY" > "$OUT/body.md"
@@ -134,7 +165,7 @@ fi
 echo "Title: $TITLE"; echo; cat "$OUT/body.md"; echo
 confirm "Open this PR on $UPSTREAM?" || die "stopped before opening the PR (entry and body are in $OUT)"
 
-ME=$(gh api user --jq .login); FORK=$ME/hermes-agent; BRANCH=hermetic-$VERSION
+BRANCH=hermetic-$VERSION
 gh repo view "$FORK" >/dev/null 2>&1 || gh repo fork "$UPSTREAM" --clone=false --default-branch-only >/dev/null
 for _ in 1 2 3 4 5 6; do gh repo view "$FORK" >/dev/null 2>&1 && break; sleep 5; done
 gh repo sync "$FORK" --branch main >/dev/null

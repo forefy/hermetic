@@ -162,15 +162,25 @@ async def account_usage(profile: Optional[str] = None):
 
 
 # ---- config and daily usage for the popover, through Hermes' public Python API ----------------
-# Hermes binds every /api/plugins/ request to its ?profile= home and secrets, so these read and
-# write that profile's config.yaml and session store.
+# Reads use the requested profile's own folder. Writes go through Hermes' save_config, which writes
+# to the home Hermes bound for this request (?profile=, Hermes 0.21.6 and later); _write_home refuses
+# when that is not the requested profile, so an older Hermes can never write into the wrong one.
+
+def _write_home(profile):
+    """The requested profile's home, when Hermes scoped this request to it; else an error to show."""
+    from hermes_constants import get_hermes_home
+    _name, home = _profile_home(profile)
+    if Path(get_hermes_home()).resolve() != Path(home).resolve():
+        raise RuntimeError("Update Hermes to change another profile's settings from here")
+    return home
+
 
 @router.get("/config/raw")
 async def config_raw(profile: Optional[str] = None):
     """config.yaml as text (the routing editor and one-click fixes show a diff against it)."""
     def _run():
-        from hermes_cli.config import get_config_path
-        path = get_config_path()
+        _name, home = _profile_home(profile)
+        path = home / "config.yaml"
         return {"yaml": path.read_text(encoding="utf-8-sig") if path.exists() else "", "path": str(path)}
     return await asyncio.to_thread(_run)
 
@@ -187,6 +197,10 @@ async def config_raw_save(payload: Dict[str, Any] = Body(default={}), profile: O
             return {"ok": False, "error": "Invalid YAML: %s" % exc}
         if not isinstance(parsed, dict):
             return {"ok": False, "error": "YAML must be a mapping"}
+        try:
+            _write_home(profile)
+        except RuntimeError as exc:
+            return {"ok": False, "error": str(exc)}
         save_config(parsed, merge_existing=False)
         return {"ok": True}
     return await asyncio.to_thread(_run)
@@ -201,6 +215,10 @@ async def config_merge(payload: Dict[str, Any] = Body(default={}), profile: Opti
 
     def _run():
         from hermes_cli.config import require_readable_config_before_write, save_config
+        try:
+            _write_home(profile)
+        except RuntimeError as exc:
+            return {"ok": False, "error": str(exc)}
         require_readable_config_before_write()  # never write over a config that cannot be read
         save_config(part, merge_existing=True)
         return {"ok": True}
@@ -865,8 +883,8 @@ async def aai_rate(payload: Dict[str, Any] = Body(default={}), profile: Optional
 def _aai_set_disabled(profile, names, on):
     from hermes_cli.config import load_config
     from hermes_cli.skills_config import get_disabled_skills, save_disabled_skills
-    # Hermes binds every /api/plugins/ request to its ?profile= home and secrets, so load_config and
-    # save_config here already read and write that profile's config.yaml
+    # save_config writes to the home Hermes bound for this request; make sure it is this profile's
+    _write_home(profile)
     cfg = load_config()
     cur = get_disabled_skills(cfg)
     new = (cur | set(names)) if on else (cur - set(names))
@@ -884,7 +902,10 @@ async def aai_archive(payload: Dict[str, Any] = Body(default={}), profile: Optio
     def _run():
         _name, home = _profile_home(profile)
         names_ok = [n for n in names if n not in _aai_essential()]
-        disabled = _aai_set_disabled(profile, names_ok, not undo)
+        try:
+            disabled = _aai_set_disabled(profile, names_ok, not undo)
+        except RuntimeError as exc:
+            return {"ok": False, "error": str(exc)}
         _aai_append(_data_dir(home) / "work.jsonl", {"ts": _aai_now(), "job": "archive", "undo": undo, "skills": names_ok})
         return {"ok": True, "disabled": len(disabled), "changed": len(names_ok)}
 

@@ -2,6 +2,8 @@
 
 A status-bar popover for the [Hermes](https://github.com/NousResearch/hermes-agent) desktop app. It shows what your agent costs, whether its skills and replies are getting better or worse, and what the harness itself touched.
 
+**Install:** `hermes plugins install forefy/hermetic --enable`, then see [INSTALL.md](INSTALL.md) (two more steps and how to check it worked).
+
 It has three views in the same popover: Costs, AAI and HDR. The dots at the top right show which one you are on, and the arrow steps through them.
 
 <p align="center">
@@ -68,15 +70,7 @@ Next: asking or blocking before a risky tool call runs, through Hermes' own appr
 hermes plugins install forefy/hermetic --enable
 ```
 
-Then restart the desktop app (menu: **Quit and Keep Windows**) so the backend routes load.
-
-To run it from a checkout while you work on it:
-
-```bash
-git clone https://github.com/forefy/hermetic.git
-cd hermetic
-./scripts/dev-link.sh
-```
+Then restart Hermes and switch on Hermetic's **Desktop** half under Capabilities, Plugins. Hermes installs it switched off, so this is the step that makes the button appear. [INSTALL.md](INSTALL.md) has the steps, what you should see when it worked, and fixes for what can go wrong.
 
 ## Costs of its own and your data
 

@@ -3294,8 +3294,9 @@ const Body = ({ meter, prices, threshold, retries, yaml, profile, profileLabel, 
     ),
     el(SessionsSection, { m, threshold, currentId }),
     el(FlowSection, { m, drift }),
-    !orAny ? null : el(RoutingSection, {
+    el(RoutingSection, {
       policyOn: orProfile,
+      providerName: meter.providerName,
       rows: meter.routing ? meter.routing.rows : [],
       since: meter.routing ? meter.routing.since : null,
       recording: !!(meter.routing && meter.routing.recording),
@@ -3754,7 +3755,7 @@ async function freshConfig(profile) {
   return text
 }
 
-const RoutingSection = ({ policyOn = true, rows, since, recording, reachable, endpoints, prices, days, yaml, aux, health, profile, profileLabel, onApplied }) => {
+const RoutingSection = ({ policyOn = true, providerName, rows, since, recording, reachable, endpoints, prices, days, yaml, aux, health, profile, profileLabel, onApplied }) => {
   const facts = useMemo(() => configFacts(yaml), [yaml])
   const [sel, setSel] = useState(null)
   const [draft, setDraft] = useState(null)
@@ -3883,7 +3884,7 @@ const RoutingSection = ({ policyOn = true, rows, since, recording, reachable, en
   const OTHERS_ROWS = 5
   const [q, setQ] = useState('')
   // no preview figures in the header; only a status word when there is nothing to show
-  const right = data
+  const right = data || (!policyOn && !rows.length)
     ? null
     : !reachable
       ? 'backend off'
@@ -4272,7 +4273,9 @@ const RoutingSection = ({ policyOn = true, rows, since, recording, reachable, en
       : el(
           'div',
           { style: { fontSize: 11, color: C.faint, padding: '2px 0 6px' } },
-          !reachable ? 'backend plugin off, restart Hermes' : recording ? 'no calls in this period' : 'waiting for the first call'
+          !policyOn && !rows.length
+            ? 'Provider routing is recorded for OpenRouter only' + (providerName && providerName !== 'Hermes' ? '; this profile uses ' + providerName : '')
+            : !reachable ? 'backend plugin off, restart Hermes' : recording ? 'no calls in this period' : 'waiting for the first call'
         ),
     // the small providers folded into "others": the box opened up, full width so names fit
     data && data.restProvs.length
@@ -4336,14 +4339,25 @@ const RoutingSection = ({ policyOn = true, rows, since, recording, reachable, en
         )
       : null,
     // policy: one quiet line, or the editor; without OpenRouter on this profile only Hermes warnings
+    // without OpenRouter: the same line, the provider in place of the rules, and Edit greyed out
     !policyOn
-      ? degraded.length
-        ? el(
-            Tip,
-            { label: 'A Hermes update changed internals this plugin uses. Fallbacks are running; ' + degraded.join(', ') + ' may be limited.' },
-            el('div', { style: { color: C.warn, fontSize: 11, marginTop: 8, cursor: 'help' } }, 'degraded: ' + degraded.join(', '))
-          )
-        : null
+      ? el(
+          'div',
+          { style: { display: 'flex', alignItems: 'center', fontSize: 11, lineHeight: '20px', color: C.sub, marginTop: 8, paddingTop: 8, borderTop: '1px solid ' + C.stroke } },
+          el('span', { style: { color: C.dim, width: 44, flex: 'none' } }, 'policy'),
+          el(Tip, { label: profileTip }, el('span', { style: { color: C.dim, marginRight: 10, whiteSpace: 'nowrap', cursor: 'help' } }, profileName)),
+          el('span', { style: { color: C.dim, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, providerName && providerName !== 'Hermes' ? 'via ' + providerName : 'not on OpenRouter'),
+          degraded.length
+            ? el(
+                Tip,
+                { label: 'A Hermes update changed internals this plugin uses. Fallbacks are running; ' + degraded.join(', ') + ' may be limited.' },
+                el('span', { style: { color: C.warn, marginLeft: 12, whiteSpace: 'nowrap', cursor: 'help' } }, 'degraded: ' + degraded.join(', '))
+              )
+            : null,
+          el('span', { style: { flex: 1 } }),
+          el(Tip, { label: 'Detailed routing rules (provider order, blocks, sorting, zero retention, fallback) are supported only with OpenRouter.' + (providerName && providerName !== 'Hermes' ? ' This profile uses ' + providerName + '.' : '') },
+            el('span', { style: { display: 'inline-flex', cursor: 'not-allowed' } }, el(Btn, { disabled: true, icon: slidersIcon }, 'Edit')))
+        )
       : !editing && !dirty
       ? el(
           'div',

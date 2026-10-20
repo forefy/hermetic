@@ -85,9 +85,9 @@ Hermetic does not update itself. Catalog installs update from the Hermes Plugins
 
 **Network.** The popover reads OpenRouter's public model, provider and zero-retention lists. The backend asks Hermes for your OpenRouter account usage (at most every few minutes, OpenRouter profiles only) to show billed spend. Nothing else leaves your machine.
 
-**What it reads.** Hermes' session database, `config.yaml`, the skills and their change history, scheduled jobs, SOUL.md and the memory files (sizes and change times), installed plugin sources (to see what each registers), and its own routing records. HDR runs `ps` and `lsof` locally to list ports opened under Hermes.
+**What it reads.** Hermes' session database (read-only, through Hermes' `SessionDB`), `config.yaml`, the skills and their change history, scheduled jobs, SOUL.md and the memory files (sizes and change times), installed plugin sources (to see what each registers), and its own routing records. HDR runs `ps` and `lsof` locally to list ports opened under Hermes.
 
-**What it writes, and only when you ask.** Routing rules and the fixes you apply (through Hermes' config API, shown before writing), the posture settings you tighten from HDR, archived skills, skill versions you ship or revert, and test results. Posture controls only make settings stricter; loosening one opens Hermes' own settings.
+**What it writes, and only when you ask.** Routing rules and the fixes you apply (through Hermes' own config functions, shown before writing), the posture settings you tighten from HDR, archived skills, skill versions you ship or revert, and test results. Posture controls only make settings stricter; loosening one opens Hermes' own settings.
 
 **In the background.** A thread checks every 5 minutes for skill changes made by the background review, and acts only if you turned automatic tests on. A short-lived thread stores the billed-spend snapshot.
 
@@ -103,6 +103,8 @@ Everything Hermetic records stays in `$HERMES_HOME/hermetic/` (ratings, tests, r
 | `plugin.yaml` | Package manifest |
 | `tests/test_hdr.py` | HDR detection rules |
 | `tests/test_credentials.py` | Hermetic's own model calls go through Hermes (`ctx.llm`, secret scope) |
+| `tests/test_paths.py` | Skill names and version ids from requests never leave Hermetic's folders |
+| `tests/test_config_routes.py` | Config writes reach only the profile Hermes scoped the request to |
 | `tests/test_detect.mjs` | How a profile's provider is read from its config |
 | `scripts/release.sh` | Tests, validates and pushes a release, then prints the catalog entry; `--pr` opens the catalog PR |
 | `catalog/hermetic.yaml.in` | Template for the catalog entry |

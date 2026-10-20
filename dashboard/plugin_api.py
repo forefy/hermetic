@@ -1990,43 +1990,19 @@ async def aai_job(id: str = Query(...), profile: Optional[str] = None):
 # its own, and the settings that decide how exposed it is. Read from Hermes' own records; nothing is
 # blocked or changed here.
 
-_HDR_URL = _aai_re.compile(r"https?://([A-Za-z0-9.-]+\.[A-Za-z]{2,})(?::\d+)?", _aai_re.I)
-_HDR_PATH = _aai_re.compile(r"(?<![\w.-])(~/[^\s'\"`|;&<>()]+|/(?:Users|tmp|private|etc|var|opt|Library|Applications|usr/local)[^\s'\"`|;&<>()]*)")
-_HDR_TLDS = {"com", "net", "org", "io", "dev", "ai", "app", "co", "me", "gov", "edu", "cloud", "tech", "xyz", "info", "biz",
-             "sh", "so", "gg", "ly", "to", "page", "site", "online", "example", "test", "local", "internal"}
+def _hdr_rules():
+    """hdr_rules.py from the plugin root (shared with the guard hook in __init__.py)."""
+    import importlib.util as _iu
+    spec = _iu.spec_from_file_location("_hermetic_hdr_rules", str(Path(__file__).resolve().parent.parent / "hdr_rules.py"))
+    mod = _iu.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
 
-def _hdr_host_ok(h):
-    last = h.rsplit(".", 1)[-1].lower()
-    return len(last) == 2 or last in _HDR_TLDS
-
-
-def _hdr_op(cmd, raw):
-    """write when the command redirects into, edits, or copies onto this path; otherwise read."""
-    q = _aai_re.escape(raw)
-    if _aai_re.search(r"(>>?|\btee(\s+-a)?)\s*['\"]?" + q, cmd):
-        return "write"
-    if _aai_re.search(r"\b(rm|chmod|chown|touch|mkdir|truncate|sed\s+-i\S*)\b[^|;&\n]*" + q, cmd):
-        return "write"
-    for seg in _aai_re.split(r"[|;&\n]+", cmd):
-        toks = seg.split()
-        if toks and toks[0] in ("cp", "mv", "install", "rsync", "ln", "ditto") and toks[-1].strip("'\"") == raw:
-            return "write"
-    return "read"
-_HDR_SENSITIVE = [
-    ("~/.ssh", "SSH keys", 70), ("~/.aws", "cloud keys", 70), ("~/.gnupg", "signing keys", 70),
-    ("~/.config/gh", "GitHub login", 70), ("~/.netrc", "saved logins", 70), ("~/.docker/config.json", "registry logins", 70),
-    ("~/.kube", "cluster access", 70), ("~/Library/Keychains", "keychain", 80),
-    ("~/Library/LaunchAgents", "starts programs at login", 90), ("/Library/LaunchAgents", "starts programs at login", 90),
-    ("/Library/LaunchDaemons", "starts programs at boot", 95),
-    ("~/.zshrc", "runs in every shell", 85), ("~/.bashrc", "runs in every shell", 85), ("~/.zprofile", "runs in every shell", 85),
-    ("~/.bash_profile", "runs in every shell", 85), ("~/.profile", "runs in every shell", 85),
-    ("~/.hermes/auth.json", "Hermes logins", 75), ("~/.hermes/vault", "Hermes vault", 75), ("~/.hermes/.env", "Hermes keys", 75),
-    ("/etc/", "system settings", 60),
-]
-_HDR_CRED = {"SSH keys", "cloud keys", "signing keys", "GitHub login", "saved logins", "registry logins", "cluster access",
-             "keychain", "Hermes logins", "Hermes vault", "Hermes keys", "keys file"}
-_HDR_FILE_TOOLS = {"read_file": "read", "search_files": "read", "write_file": "write", "patch": "write"}
+_HDR = _hdr_rules()
+_HDR_PATH, _HDR_CRED = _HDR.PATH, _HDR.CRED
+_hdr_host_ok, _hdr_op, _hdr_flatten, _hdr_tilde = _HDR.host_ok, _HDR.op, _HDR.flatten, _HDR.tilde
+_hdr_sensitive, _hdr_touches, _hdr_score = _HDR.sensitive, _HDR.touches, _HDR.score
 
 
 def _hdr_yaml(path):
@@ -2034,32 +2010,6 @@ def _hdr_yaml(path):
     from utils import fast_safe_load
     with open(path, encoding="utf-8") as f:
         return fast_safe_load(f) or {}
-
-
-def _hdr_flatten(calls):
-    """(name, args) for every tool call, opening the batch wrapper `tool_call`."""
-    for t in calls if isinstance(calls, list) else []:
-        if not isinstance(t, dict):
-            continue
-        f = t.get("function") if isinstance(t.get("function"), dict) else t
-        name = f.get("name") or f.get("tool")
-        args = f.get("arguments", f.get("args"))
-        if isinstance(args, str):
-            try:
-                args = _aai_json.loads(args)
-            except Exception:
-                args = {"_raw": args}
-        args = args if isinstance(args, dict) else {}
-        if name == "tool_call" and isinstance(args.get("calls"), list):
-            yield from _hdr_flatten(args["calls"])
-            continue
-        yield name, args
-
-
-def _hdr_tilde(p):
-    home = os.path.expanduser("~")
-    p = str(p or "").strip().rstrip(".,:")
-    return "~" + p[len(home):] if p.startswith(home) else p
 
 
 def _hdr_root(p):
@@ -2071,15 +2021,6 @@ def _hdr_root(p):
     if p.startswith("/private/") or p.startswith("/var/folders"):
         return "/".join(parts[:3])
     return "/" + (parts[1] if len(parts) > 1 else "")
-
-
-def _hdr_sensitive(p):
-    for prefix, why, score in _HDR_SENSITIVE:
-        if p == prefix or p.startswith(prefix.rstrip("/") + "/") or (prefix.endswith("/") and p.startswith(prefix)):
-            return why, score
-    if p.endswith("/.env") or p.endswith(".env") and "/" in p:
-        return "keys file", 70
-    return None
 
 
 def _hdr_calls(profile, since):
@@ -2099,29 +2040,6 @@ def _hdr_calls(profile, since):
         title, base = meta.get(sid, (sid, ""))
         for name, args in _hdr_flatten(calls):
             yield sid, title, float(ts or 0), name, args, base
-
-
-def _hdr_touches(name, args):
-    """(paths with op, hosts) one tool call names."""
-    paths, hosts = [], set()
-    texts = []
-    if name in _HDR_FILE_TOOLS and args.get("path"):
-        paths.append((_hdr_tilde(args["path"]), _HDR_FILE_TOOLS[name]))
-    elif name == "terminal":
-        cmd = str(args.get("command") or "")
-        paths += [(_hdr_tilde(m.group(1)), _hdr_op(cmd, m.group(1))) for m in _HDR_PATH.finditer(cmd)]
-        if args.get("workdir"):
-            paths.append((_hdr_tilde(args["workdir"]), "workdir"))
-        texts.append(cmd)
-    elif name in ("execute_code", "browser_exec"):
-        code = str(args.get("code") or "")
-        paths += [(_hdr_tilde(m.group(1)), "code") for m in _HDR_PATH.finditer(code)]
-        texts.append(code)
-    else:
-        texts += [v if isinstance(v, str) else _aai_json.dumps(v) for v in args.values() if isinstance(v, (str, list))]
-    for t in texts:
-        hosts.update(h.lower() for h in _HDR_URL.findall(t) if _hdr_host_ok(h))
-    return paths, hosts
 
 
 def _hdr_services(calls):
@@ -2242,6 +2160,50 @@ def _hdr_watch(home, paths):
     return out
 
 
+_HDR_GUARD_MIN = 70  # the same line the guard hook in __init__.py acts on (GUARD_MIN)
+
+
+def _hdr_guard(home, since, titles):
+    """The guard's level for this profile and what it asked or blocked since a time."""
+    d = _data_dir(home) / "hdr"
+    try:
+        level = _aai_json.loads((d / "guard.json").read_text(encoding="utf-8")).get("level")
+    except Exception:
+        level = None
+    stops = []
+    try:
+        with open(d / "guard.jsonl", encoding="utf-8") as fh:
+            for line in fh:
+                try:
+                    r = _aai_json.loads(line)
+                except Exception:
+                    continue
+                if float(r.get("ts") or 0) >= since:
+                    r["chat"] = titles.get(r.get("session_id"), "")
+                    stops.append(r)
+    except OSError:
+        pass
+    return {"level": level if level in ("watch", "ask", "block") else "watch", "min": _HDR_GUARD_MIN, "stops": stops[-20:][::-1]}
+
+
+@router.post("/hdr/guard")
+async def hdr_guard(payload: Dict[str, Any] = Body(default={}), profile: Optional[str] = None):
+    """Set the guard: watch (records only), ask (Hermes' approval prompt) or block, for calls scored 70+."""
+    level = str((payload or {}).get("level") or "")
+    if level not in ("watch", "ask", "block"):
+        return {"ok": False, "error": "level must be watch, ask or block"}
+
+    def _run():
+        _name, home = _profile_home(profile)
+        d = _data_dir(home) / "hdr"
+        d.mkdir(parents=True, exist_ok=True)
+        tmp = d / "guard.json.tmp"
+        tmp.write_text(_aai_json.dumps({"level": level, "ts": time.time()}), encoding="utf-8")
+        os.replace(tmp, d / "guard.json")
+        return {"ok": True, "level": level}
+    return await asyncio.to_thread(_run)
+
+
 def _hdr_posture(cfg):
     g, b, t = cfg.get("gateway") or {}, cfg.get("browser") or {}, cfg.get("terminal") or {}
     api = g.get("api_server") if isinstance(g.get("api_server"), dict) else {}
@@ -2300,21 +2262,26 @@ async def hdr(days: int = Query(7, ge=1, le=90), profile: Optional[str] = None):
                 d["chats"][title] = d["chats"].get(title, 0) + 1
         files, sensitive = {}, []
         mem_writes, skill_edits, subagents, vault = [], 0, 0, []
+        risky_calls, titles = 0, {}
         for sid, title, ts, name, args, base in calls:
+            titles[sid] = title
             paths, hosts = _hdr_touches(name, args)
             for h in hosts:
                 dom(h, ts, name, title)
             if ts < since:
                 continue
+            call_top = 0
             for p, op in paths:
                 r = _hdr_root(p)
                 files[r] = files.get(r, 0) + 1
                 s = _hdr_sensitive(p)
                 if s:
                     # reading keys is risky in itself; reading startup or system folders is mostly inspection
-                    cred = s[0] in _HDR_CRED
-                    score = min(100, s[1] + 10) if op in ("write", "code") else (s[1] if cred else 30)
+                    score = _hdr_score(s[0], s[1], op)
+                    call_top = max(call_top, score)
                     sensitive.append({"path": p, "op": op, "tool": name, "chat": title, "ts": ts, "why": s[0], "score": score})
+            if call_top >= _HDR_GUARD_MIN:
+                risky_calls += 1
             if name == "memory":
                 mem_writes.append({"ts": ts, "chat": title})
             elif name == "skill_manage":
@@ -2400,6 +2367,8 @@ async def hdr(days: int = Query(7, ge=1, le=90), profile: Optional[str] = None):
                        "shapers": [p["name"] for p in plugins if p["enabled"] and p["shapes_prompt"]]},
             "plugins": plugins,
             "secrets": {"vault": vault[-20:], "sensitive_reads": [s for s in sensitive if s["op"] in ("read", "code")][:10]},
+            "guard": dict(_hdr_guard(home, since, titles), risky_calls=risky_calls,
+                          approvals=str((cfg.get("approvals") or {}).get("mode") or "manual")),
         }
     try:
         return await asyncio.to_thread(_run)

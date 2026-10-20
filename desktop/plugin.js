@@ -2860,6 +2860,53 @@ const HdrPipeline = ({ list }) => {
     on.length < list.length ? el('div', { style: { fontSize: 10.5, color: C.dim, marginTop: 4 } }, 'Installed but off: ' + list.filter(p => !p.enabled).map(p => p.name).join(', ')) : null)
 }
 
+// Guard: one level for the calls HDR scores 70+. Ask goes through Hermes' own approval prompt; Block stops the call
+const GUARD_OPTIONS = [{ id: 'watch', label: 'Watch' }, { id: 'ask', label: 'Ask' }, { id: 'block', label: 'Block' }]
+const guardNoAsk = g => g.approvals === 'off' || g.approvals === 'yolo'
+const guardRight = g => {
+  const n = (g.stops || []).length
+  const word = g.level === 'block' ? el('span', { style: { color: C.bad } }, 'blocks') : g.level === 'ask' ? el('span', { style: { color: guardNoAsk(g) ? C.dim : C.warn } }, guardNoAsk(g) ? 'asks (approvals off)' : 'asks') : el('span', { style: { color: C.dim } }, 'watching')
+  return el('span', { style: { display: 'flex', gap: 8 } }, word, n ? String(n) : null)
+}
+const guardFoot = g => !g ? 'Recording only: nothing is blocked or changed.'
+  : g.level === 'block' ? 'Guard on: risky calls are blocked, everything else is only recorded.'
+  : g.level === 'ask' ? (guardNoAsk(g) ? 'Guard set to ask, but approvals are off, so nothing is stopped yet.' : 'Guard on: Hermes asks you before risky calls, everything else is only recorded.')
+  : 'Recording only: nothing is blocked or changed.'
+const HdrGuard = ({ g, profile, days, onChanged }) => {
+  const [busy, setBusy] = useState(false)
+  const [err, setErr] = useState(null)
+  const set = async level => {
+    if (level === g.level || busy) return
+    setBusy(true); setErr(null)
+    try {
+      const r = await api(profileReq(profile, { path: '/api/plugins/hermetic/hdr/guard', method: 'POST', body: { level } }))
+      if (r && r.ok === false) throw new Error(r.error || 'Could not save')
+      onChanged && onChanged()
+    } catch (e) { setErr(/404|Not Found/i.test(String(e && e.message)) ? 'Restart Hermes to load the guard' : (e && e.message) || 'Could not save') } finally { setBusy(false) }
+  }
+  const n = g.risky_calls || 0
+  const span = days === 1 ? 'Today' : 'In the last ' + days + ' days'
+  const effect = !n ? span + ', no call scored 70 or more.'
+    : g.level === 'block' ? el('span', null, span + ', this would have blocked ' + n + (n === 1 ? ' call.' : ' calls.'))
+    : g.level === 'ask' ? (guardNoAsk(g) ? el('span', null, span + ', this would have ', el('span', { style: { color: C.warn } }, 'let ' + n + ' through unasked'), '.') : span + ', this would have asked you ' + n + (n === 1 ? ' time.' : ' times.'))
+    : span + ', ' + n + (n === 1 ? ' risky call was' : ' risky calls were') + ' recorded.'
+  return el('div', null,
+    el('div', { style: { fontSize: 11, color: C.sub, marginBottom: 8 } }, 'Risky calls: reading keys and logins, writing startup items, changing shell settings (HDR score 70 or more).'),
+    el('div', { style: { display: 'flex', alignItems: 'center', gap: 10 } },
+      el(SegmentedControl, { value: g.level, onChange: set, options: GUARD_OPTIONS }),
+      busy ? aSmall('Saving…') : null),
+    el('div', { style: { fontSize: 10.5, color: C.dim, marginTop: 8 } }, effect),
+    g.level === 'ask' && guardNoAsk(g) ? el('div', { style: { marginTop: 8, padding: '7px 10px', borderRadius: 8, background: 'rgba(201,147,74,.1)', border: '1px solid rgba(201,147,74,.35)', fontSize: 11, color: C.sub, lineHeight: 1.45 } },
+      el('span', { style: { color: C.warn } }, 'Approvals are off'), ', so Hermes can’t ask you and Ask lets the call through. Turn approvals to Smart or Ask me in Posture above.') : null,
+    err ? el('div', { style: { fontSize: 10.5, color: C.bad, marginTop: 6 } }, err) : null,
+    (g.stops || []).length ? el('div', { style: { marginTop: 10 } },
+      hdrHead(g.stops.length === 1 ? 'Stopped once' : 'Stopped ' + g.stops.length + ' times'),
+      g.stops.slice(0, 5).map((x, i) => hdrLine('g' + i,
+        el('span', { style: { width: 7, height: 7, borderRadius: 4, flex: 'none', background: x.action === 'block' ? C.bad : C.warn } }),
+        hdrGrow(el('span', null, (x.action === 'block' ? 'Blocked: ' : 'Asked: ') + x.op + ' ', el('span', { className: 'mono', style: { fontSize: 10.5 } }, x.path)),
+          x.tool + (x.chat ? ' in “' + x.chat + '”' : '') + ', ' + ago(x.ts))))) : null)
+}
+
 const HdrView = ({ profile, period }) => {
   const days = AAI_DAYS[period] || 7
   const [d, setD] = useState(null)
@@ -2889,12 +2936,13 @@ const HdrView = ({ profile, period }) => {
       el(Cell, { tone: risky.length ? 'warn' : 'ok', label: 'Sensitive places', value: String(d.files.sensitive.length), sub: sub(risky.length + ' scored 70+'), tip: 'Keys, logins, startup folders and shell settings that tools read or wrote' }),
       el(Cell, { tone: exposed ? 'bad' : 'ok', label: 'Runs on its own', value: String(d.runs.jobs.length + d.runs.services.length), sub: sub(pl(d.runs.jobs.length, 'job', 'jobs') + ', ' + pl(d.runs.services.length, 'port', 'ports')), tip: 'Scheduled jobs and listening ports started under Hermes' })),
     el(Section, { id: 'hdr-posture', title: 'Posture', right: dots(issues.map(p => p.tone)) }, el(HdrPosture, { rows: d.posture, profile, onChanged: () => setTick(t => t + 1) })),
+    d.guard ? el(Section, { id: 'hdr-guard', title: 'Guard', right: guardRight(d.guard) }, el(HdrGuard, { g: d.guard, profile, days, onChanged: () => setTick(t => t + 1) })) : null,
     el(Section, { id: 'hdr-net', title: 'Where data went', right: el('span', { style: { display: 'flex', gap: 8 } }, newDom ? el('span', { style: { color: C.warn } }, newDom + ' new') : null, String(d.domains.length)) }, el(HdrDomains, { list: d.domains })),
     el(Section, { id: 'hdr-files', title: 'Files and secrets', right: risky.length || d.secrets.vault.length ? el('span', { style: { color: C.warn } }, risky.length + ' sensitive' + (d.secrets.vault.length ? '   ' + d.secrets.vault.length + ' vault' : '')) : null }, el(HdrFiles, { files: d.files, secrets: d.secrets })),
     el(Section, { id: 'hdr-runs', title: 'What runs on its own', right: exposed ? el('span', { style: { color: C.bad } }, exposed + ' open') : String(d.runs.jobs.length + d.runs.services.length) }, el(HdrRuns, { runs: d.runs })),
     el(Section, { id: 'hdr-prompt', title: 'What shapes every prompt', right: full.length ? el('span', { style: { color: C.warn } }, full.length + ' nearly full') : d.prompt.files.some(f => f.changed) ? el('span', { style: { color: C.warn } }, 'changed') : null }, el(HdrPrompt, { prompt: d.prompt })),
     el(Section, { id: 'hdr-plugins', title: 'Plugins and middleware', right: d.plugins.some(p => p.undeclared.length) ? el('span', { style: { color: C.bad } }, 'undeclared') : String(d.plugins.filter(p => p.enabled).length) }, el(HdrPipeline, { list: d.plugins })),
-    el('div', { style: { fontSize: 10.5, color: C.dim, marginTop: 14, lineHeight: 1.45 } }, 'Recording only: nothing is blocked or changed.' + (d.learning ? ' Still learning what is normal.' : '')))
+    el('div', { style: { fontSize: 10.5, color: C.dim, marginTop: 14, lineHeight: 1.45 } }, guardFoot(d.guard) + (d.learning ? ' Still learning what is normal.' : '')))
 }
 
 // direction of the view arrow, kept across renders (see the header in Body)

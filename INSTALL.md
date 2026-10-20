@@ -21,7 +21,7 @@ Or straight from GitHub, for the latest commit before it reaches the catalog:
 hermes plugins install forefy/hermetic --enable --force
 ```
 
-Why `--force` from GitHub: Hermes scans every plugin before installing it. Hermetic's HDR view watches sensitive places such as `~/.ssh`, cloud keys and startup folders, so its code names those paths, and the scan reads a list of them as a possible credential grab. That gives a "caution" verdict, which Hermes blocks for plugins from GitHub unless you pass `--force`. Catalog installs skip that prompt because a maintainer read the same findings at the pinned commit. Hermetic never opens those files: it only checks whether a tool call touched them. The list is `_HDR_SENSITIVE` in `dashboard/plugin_api.py`, and you can read the scan yourself by running the GitHub command without `--force` first.
+Why `--force` from GitHub: Hermes scans every plugin before installing it. Hermetic's HDR view watches sensitive places such as `~/.ssh`, cloud keys and startup folders, so its code names those paths, and the scan reads a list of them as a possible credential grab. That gives a "caution" verdict, which Hermes blocks for plugins from GitHub unless you pass `--force`. Catalog installs skip that prompt because a maintainer read the same findings at the pinned commit. Hermetic never opens those files: it only checks whether a tool call touched them. The list is `SENSITIVE` in `hdr_rules.py`, and you can read the scan yourself by running the GitHub command without `--force` first.
 
 Then:
 

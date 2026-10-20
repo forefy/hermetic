@@ -47,7 +47,7 @@ Parts that only make sense with OpenRouter (provider routing, provider compariso
 
 ## HDR (harness detection and response)
 
-What the harness touched and how exposed it is. For now it records and shows; it does not block anything.
+What the harness touched and how exposed it is. It records and shows everything, and its guard can ask you or block before the riskiest tool calls.
 
 <p align="center">
   <img src="docs/hermetic-hdr.png" alt="HDR view: posture, destinations, sensitive places and what runs on its own" width="400">
@@ -56,13 +56,14 @@ What the harness touched and how exposed it is. For now it records and shows; it
 </p>
 
 - **Posture**: the settings that decide how exposed you are. Approvals, commands you allowed permanently, whether the terminal runs directly on your machine, whether the browser uses your real profile, who can message the agent, the API server and shell hooks. One strip shows them all, and the worst one is spelled out.
+- **Guard**: one setting for the tool calls HDR scores 70 or more (reading keys and logins, writing startup items, changing shell settings). **Watch** records them, **Ask** has Hermes ask you first through its own approval prompt, and **Block** stops the call and tells the agent why. Watch is the default. Ask needs approvals on (Smart or Ask me in Posture); with approvals off, Hermes approves its own questions, and the guard says so.
 - **Where data went**: every host that model requests and tools reached. Tool traffic is drawn as a flow from tool kind to destination to known or new, and each host lists the chats behind it.
 - **Files and secrets**: where tools worked, and the sensitive places they touched (keys and logins, startup items, shell settings, system files, the browser vault), each scored. Reading keys scores high; writing to startup items scores highest.
 - **What runs on its own**: scheduled jobs with their schedule and next run, ports opened under Hermes and the chats that opened them, subagents and background processes.
 - **What shapes every prompt**: SOUL.md and the memory files against Hermes' own size limits, when each last changed, and memory and skill writes made from chats.
 - **Plugins and middleware**: where each enabled plugin acts on the path of a model request and of a tool call, and anything it registers without declaring it.
 
-Next: asking or blocking before a risky tool call runs, through Hermes' own approval prompt, and a low-cost judge that checks web pages and new skills before the model reads them.
+Next: a low-cost judge that checks web pages and new skills before the model reads them.
 
 ## Install
 
@@ -77,6 +78,8 @@ Hermetic does not update itself. Catalog installs update from the Hermes Plugins
 ## What it does on your machine
 
 **Model requests.** On every request that goes to OpenRouter, Hermetic's `llm_request` middleware adds the routing fields from `provider_routing` in your `config.yaml` that Hermes does not send on its own: fallbacks, zero data retention, distillable text, quantizations, max price, minimum throughput and maximum latency, including per-model overrides. Requests to any other provider go out unchanged, and on any error the request goes out unchanged. The `llm_execution` middleware only reads the generation id and finish reason off the result.
+
+**Tool calls.** A `pre_tool_call` hook checks each tool call against HDR's rules (`hdr_rules.py`). At Watch, the default, it changes nothing. At Ask it hands calls scored 70 or more to Hermes' approval prompt, and at Block it stops them; either way it notes the call in `$HERMES_HOME/hermetic/hdr/guard.jsonl`. It never approves anything itself, and if the check itself fails, the call goes ahead as if the guard were off.
 
 **Model calls of its own.** Only when you press replay, compare, draft or judge, or when you turn on automatic tests.
 - Fix drafts, the judge and rubric drafts use Hermes' plugin model access (`ctx.llm`) on your main model. To let the judge use a different model, allow it in `config.yaml` under `plugins.entries.hermetic.llm` (`allow_model_override: true` and `allowed_models`).
@@ -100,8 +103,10 @@ Everything Hermetic records stays in `$HERMES_HOME/hermetic/` (ratings, tests, r
 | `desktop/plugin.js` | The popover: plain ESM for the Hermes plugin SDK, no build step |
 | `__init__.py` | Hooks and middleware: per-call cost and routing records, provider errors, empty-reply debugging |
 | `dashboard/plugin_api.py` | Backend routes under `/api/plugins/hermetic/` |
+| `hdr_rules.py` | What a tool call touches and how risky it is; shared by HDR and the guard |
 | `plugin.yaml` | Package manifest |
 | `tests/test_hdr.py` | HDR detection rules |
+| `tests/test_guard.py` | The guard: what it asks about, blocks and lets through |
 | `tests/test_credentials.py` | Hermetic's own model calls go through Hermes (`ctx.llm`, secret scope) |
 | `tests/test_detect.mjs` | How a profile's provider is read from its config |
 | `scripts/release.sh` | Tests, validates and pushes a release, then prints the catalog entry; `--pr` opens the catalog PR |

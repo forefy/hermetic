@@ -516,6 +516,79 @@ def _on_llm_request(**kw):
         return None
 
 
+# ---- HDR guard: ask (through Hermes' approval prompt) or block before a risky tool call ----------
+# One level per profile in hermetic/hdr/guard.json: watch (default, records only), ask or block. It acts
+# on calls HDR scores GUARD_MIN or more (keys, startup items, shell settings). Its own errors never block.
+GUARD_MIN = 70
+_GUARD_LEVELS = ("watch", "ask", "block")
+_GUARD_CACHE = {}
+_RULES = {}
+_OP_WORDS = {"read": "read", "write": "write", "code": "use in code", "workdir": "work in"}
+
+
+def _hdr_rules():
+    mod = _RULES.get("m")
+    if mod is None:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("_hermetic_hdr_rules", str(Path(__file__).resolve().with_name("hdr_rules.py")))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _RULES["m"] = mod
+    return mod
+
+
+def guard_level(home=None) -> str:
+    """This profile's guard level, re-read only when guard.json changes."""
+    p = data_dir(home) / "hdr" / "guard.json"
+    try:
+        mtime = p.stat().st_mtime
+    except OSError:
+        return "watch"
+    hit = _GUARD_CACHE.get(str(p))
+    if hit and hit[0] == mtime:
+        return hit[1]
+    try:
+        level = json.loads(p.read_text(encoding="utf-8")).get("level")
+    except Exception:
+        level = None
+    level = level if level in _GUARD_LEVELS else "watch"
+    _GUARD_CACHE[str(p)] = (mtime, level)
+    return level
+
+
+def _guard_log(row: dict) -> None:
+    try:
+        p = data_dir() / "hdr" / "guard.jsonl"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with open(p, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(row, separators=(",", ":")) + "\n")
+    except Exception:
+        pass
+
+
+def _on_pre_tool_call(tool_name="", args=None, task_id="", **kw):
+    try:
+        if tool_name == "tool_call":  # Hermes unwraps batches; each call inside comes through on its own
+            return None
+        level = guard_level()
+        if level == "watch":
+            return None
+        hits = [h for h in _hdr_rules().risky(tool_name, args) if h["score"] >= GUARD_MIN]
+        if not hits:
+            return None
+        top = hits[0]
+        what = "%s %s (%s)" % (_OP_WORDS.get(top["op"], top["op"]), top["path"], top["why"])
+        _guard_log({"ts": time.time(), "action": level, "tool": tool_name, "path": top["path"], "op": top["op"],
+                    "why": top["why"], "score": top["score"], "session_id": kw.get("session_id") or task_id or ""})
+        if level == "block":
+            return {"action": "block", "message": "Blocked by Hermetic's HDR guard: this would " + what
+                    + ". If it is needed, ask the user; they can change the guard in Hermetic, HDR."}
+        return {"action": "approve", "message": "Hermetic's HDR guard: this %s call would %s." % (tool_name, what),
+                "rule_key": "hermetic:%s:%s" % (top["op"], top["path"])}
+    except Exception:
+        return None
+
+
 def register(ctx) -> None:
     try:
         ctx.register_hook("post_api_request", _on_post_api_request)
@@ -535,5 +608,9 @@ def register(ctx) -> None:
         pass
     try:
         ctx.register_hook("api_request_error", _on_api_request_error)
+    except Exception:
+        pass
+    try:
+        ctx.register_hook("pre_tool_call", _on_pre_tool_call)
     except Exception:
         pass

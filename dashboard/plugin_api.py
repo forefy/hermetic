@@ -523,7 +523,7 @@ def _aai_snapshot_versions(home, ledger):
     for x in ledger:
         for a in x.get("after") or []:
             p, sha = a.get("path"), a.get("sha256")
-            if not p or not sha:
+            if not p or not sha or not _aai_safe_skill(x.get("skill", "unknown")) or not _aai_safe_version(str(sha)[:16]):
                 continue
             target = store / x.get("skill", "unknown") / (sha[:16] + "-" + os.path.basename(p))
             if target.exists():
@@ -1332,7 +1332,23 @@ def _aai_skill_path(home, name):
     return None
 
 
+# Skill names and version ids reach file paths (candidates/<skill>/<id>.md, skill-versions/<skill>/...),
+# so only the shapes Hermetic itself produces are accepted.
+_AAI_SKILL_NAME = _aai_re.compile(r"^[A-Za-z0-9][A-Za-z0-9._ -]{0,127}$")
+_AAI_VERSION_ID = _aai_re.compile(r"^(current|cand-[0-9a-f]{10}|[0-9a-f]{8,64})$")
+
+
+def _aai_safe_skill(skill):
+    return isinstance(skill, str) and bool(_AAI_SKILL_NAME.match(skill)) and ".." not in skill
+
+
+def _aai_safe_version(version):
+    return version is None or (isinstance(version, str) and bool(_AAI_VERSION_ID.match(version)))
+
+
 def _aai_version_text(home, skill, version):
+    if not _aai_safe_skill(skill) or not _aai_safe_version(version):
+        return None
     if version in (None, "current"):
         p = _aai_skill_path(home, skill)
         return p.read_text(encoding="utf-8", errors="ignore") if p else None
@@ -1346,6 +1362,8 @@ def _aai_version_text(home, skill, version):
 
 
 def _aai_saved_versions(home, skill):
+    if not _aai_safe_skill(skill):
+        return []
     d = _data_dir(home) / "skill-versions" / skill
     return sorted([{"sha": f.name[:16], "ts": f.stat().st_mtime} for f in d.glob("*-SKILL.md")], key=lambda x: x["ts"]) if d.exists() else []
 
@@ -1448,6 +1466,8 @@ async def aai_revert(payload: Dict[str, Any] = Body(default={}), profile: Option
 
 
 def _aai_keep_current(home, skill, path):
+    if not _aai_safe_skill(skill):
+        raise ValueError("unexpected skill name")
     data = path.read_bytes()
     sha = _aai_hashlib.sha256(data).hexdigest()
     t = _data_dir(home) / "skill-versions" / skill / (sha[:16] + "-SKILL.md")
@@ -1463,7 +1483,7 @@ async def aai_draft(payload: Dict[str, Any] = Body(default={}), profile: Optiona
     def _run():
         _n, home = _profile_home(profile)
         skill = payload.get("skill")
-        p = _aai_skill_path(home, skill) if skill else None
+        p = _aai_skill_path(home, skill) if _aai_safe_skill(skill) else None
         if not p:
             return {"ok": False, "error": "skill not found"}
         current = p.read_text(encoding="utf-8", errors="ignore")

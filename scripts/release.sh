@@ -53,7 +53,7 @@ VERSION=$(field version); REQUIRES=$(field requires_hermes)
 [ -n "$VERSION" ] && [ -n "$REQUIRES" ] || die "plugin.yaml needs version and requires_hermes"
 
 step "Catalog entry today"
-LIVE=$(gh api "repos/$UPSTREAM/contents/$ENTRY" -H "Accept: application/vnd.github.raw" 2>/dev/null || true)
+LIVE=$(gh api "repos/$UPSTREAM/contents/$ENTRY" -H "Accept: application/vnd.github.raw" 2>/dev/null) || LIVE=""
 OLD_SHA=$(printf '%s\n' "$LIVE" | sed -n 's/^sha: *//p')
 OLD_VERSION=$(printf '%s\n' "$LIVE" | sed -n 's/^version: *"\{0,1\}\([^"]*\)"\{0,1\}/\1/p')
 if [ -n "$OLD_SHA" ]; then
@@ -64,14 +64,18 @@ else
 fi
 
 step "Tests"
-node tests/test_detect.mjs | tail -1
+# quiet: show a suite's output only when it fails
+run() { local out; out=$("$@" 2>&1) || { echo "$out"; die "$* failed"; }; }
+run node tests/test_detect.mjs && echo "tests/test_detect.mjs passed"
 for t in tests/test_*.py; do
   out=$(bash "$HERMES_AGENT/scripts/run-in-hermes-env" python3 "$t" 2>&1) || { echo "$out"; die "$t failed"; }
   echo "$t passed"
 done
 
 step "Hermes validation"
-hermes plugins validate . --install-deps | tail -4
+out=$(hermes plugins validate . --install-deps 2>&1) || { echo "$out"; die "validation failed"; }
+printf '%s\n' "$out" | grep -A2 '^⚠' || true
+printf '%s\n' "$out" | tail -1
 
 step "Push"
 git fetch -q origin main
@@ -91,7 +95,8 @@ SHA=$SHA VERSION=$VERSION REQUIRES=$REQUIRES HOOKS=$(yaml_list provides_hooks) M
          return s }
        { n = split("SHA VERSION REQUIRES HOOKS MIDDLEWARE", ks, " "); for (j = 1; j <= n; j++) $0 = fill($0, ks[j]); print }' \
   catalog/hermetic.yaml.in > "$OUT/hermetic.yaml"
-bash "$HERMES_AGENT/scripts/run-in-hermes-env" python3 "$HERMES_AGENT/scripts/validate_plugin_catalog.py" "$OUT/hermetic.yaml"
+run bash "$HERMES_AGENT/scripts/run-in-hermes-env" python3 "$HERMES_AGENT/scripts/validate_plugin_catalog.py" "$OUT/hermetic.yaml"
+echo "validate_plugin_catalog.py: OK"
 for url in $(sed -n 's/^  - \(https:.*\)/\1/p' "$OUT/hermetic.yaml"); do
   [ "$(curl -s -o /dev/null -w '%{http_code}' "$url")" = 200 ] || die "screenshot not reachable: $url"
 done

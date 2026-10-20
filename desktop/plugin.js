@@ -1107,7 +1107,6 @@ function useMeterData() {
   const timer = useRef(null)
   const sidRef = useRef(null)
   const profileRef = useRef('default')
-  const seenProfiles = useRef(new Set())
 
   const refresh = async () => {
     if (busy.current) return
@@ -1115,12 +1114,6 @@ function useMeterData() {
     const profile = profileRef.current
     try {
       const [profiles, prices, yaml] = await Promise.all([loadProfiles(), loadPrices(), loadConfigRaw(profile)])
-      // a profile not seen before (e.g. just created) gets the plugin linked + enabled right away
-      const names = profiles.map(p => p.name)
-      if (names.some(n => !seenProfiles.current.has(n))) {
-        names.forEach(n => seenProfiles.current.add(n))
-        api({ path: '/api/plugins/hermetic/profiles-sync', method: 'POST' }).catch(() => {})
-      }
       // "profile": only the focused chat's profile; "all": every profile added up
       const scope = sget('scope', 'profile') === 'all' ? 'all' : 'profile'
       const scoped = scope === 'all' ? profiles : profiles.filter(p => p.name === profile)
@@ -1969,7 +1962,7 @@ const ago = ts => {
 // ---- AAI phases 2 and 3: shared helpers ----
 // Model calls (replay, drafts, judge) can take minutes; the desktop bridge gives up after 30 s and
 // allows only a few requests at once. So they run as backend jobs and this polls until done.
-const AAI_LONG = ['/replay', '/draft', '/judge', '/variants', '/update']
+const AAI_LONG = ['/replay', '/draft', '/judge', '/variants']
 const aaiPost = async (profile, path, body) => {
   const req = b => api(profileReq(profile, { path: '/api/plugins/hermetic/aai' + path, method: 'POST', body: b }))
   const long = AAI_LONG.includes(path) || (path === '/rubric' && body && body.draft)
@@ -2622,71 +2615,6 @@ const AaiView2 = ({ profile, period, yaml, orProfile, auxOn, onChanged }) => {
     el(Section, { id: 'aai2-settings', title: 'Settings' }, el(AaiSettings, { profile, ratings })))
 }
 
-// "Updates" row at the bottom of every view: checks once a day (or on demand) and applies an update.
-// "updated" lives only until the plugin reloads, which a restart (or a pulled checkout) does.
-let updateDone = false
-const UpdateLine = ({ profile }) => {
-  const [st, setSt] = useState(() => (updateDone ? { done: true } : sget('update', null)))
-  const [busy, setBusy] = useState(null)
-  const go = async (action, force) => {
-    setBusy(action)
-    try {
-      const r = await aaiPost(profile, '/update', force ? { action, force: true } : { action })
-      if (action === 'apply') {
-        if (r && r.ok) {
-          updateDone = true
-          sset('update', { ok: true, available: false, ts: Date.now() })
-        }
-        // Hermes' install scan stopped it: the person decides whether to install anyway
-        setSt(s => (r && r.ok ? { ...s, available: false, done: true, scan: null } : r && r.scan_blocked ? { ...s, scan: r.findings || true } : { ...s, error: (r && r.error) || 'Update failed' }))
-      } else {
-        const next = r && r.ok ? { ...r, ts: Date.now() } : { error: (r && r.error) || 'Could not check', ts: Date.now() }
-        setSt(next)
-        sset('update', next)
-      }
-    } catch (e) {
-      // an older backend has no update route yet: stay hidden until Hermes restarts
-      setSt(/404|Not Found/i.test(String(e && e.message)) ? { hidden: true } : { error: (e && e.message) || 'Could not check' })
-    } finally {
-      setBusy(null)
-    }
-  }
-  useEffect(() => { if (!updateDone && (!st || st.hidden || Date.now() - (st.ts || 0) > 86400000)) go('check') }, [])
-  if (!st || st.hidden) return null
-  const version = st.current ? String(st.current).slice(0, 7) : null
-  const right = busy === 'apply' ? el('span', { style: { color: C.dim } }, 'updating…')
-    : st.done ? el('span', { style: { color: C.ok } }, 'restart')
-    : st.scan ? el('span', { style: { color: C.warn } }, 'needs your OK')
-    : st.error ? el('span', { style: { color: C.warn } }, 'check failed')
-    : st.available ? el('span', { style: { color: C.accent } }, st.behind ? st.behind + ' new' : 'new version')
-    : el('span', { style: { color: C.dim } }, busy === 'check' ? 'checking…' : 'up to date')
-  const btn = (label, onClick, kind) => el('button', { type: 'button', onClick, disabled: !!busy, style: { font: 'inherit', fontSize: 10.5, padding: '3px 10px', borderRadius: 6, cursor: busy ? 'default' : 'pointer', opacity: busy ? 0.6 : 1,
-    border: kind === 'warn' ? '1px solid ' + C.warn : kind === 'ghost' ? '1px solid ' + C.stroke : 'none', background: kind ? 'transparent' : C.accent, color: kind === 'warn' ? C.warn : kind === 'ghost' ? C.sub : '#fff' } }, label)
-  const note = (t, color) => el('div', { style: { fontSize: 10.5, color: color || C.dim, lineHeight: 1.5 } }, t)
-  const actions = (...kids) => el('div', { style: { display: 'flex', gap: 8, alignItems: 'center', marginTop: 8 } }, ...kids)
-  const body = st.done
-    ? note('Updated. Restart Hermes to finish: Hermes menu, Quit and Keep Windows.')
-    : st.scan
-      ? el('div', null,
-          note("Hermes' install scan flagged this update" + (st.scan !== true ? ' (' + st.scan + ' findings)' : '') + '. It flags the sensitive paths HDR watches, such as ~/.ssh and startup folders; Hermetic never opens them.', C.warn),
-          actions(btn('Install anyway', () => go('apply', true), 'warn'), note('reinstalls from the same source with --force')))
-      : st.error
-        ? el('div', null, note(st.error, C.warn), actions(btn('Try again', () => go('check'), 'ghost')))
-        : st.available
-          ? el('div', null,
-              (st.incoming || []).length
-                ? el('div', null, st.incoming.map((x, i) => el('div', { key: i, style: { display: 'flex', gap: 7, alignItems: 'baseline', fontSize: 10.5, color: C.sub, padding: '1px 0' } },
-                    el('span', { style: { width: 4, height: 4, borderRadius: 2, background: C.accent, flex: 'none', transform: 'translateY(-2px)' } }), x)))
-                : note('A newer Hermetic is available.'),
-              st.dirty
-                ? note('This checkout has local changes. Commit or stash them, then update.', C.warn)
-                : actions(btn(busy === 'apply' ? 'Updating…' : 'Update', () => go('apply')), note('then restart Hermes')))
-          : el('div', null,
-              note('Hermetic' + (version ? ' ' + version : '') + (st.ts ? ', checked ' + (Date.now() - st.ts < 90000 ? 'just now' : ago(st.ts / 1000)) : '')),
-              actions(btn(busy === 'check' ? 'Checking…' : 'Check now', () => go('check'), 'ghost')))
-  return el(Section, { id: 'updates', title: 'Updates', right }, body)
-}
-
 // ---- HDR: harness detection and response (recording only) ----------------------------------------
 const HDR_TONE = { bad: C.bad, warn: C.warn, ok: C.ok }
 const HDR_SEQ = [C.accent, 'var(--ui-cyan)', 'var(--ui-purple)', C.sub, C.dim, C.faint]
@@ -2732,12 +2660,16 @@ const HdrPosture = ({ rows, profile, onChanged }) => {
     await api(profileReq(profile, { path: '/api/config', method: 'PUT', body: { config: { command_allowlist: next } } }))
   })
   const control = r => {
-    if (r.key === 'approvals') return el('div', { style: { display: 'flex', gap: 6, flexWrap: 'wrap' } },
-      [['manual', 'Ask me'], ['smart', 'Smart'], ['off', 'Off']].map(([v, l]) => hdrBtn(l, () => setKey('approvals.mode', v), r.value === v, busy, v === 'off')))
+    if (r.key === 'approvals') {
+      // only toward asking more: off < smart < manual; loosening is done in Hermes settings
+      const rank = { off: 0, yolo: 0, smart: 1, manual: 2 }
+      const up = [['smart', 'Smart'], ['manual', 'Ask me']].filter(([v]) => rank[v] > (rank[r.value] != null ? rank[r.value] : 2))
+      return up.length ? el('div', { style: { display: 'flex', gap: 6, flexWrap: 'wrap' } }, up.map(([v, l]) => hdrBtn(l, () => setKey('approvals.mode', v), false, busy))) : aSmall('Hermes asks you before risky commands.')
+    }
     if (r.key === 'allowlist') return (r.items || []).length
       ? el('div', null, r.items.map((x, i) => hdrLine('a' + i, el('span', { className: 'mono', style: { flex: 1, minWidth: 0, fontSize: 10.5, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, x), hdrBtn('Remove', () => dropAllowed(x), false, busy, true))))
       : aSmall('Nothing is allowed permanently.')
-    if (r.key === 'browser') return el('div', { style: { display: 'flex', gap: 6 } }, hdrBtn('Your profile', () => merge({ browser: { use_real_profile: true } }), r.value === 'your profile', busy), hdrBtn('Separate profile', () => merge({ browser: { use_real_profile: false } }), r.value !== 'your profile', busy))
+    if (r.key === 'browser' && r.value === 'your profile') return hdrBtn('Use a separate browser profile', () => merge({ browser: { use_real_profile: false } }), false, busy)
     if (r.key === 'inbound' && r.value === 'anyone') return hdrBtn('Only people I pair', () => merge({ gateway: { allow_all_users: false } }), false, busy, true)
     if (r.key === 'api' && r.value !== 'off') return hdrBtn('Turn the API server off', () => merge({ gateway: { api_server: { enabled: false } } }), false, busy, true)
     return null
@@ -3185,9 +3117,8 @@ const Body = ({ meter, prices, threshold, retries, yaml, profile, profileLabel, 
         el('button', { type: 'button', 'aria-label': 'Show the ' + name + ' view', onClick: () => onView && onView(id), style: { width: 6, height: 6, padding: 0, border: 'none', borderRadius: 3, cursor: 'pointer', background: i === vi ? C.text : C.faint } })))),
     arrow(to, dir > 0 ? 'm6 3 5 5-5 5' : 'm10 3-5 5 5 5')
   )
-  const foot = el(UpdateLine, { profile: null })
-  if (view === 'hdr') return el('div', { style: cardStyle }, head, el(HdrView, { profile, period }), foot)
-  if (isAai) return el('div', { style: cardStyle }, head, el(AaiView2, { profile, period, yaml, orProfile, auxOn: !!(meter.aux && meter.aux.enabled), onChanged: refresh }), foot)
+  if (view === 'hdr') return el('div', { style: cardStyle }, head, el(HdrView, { profile, period }))
+  if (isAai) return el('div', { style: cardStyle }, head, el(AaiView2, { profile, period, yaml, orProfile, auxOn: !!(meter.aux && meter.aux.enabled), onChanged: refresh }))
   return el(
     'div',
     { style: cardStyle },
@@ -3325,8 +3256,7 @@ const Body = ({ meter, prices, threshold, retries, yaml, profile, profileLabel, 
       profileLabel,
       onApplied: refresh
     }),
-    pending.length ? el(Improve, { items: pending, yaml, profile, onApplied: refresh }) : null,
-    foot
+    pending.length ? el(Improve, { items: pending, yaml, profile, onApplied: refresh }) : null
   )
 }
 

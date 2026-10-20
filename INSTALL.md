@@ -9,11 +9,19 @@ Hermes installs plugins switched off by default. The install command below turns
 
 ## Install
 
+From the Hermes plugin catalog, once it is listed there:
+
+```bash
+hermes plugins install hermetic --enable
+```
+
+Or straight from GitHub, for the latest commit before it reaches the catalog:
+
 ```bash
 hermes plugins install forefy/hermetic --enable --force
 ```
 
-Why `--force`: Hermes scans every plugin before installing it. Hermetic's HDR view watches sensitive places such as `~/.ssh`, cloud keys and startup folders, so its code names those paths, and the scan reads a list of them as a possible credential grab. That gives a "caution" verdict, which Hermes blocks for plugins from GitHub unless you pass `--force`. Hermetic never opens those files: it only checks whether a tool call touched them. The list is `_HDR_SENSITIVE` in `dashboard/plugin_api.py`, and you can read the scan yourself by running the command without `--force` first.
+Why `--force` from GitHub: Hermes scans every plugin before installing it. Hermetic's HDR view watches sensitive places such as `~/.ssh`, cloud keys and startup folders, so its code names those paths, and the scan reads a list of them as a possible credential grab. That gives a "caution" verdict, which Hermes blocks for plugins from GitHub unless you pass `--force`. Catalog installs skip that prompt because a maintainer read the same findings at the pinned commit. Hermetic never opens those files: it only checks whether a tool call touched them. The list is `_HDR_SENSITIVE` in `dashboard/plugin_api.py`, and you can read the scan yourself by running the GitHub command without `--force` first.
 
 Then:
 
@@ -39,19 +47,20 @@ Click it. A popover opens with **Hermetic Costs** at the top; the arrow at the t
 
 | What you see | Why | Fix |
 |---|---|---|
-| The install stops with "Blocked (community source + caution verdict)" | Hermes' install scan flags HDR's list of watched paths | Review the findings, then add `--force` as shown above |
+| A GitHub install stops with "Blocked (community source + caution verdict)" | Hermes' install scan flags HDR's list of watched paths | Review the findings, then add `--force` as shown above, or install from the catalog |
 | The agent says it is installed, but there is no button | The Desktop half is off | Capabilities, Plugins, Hermetic: switch **Desktop** on |
 | The Plugins page shows "copying…" next to Desktop | Hermes has not restarted since the install | Quit and Keep Windows, then open Hermes |
 | The button is there, but AAI or HDR asks you to restart | The backend is not loaded in this profile | Restart Hermes, and check that **Agent** is on for this profile |
 | Provider routing, the policy bar or the OpenRouter account card are missing | Costs follows the profile of the chat you are in, and that profile does not use OpenRouter | Open a chat in an OpenRouter profile, or click the profile pill next to the total to see all profiles |
 
-Hermetic turns itself on in your other Hermes profiles the first time the popover loads, so you install it once.
+Hermes turns plugins on per profile. To use Hermetic in another profile, switch to it, open **Capabilities**, then **Plugins**, and click **Install here** on Hermetic.
 
 ## Update
 
-The bottom of the popover checks for a newer Hermetic once a day. When one is out, it says how many updates are available (hover for the list) and shows an **Update** button. Hermes' install scan checks every update and flags HDR's list of watched paths again; the popover then says so and offers **Install anyway**, which reinstalls from the same source with `--force`.
+Hermetic does not update itself. Updates come through Hermes:
 
-From a terminal, `hermes plugins update hermetic` stops at the same scan and has no override, so reinstall instead:
+- **Catalog install**: the Plugins page shows **Update to x.y** when the catalog moves to a newer reviewed commit, or run `hermes plugins update hermetic`.
+- **GitHub install**: reinstall to pick up the latest commit:
 
 ```bash
 hermes plugins install forefy/hermetic --enable --force

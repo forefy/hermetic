@@ -2,7 +2,7 @@
 
 A status-bar popover for the [Hermes](https://github.com/NousResearch/hermes-agent) desktop app. It shows what your agent costs, whether its skills and replies are getting better or worse, and what the harness itself touched.
 
-**Install:** `hermes plugins install forefy/hermetic --enable --force`, then see [INSTALL.md](INSTALL.md) (why `--force`, two more steps, and how to check it worked).
+**Install:** `hermes plugins install hermetic --enable` from the Hermes plugin catalog once it is listed, or `hermes plugins install forefy/hermetic --enable --force` from GitHub. Then see [INSTALL.md](INSTALL.md) (two more steps, and how to check it worked).
 
 It has three views in the same popover: Costs, AAI and HDR. The dots at the top right show which one you are on, and the arrow steps through them.
 
@@ -43,7 +43,7 @@ It has three views in the same popover: Costs, AAI and HDR. The dots at the top 
   <img src="docs/hermetic-aai-settings.png" alt="Changed skills and settings for automatic tests and the judge" width="400">
 </p>
 
-Parts that only make sense with OpenRouter (provider routing, provider comparison, fallback) hide themselves when the profile does not use it. Spend, cache, sessions, ratings, corrections, the timeline and skill history work with any provider. Replays, fix drafts and the judge call models through OpenRouter, so they need an OpenRouter key set up in Hermes.
+Parts that only make sense with OpenRouter (provider routing, provider comparison, fallback) hide themselves when the profile does not use it. Spend, cache, sessions, ratings, corrections, the timeline and skill history work with any provider. Fix drafts and the judge go through Hermes' own model access for plugins, on your main model. Replays rerun a test on a chosen model and provider through OpenRouter, so they need an OpenRouter key set up in Hermes.
 
 ## HDR (harness detection and response)
 
@@ -67,16 +67,31 @@ Next: asking or blocking before a risky tool call runs, through Hermes' own appr
 ## Install
 
 ```bash
-hermes plugins install forefy/hermetic --enable --force
+hermes plugins install hermetic --enable
 ```
 
-`--force` is needed because Hermes' install scan flags the list of sensitive paths HDR watches; [INSTALL.md](INSTALL.md) explains it. Then restart Hermes and switch on Hermetic's **Desktop** half under Capabilities, Plugins. Hermes installs it switched off, so this is the step that makes the button appear. [INSTALL.md](INSTALL.md) has the steps, what you should see when it worked, and fixes for what can go wrong.
+That is the catalog install, once Hermetic is listed. From GitHub, use `hermes plugins install forefy/hermetic --enable --force`: `--force` is needed there because Hermes' install scan flags the list of sensitive paths HDR watches, and [INSTALL.md](INSTALL.md) explains it. Then restart Hermes and switch on Hermetic's **Desktop** half under Capabilities, Plugins. Hermes installs it switched off, so this is the step that makes the button appear. [INSTALL.md](INSTALL.md) has the steps, what you should see when it worked, and fixes for what can go wrong.
 
-## Costs of its own and your data
+Hermetic does not update itself. Catalog installs update from the Hermes Plugins page or with `hermes plugins update hermetic`; GitHub installs update by running the install command again.
 
-- Hermetic makes model calls only when you press replay, compare, draft or judge, or when you turn on automatic tests. Those use your own OpenRouter key through Hermes, follow your routing rules (zero data retention, no data collection), and appear in your spend like any other call. A replay costs about $0.01 per test. Automatic tests stop at $0.50 a day.
-- HDR reads Hermes' own records and runs `ps` and `lsof` locally to list ports. Nothing it finds leaves your machine.
-- Everything it records stays on your machine in `$HERMES_HOME/hermetic/` (ratings, tests, replay results, saved skill versions, routing history). No API key ever reaches the popover.
+## What it does on your machine
+
+**Model requests.** On every request that goes to OpenRouter, Hermetic's `llm_request` middleware adds the routing fields from `provider_routing` in your `config.yaml` that Hermes does not send on its own: fallbacks, zero data retention, distillable text, quantizations, max price, minimum throughput and maximum latency, including per-model overrides. Requests to any other provider go out unchanged, and on any error the request goes out unchanged. The `llm_execution` middleware only reads the generation id and finish reason off the result.
+
+**Model calls of its own.** Only when you press replay, compare, draft or judge, or when you turn on automatic tests.
+- Fix drafts, the judge and rubric drafts use Hermes' plugin model access (`ctx.llm`) on your main model. To let the judge use a different model, allow it in `config.yaml` under `plugins.entries.hermetic.llm` (`allow_model_override: true` and `allowed_models`).
+- Replays call OpenRouter with the `OPENROUTER_API_KEY` Hermes holds for the profile, read through Hermes' secret scope. They follow your routing rules and appear in your spend like any other call. A replay costs about $0.01 per test; automatic tests stop at $0.50 a day.
+- No API key ever reaches the popover.
+
+**Network.** The popover reads OpenRouter's public model, provider and zero-retention lists. The backend asks Hermes for your OpenRouter account usage (at most every few minutes, OpenRouter profiles only) to show billed spend. Nothing else leaves your machine.
+
+**What it reads.** Hermes' session database, `config.yaml`, the skills and their change history, scheduled jobs, SOUL.md and the memory files (sizes and change times), installed plugin sources (to see what each registers), and its own routing records. HDR runs `ps` and `lsof` locally to list ports opened under Hermes.
+
+**What it writes, and only when you ask.** Routing rules and the fixes you apply (through Hermes' config API, shown before writing), the posture settings you tighten from HDR, archived skills, skill versions you ship or revert, and test results. Posture controls only make settings stricter; loosening one opens Hermes' own settings.
+
+**In the background.** A thread checks every 5 minutes for skill changes made by the background review, and acts only if you turned automatic tests on. A short-lived thread stores the billed-spend snapshot.
+
+Everything Hermetic records stays in `$HERMES_HOME/hermetic/` (ratings, tests, replay results, saved skill versions, routing history).
 
 ## Layout
 
@@ -87,6 +102,7 @@ hermes plugins install forefy/hermetic --enable --force
 | `dashboard/plugin_api.py` | Backend routes under `/api/plugins/hermetic/` |
 | `plugin.yaml` | Package manifest |
 | `tests/test_hdr.py` | HDR detection rules; run with the Python that runs Hermes: `python tests/test_hdr.py` |
+| `tests/test_credentials.py` | Hermetic's own model calls go through Hermes (`ctx.llm`, secret scope): `python tests/test_credentials.py` |
 | `tests/test_detect.mjs` | How a profile's provider is read from its config: `node tests/test_detect.mjs` |
 
 Check the package with `hermes plugins validate .`

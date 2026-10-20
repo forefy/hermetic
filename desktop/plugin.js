@@ -3147,6 +3147,8 @@ const Body = ({ meter, prices, threshold, retries, yaml, profile, profileLabel, 
   // cache hit for the period, or the hovered / pinned day
   const cacheRows = (shown ? m.series.filter(r => r.day === shown) : m.series).reduce((a, r) => ({ input: a.input + num(r.input), cache: a.cache + num(r.cache) }), { input: 0, cache: 0 })
   const cacheHit = hitRate(cacheRows.input, cacheRows.cache)
+  // prompt tokens but not one cached token all period: most likely the provider does not report cache use
+  const cacheUnreported = cacheHit != null && m.series.every(r => !num(r.cache))
   const topPrice = m.top ? priceOf(prices, m.top.model) : null
   const cacheCheaper = topPrice && topPrice.cache > 0 && topPrice.in > topPrice.cache ? topPrice.in / topPrice.cache : null
 
@@ -3283,12 +3285,13 @@ const Body = ({ meter, prices, threshold, retries, yaml, profile, profileLabel, 
             tip: 'Background review, compression and title generation billed on paid models (' + fmtPct(m.auxShare * 100) + ' of spend)'
           }),
       el(Cell, {
-        tone: cacheHit == null ? null : cacheHit >= 0.9 ? 'ok' : cacheHit >= 0.75 ? 'warn' : 'bad',
+        tone: cacheHit == null || cacheUnreported ? null : cacheHit >= 0.9 ? 'ok' : cacheHit >= 0.75 ? 'warn' : 'bad',
         label: 'Cache hit',
-        value: fmtHit(cacheHit),
+        value: cacheUnreported ? 'not reported' : fmtHit(cacheHit),
         sub: m.resets.total ? m.resets.total + (m.resets.total === 1 ? ' reset' : ' resets') + '\u2003' + fmtUsd(m.resets.toll * (drift != null ? drift : 1)) : '',
-        tip:
-          (cacheHit == null
+        tip: cacheUnreported
+          ? 'No cached tokens were reported this period. ' + (meter.providerName || 'This provider') + ' may not report cache use, or nothing was cached.'
+          : (cacheHit == null
             ? 'No prompt tokens in this period. '
             : fmtTok(cacheRows.cache) + ' of ' + fmtTok(cacheRows.cache + cacheRows.input) + ' prompt tokens came from the provider\'s cache' + (shown ? ' on ' + dayLabel(shown) : ' this period') + (cacheCheaper ? ', about ' + Math.round(cacheCheaper) + '× cheaper than fresh input for ' + shortModel(m.top.model) : '') + '. ') +
           'Resets, calls that re-sent the whole context: ' + m.resets.swaps + (orAny ? ' provider swaps, ' : ' cache misses, ') + m.resets.compactions + ' after compaction, retries in 30 days: ' + retries

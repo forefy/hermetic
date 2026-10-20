@@ -93,5 +93,6 @@ cd hermetic
 | `dashboard/plugin_api.py` | Backend routes under `/api/plugins/hermetic/` |
 | `plugin.yaml` | Package manifest |
 | `tests/test_hdr.py` | HDR detection rules; run with the Python that runs Hermes: `python tests/test_hdr.py` |
+| `tests/test_detect.mjs` | How a profile's provider is read from its config: `node tests/test_detect.mjs` |
 
 Check the package with `hermes plugins validate .`

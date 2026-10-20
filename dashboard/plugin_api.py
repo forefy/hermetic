@@ -200,6 +200,9 @@ async def sessions(days: int = Query(30, ge=1, le=365), profile: Optional[str] =
         db = _open_sessions_db(profile)
         try:
             cutoff = time.time() - (days * 86400)
+            # where each chat was billed; older session databases have no such columns
+            have = {r[1] for r in db._conn.execute("PRAGMA table_info(sessions)")}
+            billing = "billing_provider, billing_base_url," if {"billing_provider", "billing_base_url"} <= have else ""
             rows = _rows(db, """
                 SELECT id, title, source, model, parent_session_id, hidden, archived,
                        COALESCE(api_call_count, 0) as api_call_count,
@@ -208,7 +211,7 @@ async def sessions(days: int = Query(30, ge=1, le=365), profile: Optional[str] =
                        COALESCE(output_tokens, 0) as output_tokens,
                        COALESCE(cache_read_tokens, 0) as cache_read_tokens,
                        COALESCE(reasoning_tokens, 0) as reasoning_tokens,
-                       estimated_cost_usd, actual_cost_usd,
+                       estimated_cost_usd, actual_cost_usd, """ + billing + """
                        started_at, COALESCE(last_activity_at, started_at) as last_activity_at
                 FROM sessions
                 WHERE COALESCE(last_activity_at, started_at) > ? AND COALESCE(api_call_count, 0) > 0

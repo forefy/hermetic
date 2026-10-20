@@ -243,7 +243,9 @@ const mapSessionRow = (s, profile) => ({
   cost: num(s.actual_cost_usd) || num(s.estimated_cost_usd),
   started: num(s.started_at),
   last: num(s.last_active) || num(s.last_activity_at) || num(s.started_at),
-  active: !!s.is_active
+  active: !!s.is_active,
+  provider: s.billing_provider || '',
+  base: s.billing_base_url || ''
 })
 
 async function loadSessions(profiles) {
@@ -351,14 +353,21 @@ async function loadConfigRaw(profile) {
 
 // Does this profile's main model go through OpenRouter? true/false from model.provider or
 // model.base_url; null for "auto" (then recorded OpenRouter calls decide).
-function configUsesOpenRouter(yaml) {
+// One key of the model block, whatever the indentation (2 spaces, 4, a tab) or an inline {...} form.
+function modelKey(yaml, key) {
   const block = yamlBlock(yaml, 'model')
-  const val = key => {
-    const l = block.find(x => new RegExp('^\\s{2}' + key + ':').test(x))
-    return l ? l.split(':').slice(1).join(':').replace(/#.*$/, '').replace(/['"]/g, '').trim().toLowerCase() : ''
-  }
-  const provider = val('provider')
-  if (provider === 'openrouter' || /openrouter\.ai/.test(val('base_url'))) return true
+  const first = block.find(x => /^\s+\S/.test(x))
+  const depth = first ? first.match(/^\s+/)[0] : '  '
+  const l = block.find(x => x.startsWith(depth + key + ':'))
+  if (l) return l.split(':').slice(1).join(':').replace(/#.*$/, '').replace(/['"]/g, '').trim()
+  const inline = String(yaml).split('\n').find(x => /^model:\s*\{/.test(x)) || ''
+  const m = new RegExp('[{,\\s]' + key + ':\\s*["\']?([^,}"\']+)').exec(inline)
+  return m ? m[1].trim() : ''
+}
+
+function configUsesOpenRouter(yaml) {
+  const provider = modelKey(yaml, 'provider').toLowerCase()
+  if (provider === 'openrouter' || /openrouter\.ai/i.test(modelKey(yaml, 'base_url'))) return true
   if (!provider || provider === 'auto') return null
   return false
 }
@@ -373,6 +382,24 @@ function parseThreshold(yaml) {
     if (m) return parseFloat(m[1])
   }
   return 0.5
+}
+
+// The provider a profile's model calls go to, as a short name for labels ("OpenRouter", "hopscotchlabs.ai").
+function providerLabel(yaml) {
+  if (configUsesOpenRouter(yaml) === true) return 'OpenRouter'
+  const prov = modelKey(yaml, 'provider').toLowerCase()
+  const known = { nous: 'Nous Portal', anthropic: 'Anthropic', openai: 'OpenAI', gemini: 'Google', google: 'Google' }[prov]
+  if (known) return known
+  const host = (/\/\/([^/:]+)/.exec(modelKey(yaml, 'base_url')) || [])[1]
+  if (host) return host.replace(/^(api|inference-api|inference)\./, '')
+  return prov && prov !== 'auto' && prov !== 'custom' ? prov : 'Hermes'
+}
+
+const sessionProvider = s => {
+  const p = String(s.provider || ''), b = String(s.base || '')
+  if (/openrouter/i.test(p + b)) return 'OpenRouter'
+  const host = (/\/\/([^/:]+)/.exec(b) || [])[1]
+  return host ? host.replace(/^(api|inference-api|inference)\./, '') : p.replace(/^custom:/, '').replace(/^(api|inference-api|inference)\./, '')
 }
 
 function yamlBlock(yaml, top) {
@@ -1057,8 +1084,12 @@ function useMeterData() {
         names.forEach(n => seenProfiles.current.add(n))
         api({ path: '/api/plugins/hermetic/profiles-sync', method: 'POST' }).catch(() => {})
       }
-      const [analytics, sessionsResult, retries, account, routing, aux, billedHistory, health] = await Promise.all([
-        loadAllAnalytics(profiles),
+      // "profile": only the focused chat's profile; "all": every profile added up
+      const scope = sget('scope', 'profile') === 'all' ? 'all' : 'profile'
+      const scoped = scope === 'all' ? profiles : profiles.filter(p => p.name === profile)
+      const shown = scoped.length ? scoped : profiles
+      const [analytics, sessionsResult, retries, account, routingAll, aux, billedHistory, health] = await Promise.all([
+        loadAllAnalytics(shown),
         loadSessions(profiles),
         loadRetries(lastNDays(DEFAULT_DAYS)[0]),
         loadAccount(sidRef.current),
@@ -1067,11 +1098,24 @@ function useMeterData() {
         loadBilledHistory(),
         loadHealth()
       ])
+      const inScope = new Set(shown.map(p => p.name))
+      const routing = { ...routingAll, rows: routingAll.rows.filter(r => inScope.has(r.profile)) }
       // OpenRouter-only parts show for a profile that routes through OpenRouter (or, on "auto",
-      // has recorded OpenRouter calls); the providers chart also shows when any profile has history.
-      const orCfg = configUsesOpenRouter(yaml)
-      const orProfile = orCfg === true || (orCfg == null && routing.rows.some(r => r.profile === profile))
-      const orAny = orProfile || routing.rows.length > 0 || !!account
+      // has recorded OpenRouter calls); with all profiles, also when any profile has history.
+      let orCfg = configUsesOpenRouter(yaml)
+      if (orCfg == null) {
+        // "auto" or unreadable: trust where this profile's latest chat was actually billed
+        const latest = sessionsResult.sessions.filter(x => x.profile === profile && (x.provider || x.base)).sort((a, b) => b.last - a.last)[0]
+        if (latest) orCfg = /openrouter/i.test(latest.provider + latest.base)
+      }
+      const orProfile = orCfg === true || (orCfg == null && routingAll.rows.some(r => r.profile === profile))
+      const orNames = new Set(routingAll.rows.map(r => r.profile).filter(Boolean))
+      if (orCfg === true) orNames.add(profile)
+      const orAny = scope === 'all' ? orProfile || routingAll.rows.length > 0 || !!account : orProfile
+      // OpenRouter bills the whole key, so the bill is compared with every profile that uses it
+      const orList = profiles.filter(p => orNames.has(p.name))
+      const sameSet = orList.length === shown.length && orList.every(p => inScope.has(p.name))
+      const orAnalytics = account && orList.length && !sameSet ? await loadAllAnalytics(orList) : null
       const topModel = (sessionsResult.sessions.slice().sort((a, b) => b.cost - a.cost)[0] || {}).model || ''
       const routeModels = Array.from(
         new Set(
@@ -1104,7 +1148,10 @@ function useMeterData() {
         loading: false,
         error: null,
         cheapest,
-        data: { ...analytics, sessions: sessionsResult.sessions, sessionsComplete: sessionsResult.complete, routing, endpoints, aux, health },
+        data: { ...analytics, sessions: sessionsResult.sessions.filter(x => inScope.has(x.profile)), sessionsComplete: sessionsResult.complete, routing, endpoints, aux, health,
+          orDaily: orAnalytics ? orAnalytics.daily : null, providerName: providerLabel(yaml) },
+        scope,
+        profileCount: profiles.length,
         prices,
         threshold: parseThreshold(yaml),
         retries,
@@ -1113,7 +1160,8 @@ function useMeterData() {
         profileLabel: (profiles.find(p => p.name === profile) || {}).label || profile,
         orProfile,
         orAny,
-        account: account || s.account
+        // the OpenRouter account card belongs to OpenRouter profiles (or to the all-profiles total)
+        account: scope === 'all' || orProfile ? account || s.account : null
       }))
     } catch (e) {
       setState(s => ({ ...s, loading: false, error: (e && e.message) || 'load failed' }))
@@ -1152,7 +1200,13 @@ function useMeterData() {
     }
   }, [])
 
-  return { ...state, refresh }
+  const setScope = v => {
+    sset('scope', v)
+    setState(s => ({ ...s, scope: v }))
+    if (busy.current) setTimeout(refresh, 900)
+    else refresh()
+  }
+  return { ...state, refresh, setScope }
 }
 
 function useLive(prices, fallbackModel) {
@@ -2806,7 +2860,7 @@ const HdrView = ({ profile, period }) => {
 // direction of the view arrow, kept across renders (see the header in Body)
 let navDir = 1
 
-const Body = ({ meter, prices, threshold, retries, yaml, profile, profileLabel, refresh, rates, defaultModel, account, onPeriod, cheapest, orProfile = true, orAny = true, view = 'costs', onView }) => {
+const Body = ({ meter, prices, threshold, retries, yaml, profile, profileLabel, refresh, rates, defaultModel, account, onPeriod, cheapest, orProfile = true, orAny = true, view = 'costs', onView, scope = 'all', profileCount = 1, onScope }) => {
   const currentId = useValue(host.state.focusedStoredSessionId) || null
   const [period, setPeriod] = useState(() => sget('period', '7d'))
   const [hover, setHover] = useState(null)
@@ -2836,14 +2890,26 @@ const Body = ({ meter, prices, threshold, retries, yaml, profile, profileLabel, 
   const windowRows = windowStart ? m.series.filter(r => r.day >= windowStart) : m.series
   const periodHermes = windowRows.reduce((a, r) => a + r.cost, 0)
   const hermesCost = shown ? (m.series.find(r => r.day === shown) || { cost: 0 }).cost : m.periodCost
-  const headline = shown ? hermesCost : acct != null ? acct : periodHermes
-  const lastDay = m.days[m.days.length - 1]
-  const rangeLabel = period === 'today' ? 'today' : windowStart ? dayLabel(windowStart) + ' – ' + dayLabel(lastDay) : dayLabel(m.days[0]) + ' – ' + dayLabel(lastDay)
-  const headlineLabel = shown ? dayLabel(shown) + ' on Hermes' : acct != null ? rangeLabel + ' on OpenRouter' : rangeLabel + ' on Hermes'
+  // OpenRouter's bill covers every profile on the key; compare it with those profiles' list cost
+  const inPeriod = new Set(m.series.map(r => r.day))
+  const periodOR = meter.orDaily ? Array.from(meter.orDaily.values()).filter(r => (windowStart ? r.day >= windowStart : inPeriod.has(r.day))).reduce((a, r) => a + r.cost, 0) : periodHermes
   // Hermes books a session's cost to its start day, so a one-day comparison is attribution noise.
   const comparable = period !== 'today'
-  const elsewhere = comparable && acct != null ? Math.max(0, acct - periodHermes) : null
-  const drift = comparable && acct != null && periodHermes > 0.5 && acct > 0 ? acct / periodHermes : null
+  const elsewhere = comparable && acct != null ? Math.max(0, acct - periodOR) : null
+  const drift = comparable && acct != null && periodOR > 0.5 && acct > 0 ? acct / periodOR : null
+  // one profile sharing the key with others gets its share of the bill (its list cost times the drift);
+  // all profiles get the bill plus the list cost of profiles billed elsewhere
+  const share = acct != null && !!meter.orDaily && scope !== 'all'
+  const nonOR = acct != null && meter.orDaily && scope === 'all' ? Math.max(0, periodHermes - periodOR) : 0
+  const headline = shown ? hermesCost : acct != null ? (share ? (drift != null ? periodHermes * drift : periodHermes) : acct + nonOR) : periodHermes
+  const lastDay = m.days[m.days.length - 1]
+  const rangeLabel = period === 'today' ? 'today' : windowStart ? dayLabel(windowStart) + ' – ' + dayLabel(lastDay) : dayLabel(m.days[0]) + ' – ' + dayLabel(lastDay)
+  // chats billed through more than one provider: their list cost per provider
+  const byProv = {}
+  for (const x of m.sessions) { const k = sessionProvider(x); if (k) byProv[k] = (byProv[k] || 0) + num(x.cost) }
+  const provSplit = Object.entries(byProv).filter(([, v]) => v > 0).sort((a, b) => b[1] - a[1])
+  const where = acct != null ? (nonOR > 0 || provSplit.length > 1 ? 'OpenRouter and others' : 'OpenRouter') : provSplit.length > 1 ? provSplit.length + ' providers' : scope === 'all' ? 'Hermes' : meter.providerName || 'Hermes'
+  const headlineLabel = shown ? dayLabel(shown) + ' on Hermes' : rangeLabel + ' on ' + where
   const periodRate = (acct != null ? acct : m.periodCost) / periodHours(period)
   // Days without a billed snapshot (Hermes desktop closed, or before the plugin existed) get a billed
   // estimate from OpenRouter's totals: the week total minus the known snapshots, spread over the
@@ -2908,7 +2974,7 @@ const Body = ({ meter, prices, threshold, retries, yaml, profile, profileLabel, 
       }
     })
   }
-  const aboveList = drift != null && drift >= 1.3 ? acct - periodHermes : 0
+  const aboveList = drift != null && drift >= 1.3 ? acct - periodOR : 0
   const tollBilled = m.resets.toll * (drift != null ? drift : 1)
   if (!orProfile) {
     /* provider pinning and routing rules are OpenRouter features */
@@ -3024,8 +3090,16 @@ const Body = ({ meter, prices, threshold, retries, yaml, profile, profileLabel, 
     el(
       'div',
       { style: { display: 'flex', alignItems: 'baseline', gap: 10, minHeight: 34, whiteSpace: 'nowrap' } },
-      el('span', { style: { fontSize: 26, fontWeight: 500, letterSpacing: '-0.01em', fontVariantNumeric: 'tabular-nums' } }, fmtUsd(headline)),
-      el('span', { style: { fontSize: 11, color: C.sub } }, headlineLabel),
+      el(Tip, { label: shown ? 'List-price estimate for that day' : share ? 'Share of the OpenRouter bill for this profile: list cost times the pricing drift' : nonOR > 0 ? 'OpenRouter bill plus the list cost of profiles billed elsewhere (' + fmtUsd(nonOR) + ')' : '' },
+        el('span', { style: { fontSize: 26, fontWeight: 500, letterSpacing: '-0.01em', fontVariantNumeric: 'tabular-nums' } }, fmtUsd(headline, { approx: !shown && ((share && drift != null) || nonOR > 0) }))),
+      provSplit.length > 1
+        ? el(Tip, { label: 'List cost by provider: ' + provSplit.map(([k, v]) => k + ' ' + fmtUsd(v)).join(', ') }, el('span', { style: { fontSize: 11, color: C.sub, cursor: 'help', borderBottom: '1px dotted ' + C.faint } }, headlineLabel))
+        : el('span', { style: { fontSize: 11, color: C.sub } }, headlineLabel),
+      profileCount > 1 && onScope
+        ? el(Tip, { label: scope === 'all' ? 'Every profile added up. Click to show only this chat\'s profile' : 'Only this chat\'s profile. Click to add up every profile' },
+            el('button', { type: 'button', onClick: () => onScope(scope === 'all' ? 'profile' : 'all'), style: { font: 'inherit', fontSize: 10.5, padding: '1px 7px', borderRadius: 8, cursor: 'pointer', border: '1px solid ' + C.stroke, background: 'transparent', color: C.sub, whiteSpace: 'nowrap' } },
+              scope === 'all' ? 'all profiles' : profileLabel || profile))
+        : null,
       el(
         'span',
         {
@@ -4424,7 +4498,7 @@ const ContextGauge = ({ pct, used, max, threshold }) => {
 // ---- chip -------------------------------------------------------------------
 
 const Chip = () => {
-  const { loading, error, data, prices, threshold, retries, yaml, profile, profileLabel, refresh, account, cheapest, orProfile, orAny } = useMeterData()
+  const { loading, error, data, prices, threshold, retries, yaml, profile, profileLabel, refresh, account, cheapest, orProfile, orAny, scope, profileCount, setScope } = useMeterData()
   const defaultModel = useValue(host.state.model) || ''
   const rates = useLive(prices, defaultModel)
   const focusedUsage = useValue(host.state.focusedUsage)
@@ -4484,7 +4558,7 @@ const Chip = () => {
       PopoverContent,
       { align: 'end', sideOffset: 8, variant: 'menu', className: 'w-auto p-0 overflow-hidden' },
       data
-        ? el(Body, { meter: data, prices, threshold, retries, yaml, profile, profileLabel, refresh, rates, defaultModel, account, cheapest, orProfile, orAny, onPeriod: setChipPeriod, view, onView: pickView })
+        ? el(Body, { meter: data, prices, threshold, retries, yaml, profile, profileLabel, refresh, rates, defaultModel, account, cheapest, orProfile, orAny, onPeriod: setChipPeriod, view, onView: pickView, scope, profileCount, onScope: setScope })
         : el('div', { style: { padding: 16, fontSize: 12, color: C.sub, width: 240 } }, error ? error : 'Loading…')
     )
   )

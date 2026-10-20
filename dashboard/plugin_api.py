@@ -2595,9 +2595,27 @@ def _upd_hermes():
     return [sys.executable, "-m", "hermes_cli.main"]
 
 
+def _upd_row():
+    """Hermes' own record of this plugin from its read-only update check, or None."""
+    code, out = _upd_run(_upd_hermes() + ["plugins", "check-updates", "--json"], timeout=120)
+    try:
+        return next(r for r in _aai_json.loads(out[out.index("["):]) if r.get("name") == _PLUGIN_NAME)
+    except Exception:
+        return None
+
+
+def _upd_mode():
+    """"hermes" when Hermes installed and tracks the plugin; "git" for a checkout Hermes calls self-cloned."""
+    row = _upd_row()
+    if row and row.get("class") not in (None, "self-cloned"):
+        return "hermes", row
+    return ("git" if (_upd_root() / ".git").exists() else "hermes"), row
+
+
 def _upd_check():
+    mode, row = _upd_mode()
     root = _upd_root()
-    if (root / ".git").exists():
+    if mode == "git":
         code, out = _upd_run(["git", "fetch", "--quiet"], cwd=root, timeout=30)
         if code:
             return {"ok": False, "mode": "git", "error": "Could not reach the repository"}
@@ -2608,35 +2626,47 @@ def _upd_check():
         dirty = bool(_upd_run(["git", "status", "--porcelain", "--untracked-files=no"], cwd=root)[1])
         return {"ok": True, "mode": "git", "available": int(behind or 0) > 0, "behind": int(behind or 0),
                 "incoming": incoming, "dirty": dirty, "current": _upd_run(["git", "log", "-1", "--format=%h"], cwd=root)[1]}
-    code, out = _upd_run(_upd_hermes() + ["plugins", "check-updates", "--json"], timeout=120)
-    try:
-        rows = _aai_json.loads(out[out.index("["):])
-        me = next(r for r in rows if r.get("name") == _PLUGIN_NAME)
-    except Exception:
+    if not row:
         return {"ok": False, "mode": "hermes", "error": "Hermes could not check for updates"}
-    return {"ok": True, "mode": "hermes", "available": bool(me.get("update_available")),
-            "current": me.get("current"), "latest": me.get("latest"), "reason": me.get("reason")}
+    return {"ok": True, "mode": "hermes", "available": bool(row.get("update_available")),
+            "current": row.get("current"), "latest": row.get("latest"), "reason": row.get("reason")}
 
 
-def _upd_apply():
+def _upd_apply(force=False):
+    mode, _row = _upd_mode()
     root = _upd_root()
-    if (root / ".git").exists():
+    if mode == "git":
         if _upd_run(["git", "status", "--porcelain", "--untracked-files=no"], cwd=root)[1]:
             return {"ok": False, "error": "This checkout has local changes; commit or stash them first"}
         code, out = _upd_run(["git", "pull", "--ff-only", "--quiet"], cwd=root, timeout=120)
         if code:
             return {"ok": False, "error": "git pull failed: " + out[-200:]}
         return {"ok": True, "current": _upd_run(["git", "log", "-1", "--format=%h"], cwd=root)[1], "restart": True}
-    code, out = _upd_run(_upd_hermes() + ["plugins", "update", _PLUGIN_NAME], timeout=300)
-    if code:
+    if not force:
+        code, out = _upd_run(_upd_hermes() + ["plugins", "update", _PLUGIN_NAME], timeout=300)
+        if not code:
+            return {"ok": True, "restart": True}
+        if "scan blocked" in out.lower() or "BLOCKED" in out:
+            m = _aai_re.search(r"(\d+) findings", out)
+            # the person decides: "Install anyway" comes back with force
+            return {"ok": False, "scan_blocked": True, "findings": int(m.group(1)) if m else None,
+                    "error": "Hermes' install scan flagged this update"}
         return {"ok": False, "error": "Hermes could not update the plugin: " + out[-200:]}
+    # `plugins update` has no override, so a confirmed update reinstalls from the same source with --force
+    source = _upd_run(["git", "remote", "get-url", "origin"], cwd=root)[1] if (root / ".git").exists() else ""
+    if not source:
+        return {"ok": False, "error": "Could not tell where this plugin was installed from"}
+    code, out = _upd_run(_upd_hermes() + ["plugins", "install", source, "--force", "--enable", "--yes-deps"], timeout=300)
+    if code:
+        return {"ok": False, "error": "Reinstall failed: " + out[-200:]}
     return {"ok": True, "restart": True}
 
 
 @router.post("/aai/update")
 async def aai_update(payload: Dict[str, Any] = Body(default={}), profile: Optional[str] = None):
     """Check for a newer Hermetic, or apply it. Runs as a background job: both can take a while."""
-    fn = _upd_apply if (payload or {}).get("action") == "apply" else _upd_check
+    p = payload or {}
+    fn = (lambda: _upd_apply(force=bool(p.get("force")))) if p.get("action") == "apply" else _upd_check
     if (payload or {}).get("background"):
         return _aai_spawn(fn)
     try:

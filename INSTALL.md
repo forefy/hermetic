@@ -49,10 +49,12 @@ Hermetic turns itself on in your other Hermes profiles the first time the popove
 
 ## Update
 
-The bottom of the popover checks for a newer Hermetic once a day. When one is out, it says how many updates are available (hover for the list) and shows an **Update** button. Or from a terminal:
+The bottom of the popover checks for a newer Hermetic once a day. When one is out, it says how many updates are available (hover for the list) and shows an **Update** button. Hermes' install scan checks every update and flags HDR's list of watched paths again; the popover then says so and offers **Install anyway**, which reinstalls from the same source with `--force`.
+
+From a terminal, `hermes plugins update hermetic` stops at the same scan and has no override, so reinstall instead:
 
 ```bash
-hermes plugins update hermetic
+hermes plugins install forefy/hermetic --enable --force
 ```
 
 Either way, restart Hermes afterwards as in step 1.

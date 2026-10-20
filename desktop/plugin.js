@@ -2628,16 +2628,17 @@ let updateDone = false
 const UpdateLine = ({ profile }) => {
   const [st, setSt] = useState(() => (updateDone ? { done: true } : sget('update', null)))
   const [busy, setBusy] = useState(null)
-  const go = async action => {
+  const go = async (action, force) => {
     setBusy(action)
     try {
-      const r = await aaiPost(profile, '/update', { action })
+      const r = await aaiPost(profile, '/update', force ? { action, force: true } : { action })
       if (action === 'apply') {
         if (r && r.ok) {
           updateDone = true
           sset('update', { ok: true, available: false, ts: Date.now() })
         }
-        setSt(s => (r && r.ok ? { ...s, available: false, done: true } : { ...s, error: (r && r.error) || 'Update failed' }))
+        // Hermes' install scan stopped it: the person decides whether to install anyway
+        setSt(s => (r && r.ok ? { ...s, available: false, done: true, scan: null } : r && r.scan_blocked ? { ...s, scan: r.findings || true } : { ...s, error: (r && r.error) || 'Update failed' }))
       }
       else {
         const next = r && r.ok ? { ...r, ts: Date.now() } : { error: (r && r.error) || 'Could not check', ts: Date.now() }
@@ -2656,6 +2657,10 @@ const UpdateLine = ({ profile }) => {
   const line = (...kids) => el('div', { style: { display: 'flex', alignItems: 'center', gap: 10, marginTop: 16, fontSize: 10.5, color: C.dim, flexWrap: 'wrap' } }, ...kids)
   if (busy === 'apply') return line('Updating Hermetic…')
   if (st.done) return line(el('span', { style: { color: C.ok } }, 'Updated.'), 'Restart Hermes to finish: Hermes menu, Quit and Keep Windows.')
+  if (st.scan) return line(
+    el(Tip, { label: 'Hermes scans every plugin update. It flags Hermetic because HDR names sensitive paths it watches, such as ~/.ssh and startup folders; Hermetic never opens them. Install anyway reinstalls from the same source with --force.' },
+      el('span', { style: { color: C.warn, cursor: 'help' } }, "Hermes' install scan flagged this update" + (st.scan !== true ? ' (' + st.scan + ' findings)' : ''))),
+    el('button', { type: 'button', onClick: () => go('apply', true), style: { font: 'inherit', fontSize: 10.5, padding: '2px 9px', borderRadius: 6, border: '1px solid ' + C.warn, background: 'transparent', color: C.warn, cursor: 'pointer' } }, 'Install anyway'))
   if (st.error) return line(el('span', { style: { color: C.warn } }, st.error), el(ALink, { onClick: () => go('check') }, busy ? 'checking…' : 'try again'))
   if (st.available) {
     const n = st.behind ? st.behind + (st.behind === 1 ? ' update' : ' updates') : 'An update'

@@ -8,9 +8,9 @@
  *          kept as tests, replays on other versions, providers or models, and
  *          automatic tests when the background review changes a skill.
  *
- * Data comes from surfaces the desktop app already has (/api/analytics/usage,
- * /api/profiles/sessions, /api/config/raw, /api/logs, session.usage ticks, the public
- * OpenRouter /models list) plus this plugin's own backend under /api/plugins/hermetic/.
+ * Data comes through the desktop plugin SDK: host.profiles, host.request (config), host.logs,
+ * session.usage ticks, and this plugin's own backend under /api/plugins/hermetic/ via
+ * ctx.rest; plus the public OpenRouter /models list.
  * No API key ever reaches the renderer. OpenRouter-only parts hide when the profile
  * does not use OpenRouter.
  *
@@ -155,7 +155,25 @@ function carryOverLegacyStorage() {
 
 // ---- data: HTTP via the desktop bridge --------------------------------------
 
-const api = req => window.hermesDesktop.api(req)
+// Every call goes through the plugin SDK: Hermetic's own backend with ctx.rest, Hermes' own data with
+// host.*. A request names its profile in ?profile=, which Hermes scopes on the server (that profile's
+// home and secrets), so the active backend answers for every local profile.
+const OWN = '/api/plugins/hermetic'
+let pluginRest = null // ctx.rest, set in register()
+const api = req => {
+  const path = String(req.path || '')
+  if (!path.startsWith(OWN)) return Promise.reject(new Error('Not a Hermetic route: ' + path))
+  if (!pluginRest) return Promise.reject(new Error('Hermetic is still loading'))
+  let rel = path.slice(OWN.length) || '/'
+  if (!/[?&]profile=/.test(rel)) rel += (rel.includes('?') ? '&' : '?') + 'profile=' + encodeURIComponent(req.profile || 'default')
+  return pluginRest(rel, { method: req.method, body: req.body, timeoutMs: req.timeoutMs })
+}
+// config.yaml writes (reviewed text, or a few keys merged in); a refused write throws
+const writeConfig = async (profile, path, body) => {
+  const r = await api(profileReq(profile, { path: OWN + path, method: 'PUT', body }))
+  if (r && r.ok === false) throw new Error(r.error || 'Could not save the config')
+  return r
+}
 
 // The name the Bots sidebar shows for a profile: its bot title, then display name, then the
 // profile name tidied ("my-profile" -> "My Profile"); the default profile reads "Hermes".
@@ -168,7 +186,7 @@ const botLabel = p => {
 
 async function loadProfiles() {
   try {
-    const r = await api({ path: '/api/profiles' })
+    const r = await host.profiles.list()
     const list = (r && r.profiles) || []
     return list.map(p => ({ name: p.name, isDefault: !!p.is_default, label: botLabel(p) }))
   } catch {
@@ -186,8 +204,7 @@ async function loadAnalytics(profiles, days, prices) {
   await Promise.all(
     profiles.map(async p => {
       try {
-        const q = '/api/analytics/usage?days=' + days + (p.isDefault ? '' : '&profile=' + encodeURIComponent(p.name))
-        const r = await api({ path: q })
+        const r = await api({ path: OWN + '/usage?days=' + days, profile: p.isDefault ? 'default' : p.name })
         // a profile Hermes priced at $0 despite tokens (custom endpoints): blend list prices of its models
         const priced = ((r && r.daily) || []).reduce((a, d) => a + num(d.estimated_cost), 0) > 0
         let blend = null
@@ -276,7 +293,7 @@ async function loadSessions(profiles) {
       try {
         const suffix = '?days=' + DEFAULT_DAYS + (p.isDefault ? '' : '&profile=' + encodeURIComponent(p.name))
         let r = null
-        for (const base of ['/api/plugins/hermetic/sessions', '/api/analytics/sessions']) {
+        for (const base of [OWN + '/sessions']) {
           try {
             const got = await api({ path: base + suffix })
             if (got && Array.isArray(got.sessions)) {
@@ -294,13 +311,7 @@ async function loadSessions(profiles) {
       }
     })
   )
-  if (out.length) return { sessions: out, complete }
-  try {
-    const r = await api({ path: '/api/profiles/sessions?limit=400&archived=include&order=recent' })
-    return { sessions: ((r && r.sessions) || []).map(row => mapSessionRow(row)), complete: false }
-  } catch {
-    return { sessions: [], complete: false }
-  }
+  return { sessions: out, complete }
 }
 
 async function loadPrices() {
@@ -364,7 +375,7 @@ const profileReq = (profile, req) => (profile && profile !== 'default' ? { ...re
 
 async function loadConfigRaw(profile) {
   try {
-    const r = await api(profileReq(profile, { path: '/api/config/raw' }))
+    const r = await api(profileReq(profile, { path: OWN + '/config/raw' }))
     return (r && r.yaml) || ''
   } catch {
     return ''
@@ -769,7 +780,7 @@ function parseAccountLines(lines) {
 let backendPatched = true
 
 async function loadAccount(sid) {
-  for (const path of ['/api/plugins/hermetic/account/usage', '/api/account/usage']) {
+  for (const path of [OWN + '/account/usage']) {
     try {
       const r = await api({ path, timeoutMs: 20_000 })
       if (r && Array.isArray(r.lines)) {
@@ -1804,7 +1815,7 @@ const Improve = ({ items, yaml, profile, onApplied }) => {
       const latest = await freshConfig(profile)
       const change = buildYamlChange(latest, typeof item.change === 'function' ? item.change(latest) : item.change)
       if (!change) return
-      await api(profileReq(profile, { path: '/api/config/raw', method: 'PUT', body: { yaml_text: change.yaml } }))
+      await writeConfig(profile, '/config/raw', { yaml_text: change.yaml })
       if (item.after) await item.after()
       setOpen(null)
       onApplied()
@@ -2402,7 +2413,7 @@ const CompareProviders = ({ profile, providers, altModel, auxOn, onApplied }) =>
     const st = routingStateOf(configFacts(latest), auxOn)
     st.order = [x.provider]
     const change = buildYamlChange(latest, { kind: 'provider_routing', value: st })
-    if (change && change.diff.length) await api(profileReq(profile, { path: '/api/config/raw', method: 'PUT', body: { yaml_text: change.yaml } }))
+    if (change && change.diff.length) await writeConfig(profile, '/config/raw', { yaml_text: change.yaml })
     if (auxOn) await api(profileReq(profile, { path: '/api/plugins/hermetic/aux-routing', method: 'POST', body: { enabled: true } }))
     await aaiPost(profile, '/work', { job: 'prefer', detail: x.provider })
     setDone(nameOf(x.label))
@@ -2651,13 +2662,13 @@ const HdrPosture = ({ rows, profile, onChanged }) => {
   }
   // the same doors Hermes' own screens use: config.set for approvals, a one-key merge into config for the rest
   const setKey = (key, value) => run(() => host.request('config.set', profile && profile !== 'default' ? { key, value, profile } : { key, value }))
-  const merge = part => run(() => api(profileReq(profile, { path: '/api/config', method: 'PUT', body: { config: part } })))
+  const merge = part => run(() => writeConfig(profile, '/config', { config: part }))
   const dropAllowed = item => run(async () => {
-    const cur = await api(profileReq(profile, { path: '/api/config?include_defaults=false' }))
+    const cur = await host.request('config.get', { key: 'full', profile: profile || 'default' })
     const list = ((cur && (cur.config || cur)) || {}).command_allowlist || []
     const next = list.filter(x => String(x).slice(0, 120) !== item)
     if (next.length === list.length) throw new Error('That entry is no longer there')
-    await api(profileReq(profile, { path: '/api/config', method: 'PUT', body: { config: { command_allowlist: next } } }))
+    await writeConfig(profile, '/config', { config: { command_allowlist: next } })
   })
   const control = r => {
     if (r.key === 'approvals') {
@@ -3760,7 +3771,7 @@ const routingStateOf = (facts, auxOn) => ({
 // that copy can be minutes old, and writing it back would undo changes made since (2026-10-10:
 // a stale Apply silently removed a provider block).
 async function freshConfig(profile) {
-  const r = await api(profileReq(profile, { path: '/api/config/raw' }))
+  const r = await api(profileReq(profile, { path: OWN + '/config/raw' }))
   const text = r && r.yaml
   if (!text || typeof text !== 'string') throw new Error('could not re-read the config, nothing written')
   return text
@@ -3866,7 +3877,7 @@ const RoutingSection = ({ policyOn = true, providerName, rows, since, recording,
         for (const k of edited) merged[k] = st[k]
         const fresh = buildYamlChange(latestYaml, { kind: 'provider_routing', value: merged })
         if (fresh && fresh.diff.length) {
-          await api(profileReq(profile, { path: '/api/config/raw', method: 'PUT', body: { yaml_text: fresh.yaml } }))
+          await writeConfig(profile, '/config/raw', { yaml_text: fresh.yaml })
           wrote = true
         }
       }
@@ -4693,6 +4704,7 @@ export default {
   register(ctx) {
     carryOverLegacyStorage()
     store = ctx.storage
+    pluginRest = ctx.rest
     initResets()
     ctx.register({
       id: 'chip',

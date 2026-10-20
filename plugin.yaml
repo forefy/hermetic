@@ -1,6 +1,6 @@
 name: hermetic
-version: "1.1.0"
-requires_hermes: ">=0.21.5"
+version: "1.1.1"
+requires_hermes: ">=0.21.6"
 description: "Backend half of the Hermetic desktop plugin: spend and provider routing records, routing middleware, empty-reply debugging, and the AAI routes (skill history, ratings, tests, replays, judge) under /api/plugins/hermetic/."
 author: "forefy"
 provides_hooks:

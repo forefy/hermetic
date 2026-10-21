@@ -109,7 +109,7 @@ done
 if [ -n "$LIVE" ]; then diff <(printf '%s\n' "$LIVE") "$OUT/hermetic.yaml" || true; else cat "$OUT/hermetic.yaml"; fi
 
 step "Commits in this release"
-if [ -n "$OLD_SHA" ]; then git log --oneline "$OLD_SHA..$SHA"; else git log --oneline -15 "$SHA"; fi
+if [ -n "$OLD_SHA" ]; then git log --no-merges --oneline "$OLD_SHA..$SHA"; else git log --oneline -15 "$SHA"; fi
 echo; echo "Entry written to $OUT/hermetic.yaml"
 [ "$PR" = 1 ] || exit 0
 
@@ -124,7 +124,7 @@ if [ -n "$OPEN" ]; then
   {
     echo "Re-pinned from ${PINNED:0:7} to $SHORT ($VERSION):"
     echo
-    git log --format='- %s' "$PINNED..$SHA"
+    git log --no-merges --format='- %s' "$PINNED..$SHA"
     echo
     echo "Full range: https://github.com/forefy/hermetic/compare/$PINNED...$SHA"
   } > "$OUT/comment.md"
@@ -150,7 +150,7 @@ else
     echo
     echo "## Changes"
     echo
-    git log --format='- %s' "$OLD_SHA..$SHA"
+    git log --no-merges --format='- %s' "$OLD_SHA..$SHA"
     echo
     echo "Full range: https://github.com/forefy/hermetic/compare/$OLD_SHA...$SHA"
     echo

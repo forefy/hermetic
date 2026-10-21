@@ -144,6 +144,57 @@ def _db_messages(db, session_id, since=0.0, every=False):
     return [m for m in rows if float(m.get("timestamp") or 0) > since]
 
 
+# What a route needs from each session, kept until the session changes (new messages move its last
+# activity and count), so reopening HDR or AAI only re-reads the sessions with something new.
+_SESSION_CACHE: Dict[tuple, tuple] = {}
+_SESSION_CACHE_MAX = 5000
+
+
+def _per_session(db, store, row, kind, build, every=False):
+    """``build(messages)`` for one session, cached per store (a profile's state.db) and kind."""
+    key = (store, row["id"], kind)
+    stamp = (row.get("last_active"), row.get("message_count"), row.get("api_call_count"))
+    hit = _SESSION_CACHE.get(key)
+    if hit and hit[0] == stamp:
+        return hit[1]
+    value = build(_db_messages(db, row["id"], every=every))
+    if len(_SESSION_CACHE) >= _SESSION_CACHE_MAX:
+        try:
+            _SESSION_CACHE.pop(next(iter(_SESSION_CACHE)))
+        except (StopIteration, KeyError, RuntimeError):
+            pass
+    _SESSION_CACHE[key] = (stamp, value)
+    return value
+
+
+def _session_calls(msgs):
+    """(ts, tool, args, (paths, hosts) it touches) for every tool call in a session, batches opened."""
+    return [(float(m.get("timestamp") or 0), name, args, _hdr_touches(name, args)) for m in msgs if m.get("tool_calls")
+            for name, args in _hdr_flatten(_calls_of(m.get("tool_calls")))]
+
+
+def _session_turns(msgs):
+    """(id, role, ts, text, skills) for each user message and assistant reply: the text squashed and
+    cut to 400 characters, and for replies the skills their tool calls loaded."""
+    out = []
+    for m in msgs:
+        role = m.get("role")
+        if role not in ("user", "assistant"):
+            continue
+        skills = []
+        if role == "assistant":
+            for name, args in _hdr_flatten(_calls_of(m.get("tool_calls"))):
+                n = name == "skill_view" and (args.get("name") or args.get("skill"))
+                if n and n not in skills:
+                    skills.append(n)
+        out.append((m.get("id"), role, float(m.get("timestamp") or 0), " ".join(str(m.get("content") or "").split())[:400], skills))
+    return out
+
+
+def _sessions_store(profile):
+    return str(_profile_home(profile)[1] / "state.db")
+
+
 def _calls_of(tool_calls):
     """A message's tool calls as a list (stored as JSON text or already parsed)."""
     if isinstance(tool_calls, str):
@@ -733,28 +784,15 @@ def _aai_session_data(profile, since30):
     """Per session: title, start, calls; skill loads from the agent's own skill_view tool calls."""
     db = _open_sessions_db(profile)
     try:
-        sessions, titles = {}, {}
+        sessions, titles, store = {}, {}, _sessions_store(profile)
         for r in _db_sessions(db):
             titles[r["id"]] = r.get("title")
             if float(r.get("started_at") or 0) > since30:
-                sessions[r["id"]] = {"title": r.get("title") or "untitled", "start": r.get("started_at"), "calls": r.get("api_call_count") or 0, "skills": []}
-        loads = [(sid, m.get("tool_calls"), m.get("timestamp")) for sid in sessions for m in _db_messages(db, sid, since30, every=True)
-                 if "skill_view" in _aai_json.dumps(m.get("tool_calls") or "")]
-        for sid, tc, ts in loads:
-            s = sessions.get(sid)
-            if not s:
-                continue
-            try:
-                for call in _calls_of(tc):
-                    fn = (call or {}).get("function") or {}
-                    if fn.get("name") != "skill_view":
-                        continue
-                    args = _aai_json.loads(fn.get("arguments") or "{}")
-                    name = args.get("name") or args.get("skill")
-                    if name:
-                        s["skills"].append({"name": name, "ts": ts})
-            except Exception:
-                continue
+                s = sessions[r["id"]] = {"title": r.get("title") or "untitled", "start": r.get("started_at"), "calls": r.get("api_call_count") or 0, "skills": []}
+                for ts, name, args, _touched in _per_session(db, store, r, "calls", _session_calls, every=True):
+                    skill = name == "skill_view" and ts > since30 and (args.get("name") or args.get("skill"))
+                    if skill:
+                        s["skills"].append({"name": skill, "ts": ts})
         return sessions, titles
     finally:
         db.close()
@@ -852,20 +890,19 @@ async def aai_rate_queue(n: int = Query(5, ge=1, le=20), profile: Optional[str] 
         rated = {r.get("message_id") for r in _aai_read(_data_dir(home) / "ratings.jsonl")}
         db = _open_sessions_db(profile)
         try:
-            out, since = [], _aai_now() - 14 * 86400
+            out, since, store = [], _aai_now() - 14 * 86400, _sessions_store(profile)
             replies = []
             for r in _db_sessions(db, since):
                 last_user = None
-                for m in _db_messages(db, r["id"]):
-                    if m.get("role") == "user":
-                        last_user = m.get("timestamp")
-                    elif m.get("role") == "assistant" and str(m.get("content") or "").strip() and float(m.get("timestamp") or 0) > since:
-                        replies.append((m, r.get("title"), last_user))
-            for m, title, user_ts in sorted(replies, key=lambda x: -float(x[0].get("timestamp") or 0))[:200]:
-                if str(m["id"]) in rated:
+                for mid, role, ts, text, _skills in _per_session(db, store, r, "turns", _session_turns):
+                    if role == "user":
+                        last_user = ts
+                    elif text and ts > since:
+                        replies.append((mid, r["id"], ts, text, r.get("title"), last_user))
+            for mid, sid, ts, text, title, user_ts in sorted(replies, key=lambda x: -x[2])[:200]:
+                if str(mid) in rated:
                     continue
-                text = " ".join(str(m.get("content")).split())
-                out.append({"message_id": str(m["id"]), "session_id": m.get("session_id"), "title": title or "untitled", "ts": m.get("timestamp"), "preview": text[:160], "user_ts": user_ts})
+                out.append({"message_id": str(mid), "session_id": sid, "title": title or "untitled", "ts": ts, "preview": text[:160], "user_ts": user_ts})
                 if len(out) >= n:
                     break
             return {"items": out}
@@ -1880,34 +1917,24 @@ async def aai_corrections(days: int = Query(14, ge=1, le=90), profile: Optional[
     """Your replies that correct the agent ("no, ...", "you forgot ..."), with the reply they correct."""
     def _run():
         db = _open_sessions_db(profile)
-        since = time.time() - days * 86400
+        since, store = time.time() - days * 86400, _sessions_store(profile)
         try:
-            by_session = {r["id"]: [(m.get("id"), r["id"], m.get("role"), m.get("content"), m.get("tool_calls"), m.get("timestamp"), r.get("title"))
-                                    for m in _db_messages(db, r["id"], since)] for r in _db_sessions(db, since)}
+            by_session = {r["id"]: (r.get("title"), [t for t in _per_session(db, store, r, "turns", _session_turns) if t[2] > since])
+                          for r in _db_sessions(db, since)}
         finally:
             db.close()
         out = []
-        for sid, msgs in by_session.items():
+        for sid, (title, turns) in by_session.items():
             last_reply, skills, turn_ts = None, [], None
-            for mid, _s, role, content, tc, ts, title in msgs:
+            for mid, role, ts, text, loaded in turns:
                 if role == "user":
-                    text = " ".join(str(content or "").split())
                     if last_reply and _AAI_CORRECTION.search(text[:200]):
                         out.append({"message_id": str(last_reply), "correction_id": str(mid), "text": text[:240], "ts": ts, "title": title or "untitled",
                                     "skill": skills[0] if skills else None, "session_id": sid, "user_ts": turn_ts})
                     last_reply, skills, turn_ts = None, [], ts
-                elif role == "assistant":
-                    if tc and "skill_view" in _aai_json.dumps(tc):
-                        try:
-                            for call in _calls_of(tc):
-                                fn = (call or {}).get("function") or {}
-                                if fn.get("name") == "skill_view":
-                                    n = _aai_json.loads(fn.get("arguments") or "{}").get("name")
-                                    if n and n not in skills:
-                                        skills.append(n)
-                        except Exception:
-                            pass
-                    if (content or "").strip():
+                else:
+                    skills += [x for x in loaded if x not in skills]
+                    if text:
                         last_reply = mid
         _n, home = _profile_home(profile)
         gone = {r.get("correction_id") for r in _aai_read(_data_dir(home) / "dismissed.jsonl")}
@@ -2163,21 +2190,18 @@ def _hdr_root(p):
 
 
 def _hdr_calls(profile, since):
-    """(session_id, title, ts, tool, args, base_url) for every tool call since a time."""
+    """(session_id, title, ts, tool, args, base_url, (paths, hosts)) for every tool call since a time."""
     db = _open_sessions_db(profile)
+    store = _sessions_store(profile)
     try:
-        sess = _db_sessions(db, since)
-        meta = {r["id"]: (r.get("title") or r["id"], r.get("billing_base_url") or "") for r in sess}
-        rows = [(r["id"], m.get("tool_calls"), m.get("timestamp")) for r in sess for m in _db_messages(db, r["id"], since, every=True) if m.get("tool_calls")]
+        rows = [(r["id"], r.get("title") or r["id"], r.get("billing_base_url") or "", _per_session(db, store, r, "calls", _session_calls, every=True))
+                for r in _db_sessions(db, since)]
     finally:
         db.close()
-    for sid, tc, ts in rows:
-        calls = _calls_of(tc)
-        if not calls:
-            continue
-        title, base = meta.get(sid, (sid, ""))
-        for name, args in _hdr_flatten(calls):
-            yield sid, title, float(ts or 0), name, args, base
+    for sid, title, base, calls in rows:
+        for ts, name, args, touched in calls:
+            if ts > since:
+                yield sid, title, ts, name, args, base, touched
 
 
 def _hdr_services(calls):
@@ -2216,7 +2240,7 @@ def _hdr_services(calls):
             cmd = procs.get(pid, (0, ""))[1]
             port = addr.rsplit(":", 1)[-1]
             by = None
-            for sid, title, ts, name, args, _b in calls:
+            for sid, title, ts, name, args, _b, _t in calls:
                 if name == "terminal" and port in str(args.get("command") or "") and (by is None or ts > by[1]):
                     by = (title, ts)
             core = "hermes_cli" in cmd or "Hermes.app" in cmd or "web_server" in cmd
@@ -2401,9 +2425,8 @@ async def hdr(days: int = Query(7, ge=1, le=90), profile: Optional[str] = None):
         files, sensitive = {}, []
         mem_writes, skill_edits, subagents, vault = [], 0, 0, []
         risky_calls, titles = 0, {}
-        for sid, title, ts, name, args, base in calls:
+        for sid, title, ts, name, args, base, (paths, hosts) in calls:
             titles[sid] = title
-            paths, hosts = _hdr_touches(name, args)
             for h in hosts:
                 dom(h, ts, name, title)
             if ts < since:

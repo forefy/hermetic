@@ -160,14 +160,21 @@ function carryOverLegacyStorage() {
 // home and secrets), so the active backend answers for every local profile.
 const OWN = '/api/plugins/hermetic'
 let pluginRest = null // ctx.rest, set in register()
+const inflight = new Map() // identical reads already on their way share one request
 const api = req => {
   const path = String(req.path || '')
   if (!path.startsWith(OWN)) return Promise.reject(new Error('Not a Hermetic route: ' + path))
   if (!pluginRest) return Promise.reject(new Error('Hermetic is still loading'))
   let rel = path.slice(OWN.length) || '/'
   if (!/[?&]profile=/.test(rel)) rel += (rel.includes('?') ? '&' : '?') + 'profile=' + encodeURIComponent(req.profile || 'default')
-  return pluginRest(rel, { method: req.method, body: req.body, timeoutMs: req.timeoutMs })
+  const go = () => pluginRest(rel, { method: req.method, body: req.body, timeoutMs: req.timeoutMs })
+  if (req.method && String(req.method).toUpperCase() !== 'GET') { inflight.clear(); return go() } // later reads see the write
+  if (!inflight.has(rel)) inflight.set(rel, go().finally(() => inflight.delete(rel)))
+  return inflight.get(rel)
 }
+// the last data each AAI and HDR view showed, per profile and period: shown at once on reopen
+// while a fresh copy loads
+const viewCache = new Map()
 // config.yaml writes (reviewed text, or a few keys merged in); a refused write throws
 const writeConfig = async (profile, path, body) => {
   const r = await api(profileReq(profile, { path: OWN + path, method: 'PUT', body }))
@@ -2505,25 +2512,31 @@ const TimelineView = ({ items }) => {
 // AAI, v7 layout: quick look, then what needs you, then what is happening, then tools and settings
 const AaiView2 = ({ profile, period, yaml, orProfile, auxOn, onChanged }) => {
   const days = AAI_DAYS[period] || 7
-  const [data, setData] = useState(null)
+  const ck = 'aai|' + profile + '|' + days
+  const seen = viewCache.get(ck) || {}
+  const [data, setData] = useState(seen.data || null)
   const [err, setErr] = useState(null)
   const [tick, setTick] = useState(0)
-  const [cases, setCases] = useState([])
-  const [corr, setCorr] = useState([])
-  const [gate, setGate] = useState([])
+  const [cases, setCases] = useState(seen.cases || [])
+  const [corr, setCorr] = useState(seen.corr || [])
+  const [gate, setGate] = useState(seen.gate || [])
   const [busy, setBusy] = useState(null)
   const [actionsTick, setActionsTick] = useState(0)
-  const [flags, setFlags] = useState([])
+  const [flags, setFlags] = useState(seen.flags || [])
   const [verOpen, setVerOpen] = useState(null)
   const reload = () => setTick(t => t + 1)
   useEffect(() => {
     let live = true
-    api(profileReq(profile, { path: '/api/plugins/hermetic/aai?days=' + days }))
-      .then(r => live && (setData(r), setErr(null)))
-      .then(() => aaiGet(profile, '/cases')).then(r => live && r && setCases(r.cases || []))
-      .then(() => aaiGet(profile, '/corrections?days=30')).then(r => live && r && setCorr(r.items || []))
-      .then(() => aaiGet(profile, '/gate')).then(r => live && r && setGate(r.decisions || []))
-      .then(() => aaiGet(profile, '/flags?days=' + days)).then(r => live && r && setFlags(r.flags || []))
+    const c = viewCache.get(ck)
+    if (c) { setData(c.data); setCases(c.cases); setCorr(c.corr); setGate(c.gate); setFlags(c.flags) }
+    Promise.all([api(profileReq(profile, { path: '/api/plugins/hermetic/aai?days=' + days })), aaiGet(profile, '/cases'),
+      aaiGet(profile, '/corrections?days=30'), aaiGet(profile, '/gate'), aaiGet(profile, '/flags?days=' + days)])
+      .then(([r, ca, co, ga, fl]) => {
+        if (!live) return
+        const got = { data: r, cases: (ca && ca.cases) || [], corr: (co && co.items) || [], gate: (ga && ga.decisions) || [], flags: (fl && fl.flags) || [] }
+        viewCache.set(ck, got)
+        setData(got.data); setCases(got.cases); setCorr(got.corr); setGate(got.gate); setFlags(got.flags); setErr(null)
+      })
       .catch(e => live && setErr(/404|Not Found|Headless backend/i.test(String(e && e.message)) ? 'Restart Hermes to load the AAI backend: Hermes menu, Quit and Keep Windows, then reopen.' : (e && e.message) || 'Backend plugin off, restart Hermes'))
     return () => { live = false }
   }, [profile, days, tick])
@@ -2921,13 +2934,15 @@ const HdrGuard = ({ g, profile, days, onChanged }) => {
 
 const HdrView = ({ profile, period }) => {
   const days = AAI_DAYS[period] || 7
-  const [d, setD] = useState(null)
+  const ck = 'hdr|' + profile + '|' + days
+  const [d, setD] = useState(() => viewCache.get(ck) || null)
   const [err, setErr] = useState(null)
   const [tick, setTick] = useState(0)
   useEffect(() => {
     let live = true
+    if (viewCache.has(ck)) setD(viewCache.get(ck))
     api(profileReq(profile, { path: '/api/plugins/hermetic/hdr?days=' + days }))
-      .then(r => live && (r && r.error ? setErr(r.error) : (setD(r), setErr(null))))
+      .then(r => live && (r && r.error ? setErr(r.error) : (viewCache.set(ck, r), setD(r), setErr(null))))
       .catch(e => live && setErr(/404|Not Found/i.test(String(e && e.message)) ? 'Restart Hermes to load HDR: Hermes menu, Quit and Keep Windows, then reopen.' : (e && e.message) || 'Backend plugin off'))
     return () => { live = false }
   }, [profile, days, tick])

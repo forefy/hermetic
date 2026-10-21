@@ -109,6 +109,7 @@ Everything Hermetic records stays in `$HERMES_HOME/hermetic/` (ratings, tests, r
 | `tests/test_guard.py` | The guard: what it asks about, blocks and lets through |
 | `tests/test_credentials.py` | Hermetic's own model calls go through Hermes (`ctx.llm`, secret scope) |
 | `tests/test_paths.py` | Skill names and version ids from requests never leave Hermetic's folders |
+| `tests/test_session_cache.py` | HDR and AAI re-read only the sessions that changed |
 | `tests/test_config_routes.py` | Config writes reach only the profile Hermes scoped the request to |
 | `tests/test_detect.mjs` | How a profile's provider is read from its config |
 | `scripts/release.sh` | Tests, validates and pushes a release, then prints the catalog entry; `--pr` opens the catalog PR |

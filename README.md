@@ -111,6 +111,7 @@ Everything Hermetic records stays in `$HERMES_HOME/hermetic/` (ratings, tests, r
 | `tests/test_paths.py` | Skill names and version ids from requests never leave Hermetic's folders |
 | `tests/test_session_cache.py` | HDR and AAI re-read only the sessions that changed |
 | `tests/test_config_routes.py` | Config writes reach only the profile Hermes scoped the request to |
+| `tests/test_limits.mjs` | Which OpenRouter limit stops requests first, credits or the key's cap |
 | `tests/test_detect.mjs` | How a profile's provider is read from its config |
 | `scripts/release.sh` | Tests, validates and pushes a release, then prints the catalog entry; `--pr` opens the catalog PR |
 | `catalog/hermetic.yaml.in` | Template for the catalog entry |
@@ -120,6 +121,7 @@ Run the Python tests inside Hermes' environment, and the rest with node:
 ```bash
 bash ~/.hermes/hermes-agent/scripts/run-in-hermes-env python3 tests/test_hdr.py
 node tests/test_detect.mjs
+node tests/test_limits.mjs
 ```
 
 Check the package with `hermes plugins validate .`

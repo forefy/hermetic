@@ -72,7 +72,7 @@ fi
 step "Tests"
 # quiet: show a suite's output only when it fails
 run() { local out; out=$("$@" 2>&1) || { echo "$out"; die "$* failed"; }; }
-run node tests/test_detect.mjs && echo "tests/test_detect.mjs passed"
+for t in tests/test_*.mjs; do run node "$t" && echo "$t passed"; done
 for t in tests/test_*.py; do
   out=$(bash "$HERMES_AGENT/scripts/run-in-hermes-env" python3 "$t" 2>&1) || { echo "$out"; die "$t failed"; }
   echo "$t passed"

@@ -784,6 +784,22 @@ function parseAccountLines(lines) {
     }
 }
 
+// What actually stops requests: the API key's cap or the prepaid credits, whichever runs out
+// first. Credits bought = this key's spend + the balance, exact while it is the only key spending.
+function spendLimit(a) {
+  if (!a) return null
+  const keyLeft = a.limit > 0 && a.remaining != null ? a.remaining : null
+  const credits = a.balance != null && a.total != null ? { left: a.balance, bought: a.total + a.balance } : null
+  if (keyLeft == null && !credits) return null
+  const byCredits = !!credits && (keyLeft == null || credits.left < keyLeft)
+  const cap = byCredits ? credits.bought : a.limit
+  const left = byCredits ? credits.left : keyLeft
+  const tip = byCredits
+    ? fmtUsd(credits.left) + ' credits left' + (keyLeft != null ? ' (key cap $' + Math.round(a.limit) + ', ' + fmtUsd(keyLeft) + ' left on the key)' : '') + '. Credits bought = spent + balance'
+    : fmtUsd(keyLeft) + ' left on the API key cap' + (credits ? ' (' + fmtUsd(credits.left) + ' credits left)' : '')
+  return { used: byCredits ? a.total : a.limit - a.remaining, cap, left, by: byCredits ? 'credits' : 'key', share: cap > 0 ? left / cap : 0, tip }
+}
+
 let backendPatched = true
 
 async function loadAccount(sid) {
@@ -3014,6 +3030,7 @@ const Body = ({ meter, prices, threshold, retries, yaml, profile, profileLabel, 
   const multiple = typicalHourly > 0 ? liveRate / typicalHourly : 0
 
   const acct = account ? (period === 'today' ? account.today : period === '7d' ? account.week : account.month) : null
+  const lim = spendLimit(account)
   // Billed figures are OpenRouter's UTC calendar week / month to date, so the Hermes side is summed
   // over the same window rather than the trailing 7 / 30 days the bars show.
   const windowStart = acct != null && period !== 'today' ? accountWindowStart(period) : null
@@ -3255,20 +3272,20 @@ const Body = ({ meter, prices, threshold, retries, yaml, profile, profileLabel, 
           { style: { display: 'flex', gap: 14, marginTop: 4, fontSize: 11, color: C.sub, fontVariantNumeric: 'tabular-nums', minHeight: 16 } },
           comparable ? el('span', null, 'Hermes ', el('span', { style: { color: C.text } }, fmtUsd(shown ? hermesCost : periodHermes))) : null,
           elsewhere != null && elsewhere > 0.01 ? el('span', { title: 'billed minus the list-price estimate: the cost of being routed to pricier providers' }, 'routing premium ', el('span', { style: { color: C.text } }, fmtUsd(elsewhere))) : null,
-          account && account.limit
+          lim
             ? el(
                 'span',
                 {
-                  style: { marginLeft: 'auto' },
-                  title: fmtUsd(account.remaining) + ' left' + (account.week ? ', ~' + Math.max(0, account.remaining / (account.week / 7)).toFixed(1) + ' days at this week\'s pace' : '')
+                  style: { marginLeft: 'auto', whiteSpace: 'nowrap', color: lim.share <= 0.05 ? C.bad : lim.share < 0.15 ? C.warn : undefined },
+                  title: lim.tip + (account.week ? ', ~' + Math.max(0, lim.left / (account.week / 7)).toFixed(1) + ' days at this week\'s pace' : '')
                 },
-                fmtUsd(account.limit - account.remaining) + ' used / $' + Math.round(account.limit)
+                fmtUsd(lim.used) + ' used / $' + Math.round(lim.cap) + (lim.by === 'credits' ? ' credits' : '')
               )
             : null
         )
       : null,
-    account && account.limit
-      ? el('div', { style: { marginTop: 8 }, title: fmtUsd(account.remaining) + ' left of the API key quota' }, el(Track, { value: 1 - account.remaining / account.limit, height: 3, tone: account.remaining / account.limit <= 0.05 ? 'bad' : account.remaining / account.limit < 0.15 ? 'warn' : null }))
+    lim
+      ? el('div', { style: { marginTop: 8 }, title: lim.tip }, el(Track, { value: 1 - lim.share, height: 3, tone: lim.share <= 0.05 ? 'bad' : lim.share < 0.15 ? 'warn' : null }))
       : null,
     period === 'today'
       ? el(
@@ -4687,8 +4704,8 @@ const Chip = () => {
   const liveRate = rates.reduce((a, r) => a + r.rate, 0)
   const tone = liveRate >= 5 ? 'bad' : liveRate >= 1.5 ? 'warn' : null
   const running = rates.length > 0
-  // API key quota nearly exhausted: 5% or less of the limit left turns the spark red.
-  const quotaLeft = account && account.limit > 0 && account.remaining != null ? account.remaining / account.limit : null
+  // credits or the API key cap nearly used up: 5% or less left turns the spark red
+  const quotaLeft = spendLimit(account) ? spendLimit(account).share : null
   const quotaLow = quotaLeft != null && quotaLeft <= 0.05
 
   const label = error ? '-' : running ? fmtRate(liveRate) : fmtUsd(spend)

@@ -3248,20 +3248,20 @@ const Body = ({ meter, prices, threshold, retries, yaml, profile, profileLabel, 
       'div',
       { style: { display: 'flex', alignItems: 'baseline', gap: 10, minHeight: 34, whiteSpace: 'nowrap' } },
       el(Tip, { label: (est.length ? 'Hermes has no price for ' + est.map(([m]) => m).join(', ') + '; estimated at OpenRouter list price for ' + est.map(([, id]) => id).join(', ') + '. ' : pinfo.unpriced && !headline ? 'Hermes has no price for this provider and no matching OpenRouter price was found. ' : '') + (shown ? 'List-price estimate for that day' : share ? 'Share of the OpenRouter bill for this profile: list cost times the pricing drift' : nonOR > 0 ? 'OpenRouter bill plus the list cost of profiles billed elsewhere (' + fmtUsd(nonOR) + ')' : '') },
-        el('span', { style: { fontSize: 26, fontWeight: 500, letterSpacing: '-0.01em', fontVariantNumeric: 'tabular-nums' } }, (pinfo.unpriced && !est.length && !headline ? 'no price' : fmtUsd(headline, { approx: est.length > 0 || (!shown && ((share && drift != null) || nonOR > 0)) })))),
+        el('span', { style: { fontSize: 26, fontWeight: 500, letterSpacing: '-0.01em', fontVariantNumeric: 'tabular-nums', flex: 'none' } }, (pinfo.unpriced && !est.length && !headline ? 'no price' : fmtUsd(headline, { approx: est.length > 0 || (!shown && ((share && drift != null) || nonOR > 0)) })))),
       provSplit.length > 1
-        ? el(Tip, { label: 'List cost by provider: ' + provSplit.map(([k, v]) => k + ' ' + fmtUsd(v)).join(', ') }, el('span', { style: { fontSize: 11, color: C.sub, cursor: 'help', borderBottom: '1px dotted ' + C.faint } }, headlineLabel))
-        : el('span', { style: { fontSize: 11, color: C.sub } }, headlineLabel),
+        ? el(Tip, { label: 'List cost by provider: ' + provSplit.map(([k, v]) => k + ' ' + fmtUsd(v)).join(', ') }, el('span', { title: headlineLabel, style: { fontSize: 11, color: C.sub, cursor: 'help', borderBottom: '1px dotted ' + C.faint, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', flex: '0 1 auto' } }, headlineLabel))
+        : el('span', { title: headlineLabel, style: { fontSize: 11, color: C.sub, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', flex: '0 1 auto' } }, headlineLabel),
       profileCount > 1 && onScope
         ? el(Tip, { label: scope === 'all' ? 'Every profile added up. Click to show only this chat\'s profile' : 'Only this chat\'s profile. Click to add up every profile' },
-            el('button', { type: 'button', onClick: () => onScope(scope === 'all' ? 'profile' : 'all'), style: { font: 'inherit', fontSize: 10.5, padding: '1px 7px', borderRadius: 8, cursor: 'pointer', border: '1px solid ' + C.stroke, background: 'transparent', color: C.sub, whiteSpace: 'nowrap' } },
+            el('button', { type: 'button', onClick: () => onScope(scope === 'all' ? 'profile' : 'all'), style: { font: 'inherit', fontSize: 10.5, padding: '1px 7px', borderRadius: 8, cursor: 'pointer', border: '1px solid ' + C.stroke, background: 'transparent', color: C.sub, whiteSpace: 'nowrap', flex: 'none' } },
               scope === 'all' ? 'all profiles' : profileLabel || profile))
         : null,
       el(
         'span',
         {
           title: agents ? 'live, last 10 minutes' : 'average over the period',
-          style: { marginLeft: 'auto', fontSize: 11, color: liveTone ? (liveTone === 'bad' ? C.bad : C.warn) : C.sub, fontVariantNumeric: 'tabular-nums' }
+          style: { marginLeft: 'auto', flex: 'none', fontSize: 11, color: liveTone ? (liveTone === 'bad' ? C.bad : C.warn) : C.sub, fontVariantNumeric: 'tabular-nums' }
         },
         agents ? fmtRate(liveRate) + '\u2003' + agents + (agents === 1 ? ' agent' : ' agents') : fmtRate(periodRate)
       )
@@ -3269,9 +3269,9 @@ const Body = ({ meter, prices, threshold, retries, yaml, profile, profileLabel, 
     acct != null
       ? el(
           'div',
-          { style: { display: 'flex', gap: 14, marginTop: 4, fontSize: 11, color: C.sub, fontVariantNumeric: 'tabular-nums', minHeight: 16 } },
-          comparable ? el('span', null, 'Hermes ', el('span', { style: { color: C.text } }, fmtUsd(shown ? hermesCost : periodHermes))) : null,
-          elsewhere != null && elsewhere > 0.01 ? el('span', { title: 'billed minus the list-price estimate: the cost of being routed to pricier providers' }, 'routing premium ', el('span', { style: { color: C.text } }, fmtUsd(elsewhere))) : null,
+          { style: { display: 'flex', flexWrap: 'wrap', columnGap: 14, rowGap: 2, marginTop: 4, fontSize: 11, color: C.sub, fontVariantNumeric: 'tabular-nums', minHeight: 16 } },
+          comparable ? el('span', { style: { whiteSpace: 'nowrap' } }, 'Hermes ', el('span', { style: { color: C.text } }, fmtUsd(shown ? hermesCost : periodHermes))) : null,
+          elsewhere != null && elsewhere > 0.01 ? el('span', { title: 'billed minus the list-price estimate: the cost of being routed to pricier providers', style: { whiteSpace: 'nowrap' } }, 'routing premium ', el('span', { style: { color: C.text } }, fmtUsd(elsewhere))) : null,
           lim
             ? el(
                 'span',

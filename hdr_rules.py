@@ -27,6 +27,10 @@ SENSITIVE = [
 CRED = {"SSH keys", "cloud keys", "signing keys", "GitHub login", "saved logins", "registry logins", "cluster access",
         "keychain", "Hermes logins", "Hermes vault", "Hermes keys", "keys file"}
 FILE_TOOLS = {"read_file": "read", "search_files": "read", "write_file": "write", "patch": "write"}
+STARTUP = {"starts programs at login", "starts programs at boot"}
+# Writes that Hermes' own approval and file guards already ask about or refuse (tools/approval_detection.py,
+# tools/file_tools_write_guards.py); the guard leaves those to Hermes.
+HERMES_CHECKS_WRITES = {"SSH keys", "saved logins", "Hermes keys", "keys file", "runs in every shell", "system settings"}
 
 
 def host_ok(h):
@@ -110,6 +114,18 @@ def touches(name, args):
     for t in texts:
         hosts.update(h.lower() for h in URL.findall(t) if host_ok(h))
     return paths, hosts
+
+
+def guarded(hit):
+    """Whether the guard acts on one touch: only what Hermes does not check itself. Reading keys and
+    logins (Hermes checks no plain reads), writing startup items, and writing key places Hermes does
+    not list; code that names such a place counts as both."""
+    why, how = hit.get("why"), hit.get("op")
+    if why in STARTUP:
+        return how in ("write", "code")
+    if why in CRED:
+        return how in ("read", "code") or (how == "write" and why not in HERMES_CHECKS_WRITES)
+    return False
 
 
 def risky(name, args):

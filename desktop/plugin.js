@@ -2838,7 +2838,8 @@ const HdrPipeline = ({ list }) => {
     on.length < list.length ? el('div', { style: { fontSize: 10.5, color: C.dim, marginTop: 4 } }, 'Installed but off: ' + list.filter(p => !p.enabled).map(p => p.name).join(', ')) : null)
 }
 
-// Guard: one level for the calls HDR scores 70+. Ask goes through Hermes' own approval prompt; Block stops the call
+// Guard: one level for the risky calls Hermes does not check itself (hdr_rules.guarded). Ask goes through
+// Hermes' own approval prompt; Block stops the call
 const GUARD_OPTIONS = [{ id: 'watch', label: 'Watch' }, { id: 'ask', label: 'Ask' }, { id: 'block', label: 'Block' }]
 const guardNoAsk = g => g.approvals === 'off' || g.approvals === 'yolo'
 const guardRight = g => {
@@ -2864,12 +2865,12 @@ const HdrGuard = ({ g, profile, days, onChanged }) => {
   }
   const n = g.risky_calls || 0
   const span = days === 1 ? 'Today' : 'In the last ' + days + ' days'
-  const effect = !n ? span + ', no call scored 70 or more.'
+  const effect = !n ? span + ', no risky call.'
     : g.level === 'block' ? el('span', null, span + ', this would have blocked ' + n + (n === 1 ? ' call.' : ' calls.'))
     : g.level === 'ask' ? (guardNoAsk(g) ? el('span', null, span + ', this would have ', el('span', { style: { color: C.warn } }, 'let ' + n + ' through unasked'), '.') : span + ', this would have asked you ' + n + (n === 1 ? ' time.' : ' times.'))
     : span + ', ' + n + (n === 1 ? ' risky call was' : ' risky calls were') + ' recorded.'
   return el('div', null,
-    el('div', { style: { fontSize: 11, color: C.sub, marginBottom: 8 } }, 'Risky calls: reading keys and logins, writing startup items, changing shell settings (HDR score 70 or more).'),
+    el('div', { style: { fontSize: 11, color: C.sub, marginBottom: 8 } }, 'Risky calls Hermes does not check itself: reading keys and logins, and writing startup items or key places Hermes does not list.'),
     el('div', { style: { display: 'flex', alignItems: 'center', gap: 10 } },
       el(SegmentedControl, { value: g.level, onChange: set, options: GUARD_OPTIONS }),
       busy ? aSmall('Saving…') : null),
@@ -2913,7 +2914,7 @@ const HdrView = ({ profile, period }) => {
   return el('div', null,
     el('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0,1fr))', gap: 8, marginTop: 14 } },
       el(Cell, { tone: g.level === 'watch' ? (g.risky_calls ? 'warn' : 'ok') : g.level === 'ask' && guardNoAsk(g) ? 'warn' : 'ok', label: 'Guard', value: GUARD_OPTIONS.find(o => o.id === g.level).label,
-        sub: sub(stopped ? stopped + ' stopped' : pl(g.risky_calls || 0, 'risky call', 'risky calls')), tip: 'What the guard does with tool calls HDR scores 70 or more, and how many it stopped or saw in this period' }),
+        sub: sub(stopped ? stopped + ' stopped' : pl(g.risky_calls || 0, 'risky call', 'risky calls')), tip: 'What the guard does with risky calls Hermes does not check itself, and how many it stopped or saw in this period' }),
       el(Cell, { tone: newDom ? 'warn' : 'ok', label: 'Destinations', value: String(d.domains.length), sub: sub(newDom + ' new'), tip: 'Hosts that model requests and tools reached in this period; new = first seen in the last 2 days' }),
       el(Cell, { tone: risky.length ? 'warn' : 'ok', label: 'Sensitive places', value: String(d.files.sensitive.length), sub: sub(risky.length + ' scored 70+'), tip: 'Keys, logins, startup folders and shell settings that tools read or wrote' }),
       el(Cell, { tone: exposed ? 'bad' : 'ok', label: 'Runs on its own', value: String(d.runs.jobs.length + d.runs.services.length), sub: sub(pl(d.runs.jobs.length, 'job', 'jobs') + ', ' + pl(d.runs.services.length, 'port', 'ports')), tip: 'Scheduled jobs and listening ports started under Hermes' })),

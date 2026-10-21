@@ -61,6 +61,20 @@ def test_low_scores_and_batch_wrappers_pass():
     assert call("tool_call", {"calls": [{"name": "terminal", "arguments": {"command": "cat ~/.ssh/id_ed25519"}}]}) is None
 
 
+def test_writes_hermes_checks_itself_are_left_to_hermes():
+    set_level("block")
+    assert call("terminal", {"command": "echo 'export X=1' >> ~/.zshrc"}) is None, "Hermes asks before shell settings"
+    assert call("write_file", {"path": "~/.ssh/authorized_keys", "content": "x"}) is None, "Hermes guards SSH writes"
+    assert call("write_file", {"path": "~/projects/app/.env", "content": "x"}) is None
+
+
+def test_key_places_hermes_does_not_check_are_guarded():
+    set_level("block")
+    assert call("write_file", {"path": "~/.aws/credentials", "content": "x"})["action"] == "block"
+    assert call("read_file", {"path": "~/projects/app/.env"})["action"] == "block", "reads of keys files"
+    assert call("terminal", {"command": "ls ~/Library/LaunchAgents/"}) is None, "looking at startup items is fine"
+
+
 def test_its_own_errors_never_block():
     set_level("block")
     assert call("terminal", None) is None
@@ -78,7 +92,7 @@ def test_bad_settings_fall_back_to_watch():
 def test_each_stop_is_logged():
     rows = [json.loads(x) for x in (GUARD / "guard.jsonl").read_text().splitlines()]
     assert {r["action"] for r in rows} == {"ask", "block"}
-    assert all(r["session_id"] == "s1" and r["score"] >= plugin.GUARD_MIN for r in rows)
+    assert all(r["session_id"] == "s1" and r["why"] for r in rows)
 
 
 if __name__ == "__main__":

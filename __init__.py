@@ -518,8 +518,8 @@ def _on_llm_request(**kw):
 
 # ---- HDR guard: ask (through Hermes' approval prompt) or block before a risky tool call ----------
 # One level per profile in hermetic/hdr/guard.json: watch (default, records only), ask or block. It acts
-# on calls HDR scores GUARD_MIN or more (keys, startup items, shell settings). Its own errors never block.
-GUARD_MIN = 70
+# only on what Hermes does not check itself (hdr_rules.guarded: reading keys and logins, writing startup
+# items and key places Hermes does not list). Its own errors never block.
 _GUARD_LEVELS = ("watch", "ask", "block")
 _GUARD_CACHE = {}
 _RULES = {}
@@ -573,7 +573,8 @@ def _on_pre_tool_call(tool_name="", args=None, task_id="", **kw):
         level = guard_level()
         if level == "watch":
             return None
-        hits = [h for h in _hdr_rules().risky(tool_name, args) if h["score"] >= GUARD_MIN]
+        rules = _hdr_rules()
+        hits = [h for h in rules.risky(tool_name, args) if rules.guarded(h)]
         if not hits:
             return None
         top = hits[0]

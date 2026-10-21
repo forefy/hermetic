@@ -2303,7 +2303,6 @@ def _hdr_watch(home, paths):
     return out
 
 
-_HDR_GUARD_MIN = 70  # the same line the guard hook in __init__.py acts on (GUARD_MIN)
 
 
 def _hdr_guard(home, since, titles):
@@ -2326,7 +2325,7 @@ def _hdr_guard(home, since, titles):
                     stops.append(r)
     except OSError:
         pass
-    return {"level": level if level in ("watch", "ask", "block") else "watch", "min": _HDR_GUARD_MIN, "stops": stops[-20:][::-1]}
+    return {"level": level if level in ("watch", "ask", "block") else "watch", "stops": stops[-20:][::-1]}
 
 
 @router.post("/hdr/guard")
@@ -2384,7 +2383,7 @@ async def hdr(days: int = Query(7, ge=1, le=90), profile: Optional[str] = None):
                 dom(h, ts, name, title)
             if ts < since:
                 continue
-            call_top = 0
+            call_guarded = False
             for p, op in paths:
                 r = _hdr_root(p)
                 files[r] = files.get(r, 0) + 1
@@ -2392,9 +2391,9 @@ async def hdr(days: int = Query(7, ge=1, le=90), profile: Optional[str] = None):
                 if s:
                     # reading keys is risky in itself; reading startup or system folders is mostly inspection
                     score = _hdr_score(s[0], s[1], op)
-                    call_top = max(call_top, score)
+                    call_guarded = call_guarded or _HDR.guarded({"why": s[0], "op": op})
                     sensitive.append({"path": p, "op": op, "tool": name, "chat": title, "ts": ts, "why": s[0], "score": score})
-            if call_top >= _HDR_GUARD_MIN:
+            if call_guarded:
                 risky_calls += 1
             if name == "memory":
                 mem_writes.append({"ts": ts, "chat": title})

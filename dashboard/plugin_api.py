@@ -277,25 +277,6 @@ async def config_raw_save(payload: Dict[str, Any] = Body(default={}), profile: O
     return await asyncio.to_thread(_run)
 
 
-@router.put("/config")
-async def config_merge(payload: Dict[str, Any] = Body(default={}), profile: Optional[str] = None):
-    """Merge a few keys into config.yaml (HDR's posture controls); everything else stays as it is."""
-    part = (payload or {}).get("config")
-    if not isinstance(part, dict) or not part:
-        return {"ok": False, "error": "config must be a non-empty mapping"}
-
-    def _run():
-        from hermes_cli.config import require_readable_config_before_write, save_config
-        try:
-            _write_home(profile)
-        except RuntimeError as exc:
-            return {"ok": False, "error": str(exc)}
-        require_readable_config_before_write()  # never write over a config that cannot be read
-        save_config(part, merge_existing=True)
-        return {"ok": True}
-    return await asyncio.to_thread(_run)
-
-
 @router.get("/usage")
 async def usage(days: int = Query(30, ge=1, le=365), profile: Optional[str] = None):
     """Tokens, cost and calls per local day and per model for sessions started in the period, plus

@@ -2674,46 +2674,13 @@ const hdrEvery = t => { const m = /every\s+(\d+)\s*m/i.exec(t || ''); if (!m) re
 
 // Posture: one strip, a segment per setting; pick a setting to change it right here (or in Hermes Settings)
 const HDR_SETTINGS = { approvals: 'config:safety', allowlist: 'config:safety', browser: 'config:browser', terminal: 'config:workspace', inbound: 'gateway', api: 'gateway', shell_hooks: 'config:advanced' }
-const hdrBtn = (label, onClick, on, busy, danger) => el('button', { key: label, type: 'button', onClick, disabled: busy || on,
-  style: { font: 'inherit', fontSize: 11, padding: '4px 10px', borderRadius: 7, cursor: busy || on ? 'default' : 'pointer', border: '1px solid ' + (on ? C.accent : danger ? C.bad : C.stroke),
-    background: on ? 'rgba(107,132,230,.18)' : 'transparent', color: on ? C.text : danger ? C.bad : C.sub, opacity: busy && !on ? 0.5 : 1 } }, label)
-const HdrPosture = ({ rows, profile, onChanged }) => {
+const HdrPosture = ({ rows }) => {
   const rank = { bad: 0, warn: 1, ok: 2 }
   const worst = rows.slice().sort((a, b) => rank[a.tone] - rank[b.tone])[0]
   const [pick, setPick] = useState(null)
-  const [busy, setBusy] = useState(false)
-  const [err, setErr] = useState(null)
   const selKey = pick || (worst && worst.tone !== 'ok' ? worst.key : null)
   const sel = rows.find(r => r.key === selKey)
-  const run = async fn => {
-    setBusy(true); setErr(null)
-    try { await fn(); onChanged && onChanged() } catch (e) { setErr((e && e.message) || 'Could not save') } finally { setBusy(false) }
-  }
-  // the same doors Hermes' own screens use: config.set for approvals, a one-key merge into config for the rest
-  const setKey = (key, value) => run(() => host.request('config.set', profile && profile !== 'default' ? { key, value, profile } : { key, value }))
-  const merge = part => run(() => writeConfig(profile, '/config', { config: part }))
-  const dropAllowed = item => run(async () => {
-    const cur = await host.request('config.get', { key: 'full', profile: profile || 'default' })
-    const list = ((cur && (cur.config || cur)) || {}).command_allowlist || []
-    const next = list.filter(x => String(x).slice(0, 120) !== item)
-    if (next.length === list.length) throw new Error('That entry is no longer there')
-    await writeConfig(profile, '/config', { config: { command_allowlist: next } })
-  })
-  const control = r => {
-    if (r.key === 'approvals') {
-      // only toward asking more: off < smart < manual; loosening is done in Hermes settings
-      const rank = { off: 0, yolo: 0, smart: 1, manual: 2 }
-      const up = [['smart', 'Smart'], ['manual', 'Ask me']].filter(([v]) => rank[v] > (rank[r.value] != null ? rank[r.value] : 2))
-      return up.length ? el('div', { style: { display: 'flex', gap: 6, flexWrap: 'wrap' } }, up.map(([v, l]) => hdrBtn(l, () => setKey('approvals.mode', v), false, busy))) : aSmall('Hermes asks you before risky commands.')
-    }
-    if (r.key === 'allowlist') return (r.items || []).length
-      ? el('div', null, r.items.map((x, i) => hdrLine('a' + i, el('span', { className: 'mono', style: { flex: 1, minWidth: 0, fontSize: 10.5, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, x), hdrBtn('Remove', () => dropAllowed(x), false, busy, true))))
-      : aSmall('Nothing is allowed permanently.')
-    if (r.key === 'browser' && r.value === 'your profile') return hdrBtn('Use a separate browser profile', () => merge({ browser: { use_real_profile: false } }), false, busy)
-    if (r.key === 'inbound' && r.value === 'anyone') return hdrBtn('Only people I pair', () => merge({ gateway: { allow_all_users: false } }), false, busy, true)
-    if (r.key === 'api' && r.value !== 'off') return hdrBtn('Turn the API server off', () => merge({ gateway: { api_server: { enabled: false } } }), false, busy, true)
-    return null
-  }
+  // read only: these are Hermes settings, changed on Hermes' own Settings pages (linked below)
   return el('div', null,
     el('div', { style: { display: 'flex', gap: 3 } }, rows.map(r => el(Tip, { key: r.key, label: r.label + ': ' + r.value + '. ' + r.why },
       el('span', { onClick: () => setPick(r.key), style: { flex: 1, height: 6, borderRadius: 3, background: HDR_TONE[r.tone] || C.faint, opacity: r.tone === 'ok' ? 0.45 : 1, cursor: 'pointer', outline: r.key === selKey ? '1px solid ' + C.text : 'none', outlineOffset: 1 } })))),
@@ -2724,12 +2691,7 @@ const HdrPosture = ({ rows, profile, onChanged }) => {
         el('span', { style: { color: HDR_TONE[r.tone] === C.ok ? C.text : HDR_TONE[r.tone], whiteSpace: 'nowrap' } }, r.value))))),
     sel ? el('div', { style: { marginTop: 8, padding: '9px 10px', borderRadius: 8, border: '1px solid ' + C.stroke } },
       el('div', { style: { fontSize: 11.5, color: C.text, lineHeight: 1.45 } }, el('span', { style: { color: HDR_TONE[sel.tone] } }, sel.label + ' ' + sel.value + '. '), sel.why),
-      control(sel) ? el('div', { style: { marginTop: 8 } }, control(sel)) : null,
-      el('div', { style: { display: 'flex', gap: 12, alignItems: 'center', marginTop: 8, fontSize: 10.5 } },
-        HDR_SETTINGS[sel.key] ? el(ALink, { onClick: () => host.navigate('/settings?tab=' + HDR_SETTINGS[sel.key]) }, 'open in Hermes settings') : null,
-        sel.key === 'terminal' && sel.value === 'local' ? el('span', { style: { color: C.dim } }, 'A container needs Docker set up first') : null,
-        busy ? el('span', { style: { color: C.dim } }, 'Saving…') : null,
-        err ? el('span', { style: { color: C.bad } }, err) : null))
+      HDR_SETTINGS[sel.key] ? el('div', { style: { marginTop: 8, fontSize: 10.5 } }, el(ALink, { onClick: () => host.navigate('/settings?tab=' + HDR_SETTINGS[sel.key]) }, 'change in Hermes settings')) : null)
       : null)
 }
 
@@ -2937,7 +2899,8 @@ const HdrGuard = ({ g, profile, days, onChanged }) => {
       busy ? aSmall('Saving…') : null),
     el('div', { style: { fontSize: 10.5, color: C.dim, marginTop: 8 } }, effect),
     g.level === 'ask' && guardNoAsk(g) ? el('div', { style: { marginTop: 8, padding: '7px 10px', borderRadius: 8, background: 'rgba(201,147,74,.1)', border: '1px solid rgba(201,147,74,.35)', fontSize: 11, color: C.sub, lineHeight: 1.45 } },
-      el('span', { style: { color: C.warn } }, 'Approvals are off'), ', so Hermes can’t ask you and Ask lets the call through. Turn approvals to Smart or Ask me in Posture above.') : null,
+      el('span', { style: { color: C.warn } }, 'Approvals are off'), ', so Hermes can’t ask you and Ask lets the call through. ',
+      el(ALink, { onClick: () => host.navigate('/settings?tab=config:safety') }, 'Turn approvals on in Hermes settings'), '.') : null,
     g.level === 'ask' && !guardNoAsk(g) ? el('div', { style: { fontSize: 10.5, color: C.dim, marginTop: 4 } }, 'Scheduled jobs and other runs with nobody to ask treat Ask as Block.') : null,
     err ? el('div', { style: { fontSize: 10.5, color: C.bad, marginTop: 6 } }, err) : null,
     (g.stops || []).length ? el('div', { style: { marginTop: 10 } },
@@ -2978,7 +2941,7 @@ const HdrView = ({ profile, period }) => {
       el(Cell, { tone: newDom ? 'warn' : 'ok', label: 'Destinations', value: String(d.domains.length), sub: sub(newDom + ' new'), tip: 'Hosts that model requests and tools reached in this period; new = first seen in the last 2 days' }),
       el(Cell, { tone: risky.length ? 'warn' : 'ok', label: 'Sensitive places', value: String(d.files.sensitive.length), sub: sub(risky.length + ' scored 70+'), tip: 'Keys, logins, startup folders and shell settings that tools read or wrote' }),
       el(Cell, { tone: exposed ? 'bad' : 'ok', label: 'Runs on its own', value: String(d.runs.jobs.length + d.runs.services.length), sub: sub(pl(d.runs.jobs.length, 'job', 'jobs') + ', ' + pl(d.runs.services.length, 'port', 'ports')), tip: 'Scheduled jobs and listening ports started under Hermes' })),
-    el(Section, { id: 'hdr-posture', title: 'Posture', right: dots(issues.map(p => p.tone)) }, el(HdrPosture, { rows: d.posture, profile, onChanged: () => setTick(t => t + 1) })),
+    el(Section, { id: 'hdr-posture', title: 'Posture', right: dots(issues.map(p => p.tone)) }, el(HdrPosture, { rows: d.posture })),
     d.guard ? el(Section, { id: 'hdr-guard', title: 'Guard', right: guardRight(d.guard) }, el(HdrGuard, { g: d.guard, profile, days, onChanged: () => setTick(t => t + 1) })) : null,
     el(Section, { id: 'hdr-net', title: 'Where data went', right: el('span', { style: { display: 'flex', gap: 8 } }, newDom ? el('span', { style: { color: C.warn } }, newDom + ' new') : null, String(d.domains.length)) }, el(HdrDomains, { list: d.domains })),
     el(Section, { id: 'hdr-files', title: 'Files and secrets', right: risky.length || d.secrets.vault.length ? el('span', { style: { color: C.warn } }, risky.length + ' sensitive' + (d.secrets.vault.length ? '   ' + d.secrets.vault.length + ' vault' : '')) : null }, el(HdrFiles, { files: d.files, secrets: d.secrets })),

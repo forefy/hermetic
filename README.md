@@ -50,13 +50,12 @@ Parts that only make sense with OpenRouter (provider routing, provider compariso
 What the harness touched and how exposed it is. It records and shows everything, and its guard can ask you or block before the riskiest tool calls.
 
 <p align="center">
-  <img src="docs/hermetic-hdr.png" alt="HDR view: posture, destinations, sensitive places and what runs on its own" width="400">
+  <img src="docs/hermetic-hdr.png" alt="HDR view: the guard, destinations, sensitive places and what runs on its own" width="400">
   &nbsp;
   <img src="docs/hermetic-hdr-pipeline.png" alt="Where each plugin acts on a model request and on a tool call" width="400">
 </p>
 
-- **Posture**: the settings that decide how exposed you are. Approvals, commands you allowed permanently, whether the terminal runs directly on your machine, whether the browser uses your real profile, who can message the agent, the API server and shell hooks. One strip shows them all and the worst one is spelled out; you change them in Hermes' settings.
-- **Guard**: one setting for the tool calls HDR scores 70 or more (reading keys and logins, writing startup items, changing shell settings). **Watch** records them, **Ask** has Hermes ask you first through its own approval prompt, and **Block** stops the call and tells the agent why. Watch is the default. Ask needs approvals on (Smart or Ask me in Posture); with approvals off, Hermes approves its own questions, and the guard says so. Scheduled jobs and other runs with nobody to ask treat Ask as Block.
+- **Guard**: one setting for the tool calls HDR scores 70 or more (reading keys and logins, writing startup items, changing shell settings). **Watch** records them, **Ask** has Hermes ask you first through its own approval prompt, and **Block** stops the call and tells the agent why. Watch is the default. Ask needs approvals on (Smart or Ask me in Hermes' settings); with approvals off, Hermes approves its own questions, and the guard says so. Scheduled jobs and other runs with nobody to ask treat Ask as Block.
 - **Where data went**: every host that model requests and tools reached. Tool traffic is drawn as a flow from tool kind to destination to known or new, and each host lists the chats behind it.
 - **Files and secrets**: where tools worked, and the sensitive places they touched (keys and logins, startup items, shell settings, system files, the browser vault), each scored. Reading keys scores high; writing to startup items scores highest.
 - **What runs on its own**: scheduled jobs with their schedule and next run, ports opened under Hermes and the chats that opened them, subagents and background processes.
@@ -90,7 +89,7 @@ Hermetic does not update itself. Catalog installs update from the Hermes Plugins
 
 **What it reads.** Hermes' session database (read-only, through Hermes' `SessionDB`), `config.yaml`, the skills and their change history, scheduled jobs, SOUL.md and the memory files (sizes and change times), installed plugin sources (to see what each registers), and its own routing records. HDR runs `ps` and `lsof` locally to list ports opened under Hermes.
 
-**What it writes, and only when you ask.** Routing rules and the fixes you apply (through Hermes' own config functions, shown before writing), archived skills, skill versions you ship or revert, the guard's level, and test results. HDR's posture view only reads Hermes' settings; you change them in Hermes.
+**What it writes, and only when you ask.** Routing rules and the fixes you apply (through Hermes' own config functions, shown before writing), archived skills, skill versions you ship or revert, the guard's level, and test results.
 
 **In the background.** A thread checks every 5 minutes for skill changes made by the background review, and acts only if you turned automatic tests on. A short-lived thread stores the billed-spend snapshot.
 

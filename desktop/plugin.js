@@ -2656,7 +2656,6 @@ const AaiView2 = ({ profile, period, yaml, orProfile, auxOn, onChanged }) => {
 }
 
 // ---- HDR: harness detection and response (recording only) ----------------------------------------
-const HDR_TONE = { bad: C.bad, warn: C.warn, ok: C.ok }
 const HDR_SEQ = [C.accent, 'var(--ui-cyan)', 'var(--ui-purple)', C.sub, C.dim, C.faint]
 const hdrScore = s => el('span', { style: { display: 'inline-flex', alignItems: 'center', gap: 5, flex: 'none' } },
   el('span', { style: { width: 44, height: 5, borderRadius: 3, background: 'rgba(255,255,255,.07)', overflow: 'hidden', display: 'inline-block' } },
@@ -2671,27 +2670,6 @@ const hdrHead = t => el('div', { style: { fontSize: 10.5, color: C.dim, margin: 
 const hdrMore = (list, n, open, setOpen) => list.length > n ? el(ALink, { onClick: () => setOpen(!open) }, open ? 'show less' : 'show all ' + list.length) : null
 const hdrIn = ts => { const s = ts - Date.now() / 1000; return s <= 0 ? 'due' : s < 3600 ? 'in ' + Math.round(s / 60) + 'm' : s < 86400 ? 'in ' + Math.round(s / 3600) + 'h' : 'in ' + Math.round(s / 86400) + 'd' }
 const hdrEvery = t => { const m = /every\s+(\d+)\s*m/i.exec(t || ''); if (!m) return t; const n = +m[1]; return n % 1440 === 0 ? 'every ' + (n / 1440 === 1 ? 'day' : n / 1440 + ' days') : n % 60 === 0 ? 'every ' + (n / 60 === 1 ? 'hour' : n / 60 + ' hours') : 'every ' + n + ' min' }
-
-// Posture: one strip, a segment per setting; pick one to see why it matters
-const HdrPosture = ({ rows }) => {
-  const rank = { bad: 0, warn: 1, ok: 2 }
-  const worst = rows.slice().sort((a, b) => rank[a.tone] - rank[b.tone])[0]
-  const [pick, setPick] = useState(null)
-  const selKey = pick || (worst && worst.tone !== 'ok' ? worst.key : null)
-  const sel = rows.find(r => r.key === selKey)
-  // read only: these are Hermes settings, changed in Hermes' own Settings
-  return el('div', null,
-    el('div', { style: { display: 'flex', gap: 3 } }, rows.map(r => el(Tip, { key: r.key, label: r.label + ': ' + r.value + '. ' + r.why },
-      el('span', { onClick: () => setPick(r.key), style: { flex: 1, height: 6, borderRadius: 3, background: HDR_TONE[r.tone] || C.faint, opacity: r.tone === 'ok' ? 0.45 : 1, cursor: 'pointer', outline: r.key === selKey ? '1px solid ' + C.text : 'none', outlineOffset: 1 } })))),
-    el('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0,1fr))', gap: 6, marginTop: 10 } }, rows.map(r => el(Tip, { key: r.key, label: r.why },
-      el('div', { onClick: () => setPick(r.key === selKey ? '__none' : r.key), style: { display: 'flex', alignItems: 'center', gap: 6, padding: '6px 8px', borderRadius: 7, cursor: 'pointer', minWidth: 0, fontSize: 11,
-        background: r.key === selKey ? 'rgba(107,132,230,.14)' : 'var(--ui-bg-tertiary)', boxShadow: r.key === selKey ? 'inset 0 0 0 1px ' + C.accent : 'none' } },
-        el(Dot, { tone: r.tone }), el('span', { style: { flex: 1, color: C.sub, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, r.label),
-        el('span', { style: { color: HDR_TONE[r.tone] === C.ok ? C.text : HDR_TONE[r.tone], whiteSpace: 'nowrap' } }, r.value))))),
-    sel ? el('div', { style: { marginTop: 8, padding: '9px 10px', borderRadius: 8, border: '1px solid ' + C.stroke } },
-      el('div', { style: { fontSize: 11.5, color: C.text, lineHeight: 1.45 } }, el('span', { style: { color: HDR_TONE[sel.tone] } }, sel.label + ' ' + sel.value + '. '), sel.why))
-      : null)
-}
 
 // Where data went: the same flow chart as Costs, tool kind -> destination -> seen before or new
 const HDR_FAMILY = n => n === 'model requests' ? 'Model' : n === 'terminal' ? 'Terminal' : n === 'execute_code' ? 'Code' : /^browser|desktop_preview/.test(n) ? 'Browser' : n === 'delegate_task' ? 'Subagents' : /^web_|vision/.test(n) ? 'Web tools' : 'Other tools'
@@ -2924,21 +2902,21 @@ const HdrView = ({ profile, period }) => {
   }, [profile, days, tick])
   if (err) return el('div', { style: { fontSize: 11, color: C.faint, marginTop: 14 } }, err)
   if (!d) return el('div', { style: { fontSize: 11, color: C.faint, marginTop: 14 } }, 'Loading…')
-  const issues = d.posture.filter(p => p.tone !== 'ok')
+  const g = d.guard || { level: 'watch', stops: [], risky_calls: 0 }
+  const stopped = (g.stops || []).length
   const newDom = d.domains.filter(x => x.new).length
   const risky = d.files.sensitive.filter(s => s.score >= 70)
   const exposed = d.runs.services.filter(s => s.exposed).length
   const full = d.prompt.files.filter(f => { const l = (d.prompt.limits || {})[f.file.split('/').pop()]; return l && f.bytes / l >= 0.8 })
   const sub = t => el('span', { style: { fontSize: 11, fontWeight: 400, color: C.dim, marginLeft: 5 } }, t)
-  const dots = list => el('span', { style: { display: 'flex', alignItems: 'center', gap: 4 } }, list.map((t, i) => el('span', { key: i, style: { width: 6, height: 6, borderRadius: 3, background: HDR_TONE[t] || C.dim } })))
   const pl = (n, one, many) => n + ' ' + (n === 1 ? one : many)
   return el('div', null,
     el('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0,1fr))', gap: 8, marginTop: 14 } },
-      el(Cell, { tone: issues.some(p => p.tone === 'bad') ? 'bad' : issues.length ? 'warn' : 'ok', label: 'Posture', value: String(issues.length), sub: sub(issues.length === 1 ? 'setting to look at' : 'settings to look at'), tip: issues.map(p => p.label + ': ' + p.value).join(', ') || 'All settings look safe' }),
+      el(Cell, { tone: g.level === 'watch' ? (g.risky_calls ? 'warn' : 'ok') : g.level === 'ask' && guardNoAsk(g) ? 'warn' : 'ok', label: 'Guard', value: GUARD_OPTIONS.find(o => o.id === g.level).label,
+        sub: sub(stopped ? stopped + ' stopped' : pl(g.risky_calls || 0, 'risky call', 'risky calls')), tip: 'What the guard does with tool calls HDR scores 70 or more, and how many it stopped or saw in this period' }),
       el(Cell, { tone: newDom ? 'warn' : 'ok', label: 'Destinations', value: String(d.domains.length), sub: sub(newDom + ' new'), tip: 'Hosts that model requests and tools reached in this period; new = first seen in the last 2 days' }),
       el(Cell, { tone: risky.length ? 'warn' : 'ok', label: 'Sensitive places', value: String(d.files.sensitive.length), sub: sub(risky.length + ' scored 70+'), tip: 'Keys, logins, startup folders and shell settings that tools read or wrote' }),
       el(Cell, { tone: exposed ? 'bad' : 'ok', label: 'Runs on its own', value: String(d.runs.jobs.length + d.runs.services.length), sub: sub(pl(d.runs.jobs.length, 'job', 'jobs') + ', ' + pl(d.runs.services.length, 'port', 'ports')), tip: 'Scheduled jobs and listening ports started under Hermes' })),
-    el(Section, { id: 'hdr-posture', title: 'Posture', right: dots(issues.map(p => p.tone)) }, el(HdrPosture, { rows: d.posture })),
     d.guard ? el(Section, { id: 'hdr-guard', title: 'Guard', right: guardRight(d.guard) }, el(HdrGuard, { g: d.guard, profile, days, onChanged: () => setTick(t => t + 1) })) : null,
     el(Section, { id: 'hdr-net', title: 'Where data went', right: el('span', { style: { display: 'flex', gap: 8 } }, newDom ? el('span', { style: { color: C.warn } }, newDom + ' new') : null, String(d.domains.length)) }, el(HdrDomains, { list: d.domains })),
     el(Section, { id: 'hdr-files', title: 'Files and secrets', right: risky.length || d.secrets.vault.length ? el('span', { style: { color: C.warn } }, risky.length + ' sensitive' + (d.secrets.vault.length ? '   ' + d.secrets.vault.length + ' vault' : '')) : null }, el(HdrFiles, { files: d.files, secrets: d.secrets })),

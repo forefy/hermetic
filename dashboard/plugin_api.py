@@ -2347,34 +2347,6 @@ async def hdr_guard(payload: Dict[str, Any] = Body(default={}), profile: Optiona
     return await asyncio.to_thread(_run)
 
 
-def _hdr_posture(cfg):
-    g, b, t = cfg.get("gateway") or {}, cfg.get("browser") or {}, cfg.get("terminal") or {}
-    api = g.get("api_server") if isinstance(g.get("api_server"), dict) else {}
-    plats = [k for k, v in (cfg.get("platforms") or {}).items() if isinstance(v, dict) and v.get("enabled")]
-    mode = str((cfg.get("approvals") or {}).get("mode") or "manual")
-    allow = cfg.get("command_allowlist") or []
-    rows = [
-        {"key": "approvals", "label": "Approvals", "value": mode, "tone": "bad" if mode in ("off", "yolo") else "ok",
-         "why": "Nothing can ask you: every approval request, including a plugin's, is approved automatically." if mode in ("off", "yolo") else "Risky commands ask you first."},
-        {"key": "allowlist", "label": "Saved always-allow", "value": str(len(allow)), "tone": "warn" if allow else "ok", "items": [str(a)[:120] for a in allow],
-         "why": "Commands you allowed permanently; they never ask again."},
-        {"key": "terminal", "label": "Terminal", "value": str(t.get("backend") or "local"), "tone": "warn" if (t.get("backend") or "local") == "local" else "ok",
-         "why": "Commands run directly on this Mac, with your files and logins." if (t.get("backend") or "local") == "local" else "Commands run in a separate environment."},
-        {"key": "browser", "label": "Browser", "value": "your profile" if b.get("use_real_profile") else "separate profile", "tone": "warn" if b.get("use_real_profile") else "ok",
-         "why": "The agent browses logged in as you." if b.get("use_real_profile") else "The agent's browser has its own logins."},
-        {"key": "inbound", "label": "Inbound", "value": "anyone" if g.get("allow_all_users") else ("you, " + ", ".join(plats)) if plats else "only you",
-         "tone": "bad" if g.get("allow_all_users") else "warn" if plats else "ok", "why": "Messages from other people reach the agent." if g.get("allow_all_users") or plats else "Only you talk to it."},
-        {"key": "api", "label": "API server", "value": (str(api.get("host") or "on") if api.get("enabled") else "off"),
-         "tone": "bad" if api.get("enabled") and str(api.get("host") or "").startswith("0.") else "warn" if api.get("enabled") else "ok",
-         "why": "Other programs can drive the agent over HTTP." if api.get("enabled") else "No HTTP access from outside."},
-    ]
-    hooks = cfg.get("hooks") or {}
-    n = sum(len(v) if isinstance(v, list) else 1 for v in hooks.values()) if isinstance(hooks, dict) else 0
-    rows.append({"key": "shell_hooks", "label": "Shell hooks", "value": str(n), "tone": "warn" if n else "ok",
-                 "why": "Shell commands Hermes runs on its own events." if n else "No shell commands run on Hermes events."})
-    return rows
-
-
 @router.get("/hdr")
 async def hdr(days: int = Query(7, ge=1, le=90), profile: Optional[str] = None):
     """Everything HDR shows, from Hermes' own records. Recording only."""
@@ -2491,7 +2463,6 @@ async def hdr(days: int = Query(7, ge=1, le=90), profile: Optional[str] = None):
         prompt_files = _hdr_watch(home, [p for p in watched if p.is_file() and not p.name.endswith(".lock")])
         plugins = _hdr_plugins(home, cfg)
 
-        posture = _hdr_posture(cfg)
         grouped = {}
         for x in sensitive:
             g = grouped.setdefault((x["path"], x["op"]), dict(x, times=0, chats=[]))
@@ -2503,7 +2474,6 @@ async def hdr(days: int = Query(7, ge=1, le=90), profile: Optional[str] = None):
         roots = sorted(files.items(), key=lambda kv: -kv[1])
         return {
             "days": days, "learning": learning, "learning_since": first_call,
-            "posture": posture,
             "domains": domains,
             "files": {"roots": [{"root": r, "touches": n} for r, n in roots[:12]], "total": sum(files.values()), "sensitive": sensitive[:30]},
             "runs": {"jobs": jobs, "processes": procs if isinstance(procs, list) else [], "services": services, "subagents": subagents},

@@ -54,11 +54,6 @@ def test_terminal_paths_and_hosts():
     assert hosts == {"api.github.com"}
 
 
-def test_posture_flags_approvals_off():
-    rows = {r["key"]: r for r in api._hdr_posture({"approvals": {"mode": "off"}, "terminal": {"backend": "docker"}})}
-    assert rows["approvals"]["tone"] == "bad"
-    assert rows["terminal"]["tone"] == "ok"
-    assert rows["inbound"]["tone"] == "ok"
 
 
 if __name__ == "__main__":

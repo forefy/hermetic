@@ -53,6 +53,8 @@ BR=$(git branch --show-current)
 case "$BR" in main|release/*) ;; *) die "run it on main or a release/* branch" ;; esac
 [ -z "$(git status --porcelain)" ] || die "commit or stash your changes first"
 
+# requires_hermes in the catalog entry is the floor the catalog maintainers set (in the template);
+# plugin.yaml keeps a lower one so development builds that report an older version can still install
 VERSION=$(field version); REQUIRES=$(field requires_hermes)
 [ -n "$VERSION" ] && [ -n "$REQUIRES" ] || die "plugin.yaml needs version and requires_hermes"
 

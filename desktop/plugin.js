@@ -3204,9 +3204,15 @@ const Body = ({ meter, prices, threshold, retries, yaml, profile, profileLabel, 
         { id: '30d', label: '30d' }
       ]
     }),
-    el('span', { style: { display: 'inline-flex', gap: 4, alignItems: 'center' } },
+    // each dot's button fills its whole slot (10 x 20) around the 6px dot, so it is easy to hit
+    el('span', { style: { display: 'inline-flex', alignItems: 'center' } },
       VIEWS.map(([id, name, what], i) => el(Tip, { key: id, label: name + ': ' + what },
-        el('button', { type: 'button', 'aria-label': 'Show the ' + name + ' view', onClick: () => onView && onView(id), style: { width: 6, height: 6, padding: 0, border: 'none', borderRadius: 3, cursor: 'pointer', background: i === vi ? C.text : C.faint } })))),
+        el('button', {
+          type: 'button', 'aria-label': 'Show the ' + name + ' view', onClick: () => onView && onView(id),
+          onMouseEnter: e => { if (i !== vi) e.currentTarget.firstChild.style.background = C.sub },
+          onMouseLeave: e => { e.currentTarget.firstChild.style.background = i === vi ? C.text : C.faint },
+          style: { width: 10, height: 20, padding: 0, border: 'none', background: 'transparent', cursor: 'pointer', display: 'inline-flex', alignItems: 'center', justifyContent: 'center' }
+        }, el('span', { style: { width: 6, height: 6, borderRadius: 3, background: i === vi ? C.text : C.faint, transition: 'background .12s' } }))))),
     arrow(to, dir > 0 ? 'm6 3 5 5-5 5' : 'm10 3-5 5 5 5')
   )
   if (view === 'hdr') return el('div', { style: cardStyle }, head, el(HdrView, { profile, period }))

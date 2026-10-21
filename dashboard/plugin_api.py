@@ -2305,13 +2305,30 @@ def _hdr_watch(home, paths):
 
 
 
-def _hdr_guard(home, since, titles):
-    """The guard's level for this profile and what it asked or blocked since a time."""
-    d = _data_dir(home) / "hdr"
+def _hdr_guard_file(home):
+    return _data_dir(home) / "hdr" / "guard.json"
+
+
+def _hdr_guard_read(home):
     try:
-        level = _aai_json.loads((d / "guard.json").read_text(encoding="utf-8")).get("level")
+        data = _aai_json.loads(_hdr_guard_file(home).read_text(encoding="utf-8"))
     except Exception:
-        level = None
+        data = {}
+    level = data.get("level") if data.get("level") in ("watch", "ask", "block") else "watch"
+    return {"level": level, "rules": [r for r in data.get("rules") or [] if isinstance(r, dict)]}
+
+
+def _hdr_guard_write(home, data):
+    p = _hdr_guard_file(home)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(".json.tmp")
+    tmp.write_text(_aai_json.dumps(dict(data, ts=time.time())), encoding="utf-8")
+    os.replace(tmp, p)
+
+
+def _hdr_guard(home, since, titles):
+    """The guard's level and saved rules for this profile, and what it stopped or let through since a time."""
+    d = _data_dir(home) / "hdr"
     stops = []
     try:
         with open(d / "guard.jsonl", encoding="utf-8") as fh:
@@ -2325,24 +2342,217 @@ def _hdr_guard(home, since, titles):
                     stops.append(r)
     except OSError:
         pass
-    return {"level": level if level in ("watch", "ask", "block") else "watch", "stops": stops[-20:][::-1]}
+    return dict(_hdr_guard_read(home), stops=stops[-20:][::-1])
 
 
 @router.post("/hdr/guard")
 async def hdr_guard(payload: Dict[str, Any] = Body(default={}), profile: Optional[str] = None):
-    """Set the guard: watch (records only), ask (Hermes' approval prompt) or block, for calls scored 70+."""
-    level = str((payload or {}).get("level") or "")
-    if level not in ("watch", "ask", "block"):
+    """Set the guard (watch, ask or block) and/or remove a saved rule by its index."""
+    level = (payload or {}).get("level")
+    remove = (payload or {}).get("remove_rule")
+    if level is not None and level not in ("watch", "ask", "block"):
         return {"ok": False, "error": "level must be watch, ask or block"}
 
     def _run():
         _name, home = _profile_home(profile)
-        d = _data_dir(home) / "hdr"
+        data = _hdr_guard_read(home)
+        if level is not None:
+            data["level"] = level
+        if isinstance(remove, int) and 0 <= remove < len(data["rules"]):
+            data["rules"].pop(remove)
+        _hdr_guard_write(home, data)
+        return dict(data, ok=True)
+    return await asyncio.to_thread(_run)
+
+
+# Hermetic's own Ask: the guard hook (__init__.py) leaves a question in one folder for every profile and
+# waits; the popover lists questions here every 2s (which also tells the hook someone is there) and answers.
+def _asks_dir():
+    from hermes_constants import get_default_hermes_root
+    return _data_dir(Path(get_default_hermes_root())) / "hdr" / "asks"
+
+
+@router.get("/hdr/guard/asks")
+async def hdr_guard_asks(profile: Optional[str] = None):
+    """Questions waiting for an answer, oldest first, with the chat they came from."""
+    def _run():
+        d = _asks_dir()
         d.mkdir(parents=True, exist_ok=True)
-        tmp = d / "guard.json.tmp"
-        tmp.write_text(_aai_json.dumps({"level": level, "ts": time.time()}), encoding="utf-8")
-        os.replace(tmp, d / "guard.json")
-        return {"ok": True, "level": level}
+        (d / "seen").touch()
+        now, out = time.time(), []
+        for f in sorted(d.glob("*.json")):
+            if f.name.endswith(".answer.json"):
+                continue
+            try:
+                a = _aai_json.loads(f.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if float(a.get("until") or 0) <= now or (d / (str(a.get("id")) + ".answer.json")).exists():
+                continue
+            a["left"] = round(float(a["until"]) - now, 1)
+            a["chat"] = ""
+            try:
+                db = _open_sessions_db(a.get("profile"))
+                try:
+                    a["chat"] = (db.get_session(a.get("session_id")) or {}).get("title") or ""
+                finally:
+                    db.close()
+            except Exception:
+                pass
+            out.append(a)
+        return {"asks": sorted(out, key=lambda a: a["ts"])}
+    return await asyncio.to_thread(_run)
+
+
+@router.post("/hdr/guard/answer")
+async def hdr_guard_answer(payload: Dict[str, Any] = Body(default={}), profile: Optional[str] = None):
+    """Answer a question: allow or block, and remember it once, for that chat, or always, for the file,
+    its folder, or that whole kind of place."""
+    p = payload or {}
+    aid, decision = str(p.get("id") or ""), p.get("decision")
+    scope, remember = p.get("scope") or "file", p.get("remember") or "once"
+    if not _aai_re.match(r"^[0-9a-f]{12}$", aid) or decision not in ("allow", "block") \
+            or scope not in ("file", "folder", "kind") or remember not in ("once", "chat", "always"):
+        return {"ok": False, "error": "bad answer"}
+
+    def _run():
+        d = _asks_dir()
+        try:
+            a = _aai_json.loads((d / (aid + ".json")).read_text(encoding="utf-8"))
+        except Exception:
+            return {"ok": False, "error": "That question is no longer waiting"}
+        tmp = d / (aid + ".answer.tmp")
+        tmp.write_text(_aai_json.dumps({"decision": decision, "how": "you"}), encoding="utf-8")
+        os.replace(tmp, d / (aid + ".answer.json"))
+        if remember != "once":
+            rule = {"decision": decision, "scope": scope, "op": a.get("op"), "path": a.get("path"), "folder": a.get("folder"),
+                    "kind": a.get("kind"), "why": a.get("why"), "ts": time.time()}
+            if remember == "chat":
+                rule["session_id"] = a.get("session_id")
+            try:
+                _n, home = _profile_home(a.get("profile"))
+            except ValueError:
+                return {"ok": True, "error": "Answered, but that profile is gone, so the rule was not saved"}
+            data = _hdr_guard_read(home)
+            data["rules"].append(rule)
+            _hdr_guard_write(home, data)
+        return {"ok": True}
+    return await asyncio.to_thread(_run)
+
+
+# ---- Hooks: shell hooks (config.yaml hooks:) and gateway hooks (hooks/<name>/), and their scripts ----
+# Hermes approves a shell hook once per (event, command) and then trusts edits to its script; gateway
+# hooks run with no prompt at all. HDR remembers each script as first seen and shows what changed since.
+_HOOK_CAN = {"pre_tool_call": "Can block or change tool calls", "post_tool_call": "Sees what tools return",
+             "pre_llm_call": "Adds text to every prompt", "post_llm_call": "Sees every reply",
+             "transform_llm_output": "Can change replies", "transform_tool_result": "Can change what tools return",
+             "subagent_stop": "Runs when a subagent finishes", "on_session_start": "Runs when a chat starts",
+             "on_session_end": "Runs when a chat ends"}
+_HOOK_TEXT_MAX = 64_000
+
+
+def _hook_script(command):
+    """The script file a hook command runs, when its first word is a file."""
+    import shlex
+    try:
+        first = shlex.split(str(command))[0]
+    except (ValueError, IndexError):
+        return None
+    p = Path(os.path.expanduser(first))
+    return p if p.is_file() else None
+
+
+def _hooks_store(home):
+    return _data_dir(home) / "hdr" / "hooks.json"
+
+
+def _hdr_hooks(home, cfg):
+    """Every hook this profile runs: what it can do, whether Hermes approved it, and edits to its script
+    since HDR first saw it (with the lines that changed)."""
+    store_p = _hooks_store(home)
+    try:
+        store = _aai_json.loads(store_p.read_text(encoding="utf-8"))
+        first_run = False
+    except Exception:
+        store, first_run = {}, not store_p.exists()
+    try:
+        allow = _aai_json.loads((home / "shell-hooks-allowlist.json").read_text(encoding="utf-8")).get("approvals") or []
+    except Exception:
+        allow = []
+    approved = {(str(a.get("event")), str(a.get("command"))) for a in allow if isinstance(a, dict)}
+    auto = cfg.get("hooks_auto_accept") is True or str(os.environ.get("HERMES_ACCEPT_HOOKS") or "") in ("1", "true", "yes")
+    items = []
+    for event, entries in (cfg.get("hooks") or {}).items() if isinstance(cfg.get("hooks"), dict) else []:
+        for e in entries if isinstance(entries, list) else []:
+            if isinstance(e, dict) and e.get("command"):
+                cmd = str(e["command"])
+                items.append({"kind": "shell", "event": str(event), "matcher": e.get("matcher"), "command": cmd,
+                              "approved": (str(event), cmd) in approved, "can": _HOOK_CAN.get(str(event), "Runs on " + str(event)),
+                              "script": _hook_script(cmd)})
+    gdir = home / "hooks"
+    for d in sorted(gdir.iterdir()) if gdir.is_dir() else []:
+        handler = d / "handler.py"
+        if not (d / "HOOK.yaml").is_file() or not handler.is_file():
+            continue
+        try:
+            events = [str(x) for x in (_hdr_yaml(d / "HOOK.yaml").get("events") or [])]
+        except Exception:
+            events = []
+        items.append({"kind": "gateway", "event": ", ".join(events) or "?", "matcher": None, "command": _hdr_tilde(str(handler)),
+                      "approved": None, "can": "Runs inside the gateway, with no prompt", "script": handler})
+    now, dirty, out = time.time(), False, []
+    for it in items:
+        script = it.pop("script")
+        key = it["kind"] + "|" + it["event"] + "|" + it["command"]
+        text = ""
+        if script:
+            try:
+                text = script.read_text(encoding="utf-8", errors="replace")[:_HOOK_TEXT_MAX]
+            except OSError:
+                text = ""
+        sha = _aai_hashlib.sha256(text.encode()).hexdigest()[:16] if script else ""
+        rec = store.get(key)
+        if rec is None:
+            rec = store[key] = {"first": 0 if first_run else now, "sha": sha, "text": text}
+            dirty = True
+        it.update(key=key, first_seen=rec["first"], new=bool(rec["first"]) and rec["first"] > now - 7 * 86400,
+                  runs_unasked=it["kind"] == "shell" and not it["approved"] and auto, script=_hdr_tilde(str(script)) if script else None)
+        if script and sha != rec.get("sha"):
+            diff = list(_aai_difflib.unified_diff(str(rec.get("text") or "").splitlines(), text.splitlines(), lineterm="", n=0))[2:]
+            it.update(changed=script.stat().st_mtime, diff=[ln for ln in diff if not ln.startswith("@@")][:14])
+        out.append(it)
+    if dirty:
+        try:
+            store_p.parent.mkdir(parents=True, exist_ok=True)
+            store_p.write_text(_aai_json.dumps(store), encoding="utf-8")
+        except OSError:
+            pass
+    return {"auto_accept": auto, "hooks": out}
+
+
+@router.post("/hdr/hooks/reviewed")
+async def hdr_hooks_reviewed(payload: Dict[str, Any] = Body(default={}), profile: Optional[str] = None):
+    """You looked at an edited hook script: its current text becomes the version HDR compares against."""
+    key = str((payload or {}).get("key") or "")
+
+    def _run():
+        _n, home = _profile_home(profile)
+        store_p = _hooks_store(home)
+        try:
+            store = _aai_json.loads(store_p.read_text(encoding="utf-8"))
+        except Exception:
+            return {"ok": False, "error": "nothing recorded yet"}
+        if key not in store:
+            return {"ok": False, "error": "unknown hook"}
+        command = key.split("|", 2)[2]
+        script = _hook_script(command) or Path(os.path.expanduser(command))
+        try:
+            text = script.read_text(encoding="utf-8", errors="replace")[:_HOOK_TEXT_MAX]
+        except OSError:
+            return {"ok": False, "error": "the script is gone"}
+        store[key].update(sha=_aai_hashlib.sha256(text.encode()).hexdigest()[:16], text=text)
+        store_p.write_text(_aai_json.dumps(store), encoding="utf-8")
+        return {"ok": True}
     return await asyncio.to_thread(_run)
 
 
@@ -2481,8 +2691,8 @@ async def hdr(days: int = Query(7, ge=1, le=90), profile: Optional[str] = None):
                        "shapers": [p["name"] for p in plugins if p["enabled"] and p["shapes_prompt"]]},
             "plugins": plugins,
             "secrets": {"vault": vault[-20:], "sensitive_reads": [s for s in sensitive if s["op"] in ("read", "code")][:10]},
-            "guard": dict(_hdr_guard(home, since, titles), risky_calls=risky_calls,
-                          approvals=str((cfg.get("approvals") or {}).get("mode") or "manual")),
+            "hooks": _hdr_hooks(home, cfg),
+            "guard": dict(_hdr_guard(home, since, titles), risky_calls=risky_calls),
         }
     try:
         return await asyncio.to_thread(_run)

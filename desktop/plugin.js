@@ -160,6 +160,7 @@ function carryOverLegacyStorage() {
 // home and secrets), so the active backend answers for every local profile.
 const OWN = '/api/plugins/hermetic'
 let pluginRest = null // ctx.rest, set in register()
+let pluginOs = null // ctx.os, for the guard's macOS notifications
 const inflight = new Map() // identical reads already on their way share one request
 const api = req => {
   const path = String(req.path || '')
@@ -2838,27 +2839,30 @@ const HdrPipeline = ({ list }) => {
     on.length < list.length ? el('div', { style: { fontSize: 10.5, color: C.dim, marginTop: 4 } }, 'Installed but off: ' + list.filter(p => !p.enabled).map(p => p.name).join(', ')) : null)
 }
 
-// Guard: one level for the risky calls Hermes does not check itself (hdr_rules.guarded). Ask goes through
-// Hermes' own approval prompt; Block stops the call
+// Guard: one level for the risky calls Hermes does not check itself (hdr_rules.guarded). Ask is Hermetic's own
+// question (the AskCard below, or a macOS notification), whatever Hermes' approvals setting; Block stops the call
 const GUARD_OPTIONS = [{ id: 'watch', label: 'Watch' }, { id: 'ask', label: 'Ask' }, { id: 'block', label: 'Block' }]
-const guardNoAsk = g => g.approvals === 'off' || g.approvals === 'yolo'
+const GUARD_HOW = { you: 'by you', 'no answer': 'no answer in time', 'nobody to ask': 'nobody at Hermes', 'your rule': 'your rule', 'guard set to block': 'guard set to block' }
+const opWord = op => (op === 'read' ? 'reading' : op === 'write' ? 'writing' : 'using')
+const guardRuleText = r => (r.decision === 'allow' ? 'Allow ' : 'Block ') + opWord(r.op) + ' '
+  + (r.scope === 'file' ? r.path : r.scope === 'folder' ? 'anything in ' + r.folder : r.kind === 'startup' ? 'startup items' : 'keys and logins')
+  + (r.session_id ? ', in one chat' : ', always')
 const guardRight = g => {
   const n = (g.stops || []).length
-  const word = g.level === 'block' ? el('span', { style: { color: C.bad } }, 'blocks') : g.level === 'ask' ? el('span', { style: { color: guardNoAsk(g) ? C.dim : C.warn } }, guardNoAsk(g) ? 'asks (approvals off)' : 'asks') : el('span', { style: { color: C.dim } }, 'watching')
+  const word = g.level === 'block' ? el('span', { style: { color: C.bad } }, 'blocks') : g.level === 'ask' ? el('span', { style: { color: C.warn } }, 'asks') : el('span', { style: { color: C.dim } }, 'watching')
   return el('span', { style: { display: 'flex', gap: 8 } }, word, n ? String(n) : null)
 }
-const guardFoot = g => !g ? 'Recording only: nothing is blocked or changed.'
-  : g.level === 'block' ? 'Guard on: risky calls are blocked, everything else is only recorded.'
-  : g.level === 'ask' ? (guardNoAsk(g) ? 'Guard set to ask, but approvals are off, so nothing is stopped yet.' : 'Guard on: Hermes asks you before risky calls, everything else is only recorded.')
-  : 'Recording only: nothing is blocked or changed.'
+const guardFoot = g => !g || g.level === 'watch' ? 'Recording only: nothing is blocked or changed.'
+  : g.level === 'block' ? 'Guard on: risky calls are blocked unless your rules allow them.'
+  : 'Guard on: Hermetic asks you before risky calls.'
 const HdrGuard = ({ g, profile, days, onChanged }) => {
   const [busy, setBusy] = useState(false)
   const [err, setErr] = useState(null)
-  const set = async level => {
-    if (level === g.level || busy) return
+  const post = async body => {
+    if (busy) return
     setBusy(true); setErr(null)
     try {
-      const r = await api(profileReq(profile, { path: '/api/plugins/hermetic/hdr/guard', method: 'POST', body: { level } }))
+      const r = await api(profileReq(profile, { path: '/api/plugins/hermetic/hdr/guard', method: 'POST', body }))
       if (r && r.ok === false) throw new Error(r.error || 'Could not save')
       onChanged && onChanged()
     } catch (e) { setErr(/404|Not Found/i.test(String(e && e.message)) ? 'Restart Hermes to load the guard' : (e && e.message) || 'Could not save') } finally { setBusy(false) }
@@ -2866,25 +2870,97 @@ const HdrGuard = ({ g, profile, days, onChanged }) => {
   const n = g.risky_calls || 0
   const span = days === 1 ? 'Today' : 'In the last ' + days + ' days'
   const effect = !n ? span + ', no risky call.'
-    : g.level === 'block' ? el('span', null, span + ', this would have blocked ' + n + (n === 1 ? ' call.' : ' calls.'))
-    : g.level === 'ask' ? (guardNoAsk(g) ? el('span', null, span + ', this would have ', el('span', { style: { color: C.warn } }, 'let ' + n + ' through unasked'), '.') : span + ', this would have asked you ' + n + (n === 1 ? ' time.' : ' times.'))
+    : g.level === 'block' ? span + ', this would have blocked ' + n + (n === 1 ? ' call.' : ' calls.')
+    : g.level === 'ask' ? span + ', this would have asked you ' + n + (n === 1 ? ' time.' : ' times.')
     : span + ', ' + n + (n === 1 ? ' risky call was' : ' risky calls were') + ' recorded.'
+  const rules = g.rules || []
   return el('div', null,
     el('div', { style: { fontSize: 11, color: C.sub, marginBottom: 8 } }, 'Risky calls Hermes does not check itself: reading keys and logins, and writing startup items or key places Hermes does not list.'),
     el('div', { style: { display: 'flex', alignItems: 'center', gap: 10 } },
-      el(SegmentedControl, { value: g.level, onChange: set, options: GUARD_OPTIONS }),
+      el(SegmentedControl, { value: g.level, onChange: level => level !== g.level && post({ level }), options: GUARD_OPTIONS }),
       busy ? aSmall('Saving…') : null),
-    el('div', { style: { fontSize: 10.5, color: C.dim, marginTop: 8 } }, effect),
-    g.level === 'ask' && guardNoAsk(g) ? el('div', { style: { marginTop: 8, padding: '7px 10px', borderRadius: 8, background: 'rgba(201,147,74,.1)', border: '1px solid rgba(201,147,74,.35)', fontSize: 11, color: C.sub, lineHeight: 1.45 } },
-      el('span', { style: { color: C.warn } }, 'Approvals are off'), ', so Hermes can’t ask you and Ask lets the call through. Turn approvals on in Hermes settings.') : null,
-    g.level === 'ask' && !guardNoAsk(g) ? el('div', { style: { fontSize: 10.5, color: C.dim, marginTop: 4 } }, 'Scheduled jobs and other runs with nobody to ask treat Ask as Block.') : null,
+    g.level === 'ask' ? el('div', { style: { fontSize: 10.5, color: C.dim, marginTop: 8, lineHeight: 1.45 } }, 'Hermetic asks you here, or with a macOS notification when Hermes is in the background. No answer in 20 seconds, or nobody at Hermes (scheduled jobs), blocks the call.') : null,
+    el('div', { style: { fontSize: 10.5, color: C.dim, marginTop: 6 } }, effect),
     err ? el('div', { style: { fontSize: 10.5, color: C.bad, marginTop: 6 } }, err) : null,
+    rules.length ? el('div', { style: { marginTop: 10 } },
+      hdrHead('Your rules'),
+      rules.map((r, i) => hdrLine('r' + i,
+        el('span', { style: { width: 7, height: 7, borderRadius: 4, flex: 'none', background: r.decision === 'allow' ? C.ok : C.bad } }),
+        hdrGrow(guardRuleText(r), r.why ? r.why + ', saved ' + ago(r.ts) : 'saved ' + ago(r.ts)),
+        el(ALink, { onClick: () => post({ remove_rule: i }) }, 'remove')))) : null,
     (g.stops || []).length ? el('div', { style: { marginTop: 10 } },
-      hdrHead(g.stops.length === 1 ? 'Stopped once' : 'Stopped ' + g.stops.length + ' times'),
+      hdrHead('Recent'),
       g.stops.slice(0, 5).map((x, i) => hdrLine('g' + i,
-        el('span', { style: { width: 7, height: 7, borderRadius: 4, flex: 'none', background: x.action === 'block' ? C.bad : C.warn } }),
-        hdrGrow(el('span', null, (x.action === 'block' ? 'Blocked: ' : 'Asked: ') + x.op + ' ', el('span', { className: 'mono', style: { fontSize: 10.5 } }, x.path)),
-          x.tool + (x.chat ? ' in “' + x.chat + '”' : '') + ', ' + ago(x.ts))))) : null)
+        el('span', { style: { width: 7, height: 7, borderRadius: 4, flex: 'none', background: x.action === 'allow' ? C.ok : C.bad } }),
+        hdrGrow(el('span', null, (x.action === 'allow' ? 'Allowed: ' : 'Blocked: ') + opWord(x.op) + ' ', el('span', { className: 'mono', style: { fontSize: 10.5 } }, x.path)),
+          x.tool + (x.chat ? ' in “' + x.chat + '”' : '') + ', ' + (GUARD_HOW[x.how] || 'by you') + ', ' + ago(x.ts))))) : null)
+}
+
+// Hooks: every shell hook (config.yaml) and gateway hook (hooks/<name>/), what it can do, and edits to its
+// script since HDR first saw it. Hermes approves a hook once and then trusts edits; gateway hooks never ask.
+const hookFlags = x => [
+  x.changed ? hdrTag('edited ' + ago(x.changed), C.warn) : null,
+  x.new ? hdrTag('new', C.warn) : null,
+  x.kind === 'gateway' ? hdrTag('no prompt') : null,
+  x.kind === 'shell' && !x.approved ? (x.runs_unasked ? hdrTag('runs unasked', C.bad) : hdrTag('not approved, skipped')) : null
+].filter(Boolean)
+const hookFlagged = x => !!(x.changed || x.new || x.runs_unasked)
+const HdrHooks = ({ h, profile, onChanged }) => {
+  const reviewed = key => api(profileReq(profile, { path: '/api/plugins/hermetic/hdr/hooks/reviewed', method: 'POST', body: { key } })).then(() => onChanged && onChanged()).catch(() => {})
+  return el('div', null,
+    h.auto_accept ? el('div', { style: { marginBottom: 8, padding: '7px 10px', borderRadius: 8, background: 'rgba(201,147,74,.1)', border: '1px solid rgba(201,147,74,.35)', fontSize: 11, color: C.sub, lineHeight: 1.45 } },
+      el('span', { style: { color: C.warn } }, 'Auto-accept is on'), ' (hooks_auto_accept), so new hooks run without Hermes asking you.') : null,
+    !h.hooks.length ? aSmall('No hooks. Nothing runs on Hermes’ events.')
+      : h.hooks.map((x, i) => el('div', { key: x.key },
+          hdrLine('h' + i,
+            el('span', { style: { width: 7, height: 7, borderRadius: 4, flex: 'none', background: hookFlagged(x) ? C.warn : C.ok } }),
+            hdrGrow(el('span', { className: 'mono', style: { fontSize: 10.5 } }, x.command), x.event + (x.matcher ? ' on ' + x.matcher : '') + ': ' + x.can),
+            el('span', { style: { display: 'flex', gap: 4, flex: 'none' } }, ...hookFlags(x))),
+          x.changed && (x.diff || []).length ? el('div', { style: { margin: '2px 0 6px 15px' } },
+            el('div', { className: 'mono', style: { fontSize: 10, background: 'rgba(255,255,255,.03)', borderRadius: 6, padding: '6px 8px', whiteSpace: 'pre-wrap', wordBreak: 'break-all' } },
+              x.diff.map((ln, j) => el('div', { key: j, style: { color: ln[0] === '+' ? C.ok : ln[0] === '-' ? C.bad : C.dim } }, ln))),
+            el('div', { style: { marginTop: 4, fontSize: 10.5 } }, el(ALink, { onClick: () => reviewed(x.key) }, 'Mark reviewed'))) : null)))
+}
+
+// Hermetic's own Ask, LuLu style: the guard holds a risky call and this card asks who, what and why, with a
+// rule (this file, its folder or the whole kind; once, this chat or always). No answer in time blocks it.
+const AskCard = ({ ask, more, onAnswered }) => {
+  const [scope, setScope] = useState('file')
+  const [remember, setRemember] = useState('once')
+  const [now, setNow] = useState(Date.now())
+  const [busy, setBusy] = useState(false)
+  const [err, setErr] = useState(null)
+  const shownAt = useRef(Date.now())
+  useEffect(() => { const t = setInterval(() => setNow(Date.now()), 500); return () => clearInterval(t) }, [])
+  const left = Math.max(0, Math.round(ask.left - (now - shownAt.current) / 1000))
+  const answer = async decision => {
+    setBusy(true); setErr(null)
+    try {
+      const r = await api({ path: OWN + '/hdr/guard/answer', method: 'POST', body: { id: ask.id, decision, scope, remember } })
+      if (r && r.ok === false) throw new Error(r.error || 'Could not answer')
+      onAnswered(ask.id)
+    } catch (e) { setErr((e && e.message) || 'Could not answer') } finally { setBusy(false) }
+  }
+  const scopes = [{ id: 'file', label: 'This file' }, { id: 'folder', label: ask.folder || 'Its folder' }, { id: 'kind', label: ask.kind === 'startup' ? 'All startup items' : 'All key reads' }]
+  const remembers = [{ id: 'once', label: 'Once' }].concat(ask.session_id ? [{ id: 'chat', label: 'This chat' }] : [], [{ id: 'always', label: 'Always' }])
+  const kv = (k, v) => [el('span', { key: k + 'k', style: { color: C.dim } }, k), el('span', { key: k + 'v', style: { color: C.sub, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, v)]
+  return el('div', { style: { padding: 16, width: 380, maxWidth: '100%', boxSizing: 'border-box', fontSize: 12, color: C.text } },
+    el('div', { style: { display: 'flex', gap: 10, alignItems: 'center' } },
+      el('span', { style: { width: 30, height: 30, borderRadius: 8, flex: 'none', background: 'rgba(201,147,74,.16)', color: C.warn, display: 'flex', alignItems: 'center', justifyContent: 'center', fontWeight: 600 } }, '!'),
+      el('div', { style: { minWidth: 0 } },
+        el('div', { style: { fontSize: 12.5, fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, 'The agent wants to ' + (ask.op === 'read' ? 'read ' : ask.op === 'write' ? 'write ' : 'use ') + ask.path),
+        el('div', { style: { fontSize: 10.5, color: C.dim } }, 'Hermetic guard: Hermes doesn’t check this itself'))),
+    el('div', { style: { display: 'grid', gridTemplateColumns: '62px minmax(0,1fr)', gap: '2px 8px', marginTop: 10, fontSize: 11 } },
+      ...kv('tool', ask.tool), ...kv('chat', ask.chat || '-'), ...kv('profile', ask.profile || 'default'), ...kv('why', ask.why)),
+    el('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginTop: 10, fontSize: 10.5, color: C.dim } }, 'Rule for', el(SegmentedControl, { value: scope, onChange: setScope, options: scopes })),
+    el('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginTop: 6, fontSize: 10.5, color: C.dim } }, 'Remember', el(SegmentedControl, { value: remember, onChange: setRemember, options: remembers })),
+    el('div', { style: { display: 'flex', alignItems: 'center', gap: 8, marginTop: 12 } },
+      el('span', { style: { display: 'flex', alignItems: 'center', gap: 6, fontSize: 10.5, color: C.dim, marginRight: 'auto' } },
+        el('span', { style: { width: 14, height: 14, borderRadius: 7, background: 'conic-gradient(' + C.warn + ' ' + Math.round(left / Math.max(1, ask.left) * 100) + '%, rgba(255,255,255,.08) 0)' } }),
+        left + 's, then blocked' + (more ? '   ' + more + ' more waiting' : '')),
+      el('button', { type: 'button', disabled: busy, onClick: () => answer('block'), style: { font: 'inherit', fontSize: 11.5, padding: '5px 14px', borderRadius: 7, cursor: 'pointer', border: '1px solid ' + C.bad, background: 'transparent', color: C.bad } }, 'Block'),
+      el('button', { type: 'button', disabled: busy, onClick: () => answer('allow'), style: { font: 'inherit', fontSize: 11.5, padding: '5px 14px', borderRadius: 7, cursor: 'pointer', border: '1px solid ' + C.accent, background: C.accent, color: '#fff' } }, 'Allow')),
+    err ? el('div', { style: { fontSize: 10.5, color: C.bad, marginTop: 6 } }, err) : null)
 }
 
 const HdrView = ({ profile, period }) => {
@@ -2913,12 +2989,13 @@ const HdrView = ({ profile, period }) => {
   const pl = (n, one, many) => n + ' ' + (n === 1 ? one : many)
   return el('div', null,
     el('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0,1fr))', gap: 8, marginTop: 14 } },
-      el(Cell, { tone: g.level === 'watch' ? (g.risky_calls ? 'warn' : 'ok') : g.level === 'ask' && guardNoAsk(g) ? 'warn' : 'ok', label: 'Guard', value: GUARD_OPTIONS.find(o => o.id === g.level).label,
+      el(Cell, { tone: g.level === 'watch' ? (g.risky_calls ? 'warn' : 'ok') : 'ok', label: 'Guard', value: GUARD_OPTIONS.find(o => o.id === g.level).label,
         sub: sub(stopped ? stopped + ' stopped' : pl(g.risky_calls || 0, 'risky call', 'risky calls')), tip: 'What the guard does with risky calls Hermes does not check itself, and how many it stopped or saw in this period' }),
       el(Cell, { tone: newDom ? 'warn' : 'ok', label: 'Destinations', value: String(d.domains.length), sub: sub(newDom + ' new'), tip: 'Hosts that model requests and tools reached in this period; new = first seen in the last 2 days' }),
       el(Cell, { tone: risky.length ? 'warn' : 'ok', label: 'Sensitive places', value: String(d.files.sensitive.length), sub: sub(risky.length + ' scored 70+'), tip: 'Keys, logins, startup folders and shell settings that tools read or wrote' }),
       el(Cell, { tone: exposed ? 'bad' : 'ok', label: 'Runs on its own', value: String(d.runs.jobs.length + d.runs.services.length), sub: sub(pl(d.runs.jobs.length, 'job', 'jobs') + ', ' + pl(d.runs.services.length, 'port', 'ports')), tip: 'Scheduled jobs and listening ports started under Hermes' })),
     d.guard ? el(Section, { id: 'hdr-guard', title: 'Guard', right: guardRight(d.guard) }, el(HdrGuard, { g: d.guard, profile, days, onChanged: () => setTick(t => t + 1) })) : null,
+    d.hooks ? el(Section, { id: 'hdr-hooks', title: 'Hooks', right: el('span', { style: { display: 'flex', gap: 8 } }, d.hooks.hooks.filter(hookFlagged).length || d.hooks.auto_accept ? el('span', { style: { color: C.warn } }, (d.hooks.hooks.filter(hookFlagged).length || 'auto-accept') + (d.hooks.hooks.filter(hookFlagged).length ? ' to look at' : '')) : null, String(d.hooks.hooks.length)) }, el(HdrHooks, { h: d.hooks, profile, onChanged: () => setTick(t => t + 1) })) : null,
     el(Section, { id: 'hdr-net', title: 'Where data went', right: el('span', { style: { display: 'flex', gap: 8 } }, newDom ? el('span', { style: { color: C.warn } }, newDom + ' new') : null, String(d.domains.length)) }, el(HdrDomains, { list: d.domains })),
     el(Section, { id: 'hdr-files', title: 'Files and secrets', right: risky.length || d.secrets.vault.length ? el('span', { style: { color: C.warn } }, risky.length + ' sensitive' + (d.secrets.vault.length ? '   ' + d.secrets.vault.length + ' vault' : '')) : null }, el(HdrFiles, { files: d.files, secrets: d.secrets })),
     el(Section, { id: 'hdr-runs', title: 'What runs on its own', right: exposed ? el('span', { style: { color: C.bad } }, exposed + ' open') : String(d.runs.jobs.length + d.runs.services.length) }, el(HdrRuns, { runs: d.runs })),
@@ -4618,11 +4695,12 @@ const Chip = () => {
   const ctxSrc = (liveFocused && typeof liveFocused.context_percent === 'number' ? liveFocused : focusedUsage) || null
   const ctxPct = ctxSrc && typeof ctxSrc.context_percent === 'number' && ctxSrc.context_percent > 0 ? ctxSrc.context_percent : null
   const [open, setOpen] = useState(false)
+  const asksWaiting = useRef(0) // a guard question stays on screen until it is answered or runs out
   // Radix closes the popover on clicks inside the app's page. Clicks into an embedded view (the
   // browser pane) or another app never reach that page, so also close when focus leaves for one.
   useEffect(() => {
     if (!open) return
-    const close = () => setOpen(false)
+    const close = () => { if (!asksWaiting.current) setOpen(false) }
     const onFocusIn = e => { if (e.target && /^(IFRAME|WEBVIEW)$/.test(e.target.tagName)) close() }
     window.addEventListener('blur', close)
     document.addEventListener('focusin', onFocusIn)
@@ -4631,6 +4709,42 @@ const Chip = () => {
       document.removeEventListener('focusin', onFocusIn)
     }
   }, [open])
+
+  // the guard's questions: listed every 2s (which also tells the guard someone is at Hermes); a new one
+  // opens the popover and, when Hermes is in the background, a macOS notification with Allow and Block
+  const [asks, setAsks] = useState([])
+  const askSeen = useRef(new Set())
+  const answerAsk = (id, decision) => api({ path: OWN + '/hdr/guard/answer', method: 'POST', body: { id, decision } }).then(() => setAsks(x => { const rest = x.filter(a => a.id !== id); asksWaiting.current = rest.length; return rest })).catch(() => {})
+  useEffect(() => {
+    let live = true
+    let pauseUntil = 0 // an older backend without this route: check again in a minute, not every 2s
+    const tick = async () => {
+      if (Date.now() < pauseUntil) return
+      try {
+        const r = await api({ path: OWN + '/hdr/guard/asks' })
+        if (!live) return
+        const list = (r && r.asks) || []
+        asksWaiting.current = list.length
+        setAsks(list)
+        for (const a of list) {
+          if (askSeen.current.has(a.id)) continue
+          askSeen.current.add(a.id)
+          setOpen(true)
+          if (pluginOs && pluginOs.notify) {
+            try {
+              pluginOs.notify({ title: 'Allow the agent to ' + (a.op === 'read' ? 'read ' : a.op === 'write' ? 'write ' : 'use ') + a.path + '?', body: a.tool + (a.chat ? ' in “' + a.chat + '”' : '') + '. Blocked in ' + Math.round(a.left) + 's if nobody answers.',
+                onActivate: () => setOpen(true), actions: [{ id: 'allow', label: 'Allow', onAction: () => answerAsk(a.id, 'allow') }, { id: 'block', label: 'Block', onAction: () => answerAsk(a.id, 'block') }] })
+            } catch { /* notifications are a bonus; the card in the popover still asks */ }
+          }
+        }
+      } catch (e) {
+        if (/404|Not Found/i.test(String(e && e.message))) pauseUntil = Date.now() + 60_000
+      }
+    }
+    tick()
+    const t = setInterval(tick, 2000)
+    return () => { live = false; clearInterval(t) }
+  }, [])
 
   const week = lastNDays(7)
   const spark = data ? week.map(d => (data.daily.get(d) || { cost: 0 }).cost) : week.map(() => 0)
@@ -4653,7 +4767,7 @@ const Chip = () => {
 
   return el(
     Popover,
-    { open, onOpenChange: setOpen },
+    { open, onOpenChange: v => { if (v || !asksWaiting.current) setOpen(v) } },
     el(
       PopoverTrigger,
       { asChild: true },
@@ -4661,7 +4775,7 @@ const Chip = () => {
         'button',
         {
           type: 'button',
-          title: error ? 'Hermetic: ' + error : loading ? 'Hermetic: loading' : 'Hermetic, ' + periodName + ', ' + fmtUsd(spend) + (account ? '' : backendPatched ? ' (Hermes estimate)' : ' (Hermes estimate, backend plugin off)'),
+          title: asks.length ? 'Hermetic guard: ' + asks.length + (asks.length === 1 ? ' question waits' : ' questions wait') + ' for your answer' : error ? 'Hermetic: ' + error : loading ? 'Hermetic: loading' : 'Hermetic, ' + periodName + ', ' + fmtUsd(spend) + (account ? '' : backendPatched ? ' (Hermes estimate)' : ' (Hermes estimate, backend plugin off)'),
           className: cn(
             'inline-flex h-full items-center gap-2 px-2 text-[0.6875rem] transition-colors',
             'hover:bg-(--chrome-action-hover)',
@@ -4672,6 +4786,7 @@ const Chip = () => {
             fontVariantNumeric: 'tabular-nums'
           }
         },
+        asks.length ? el('span', { style: { width: 7, height: 7, borderRadius: 4, flex: 'none', background: C.warn } }) : null,
         ctxPct != null ? el(ContextGauge, { pct: ctxPct, used: ctxSrc.context_used, max: ctxSrc.context_max, threshold }) : null,
         el(Spark, { values: spark, tone: quotaLow ? 'bad' : tone, marks: resets.filter(r => r.cause === 'swap') }),
         el('span', { style: { color: tone ? 'inherit' : C.text } }, label),
@@ -4681,7 +4796,9 @@ const Chip = () => {
     el(
       PopoverContent,
       { align: 'end', sideOffset: 8, variant: 'menu', className: 'w-auto p-0 overflow-hidden' },
-      data
+      asks.length
+        ? el(AskCard, { key: asks[0].id, ask: asks[0], more: asks.length - 1, onAnswered: id => { asksWaiting.current = Math.max(0, asks.length - 1); setAsks(x => x.filter(a => a.id !== id)); if (asks.length <= 1) setOpen(false) } })
+        : data
         ? el(Body, { meter: data, prices, threshold, retries, yaml, profile, profileLabel, refresh, rates, defaultModel, account, cheapest, orProfile, orAny, onPeriod: setChipPeriod, view, onView: pickView, scope, profileCount, onScope: setScope })
         : el('div', { style: { padding: 16, fontSize: 12, color: C.sub, width: 240 } }, error ? error : 'Loading…')
     )
@@ -4695,6 +4812,7 @@ export default {
     carryOverLegacyStorage()
     store = ctx.storage
     pluginRest = ctx.rest
+    pluginOs = ctx.os || null
     initResets()
     ctx.register({
       id: 'chip',

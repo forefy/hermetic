@@ -128,6 +128,37 @@ def guarded(hit):
     return False
 
 
+def kind(why):
+    """What a guarded place is, for rules that cover a whole kind: 'startup' or 'keys'."""
+    return "startup" if why in STARTUP else "keys" if why in CRED else None
+
+
+def folder_of(p):
+    """The watched place a path belongs to (~/.ssh, ~/.aws, a LaunchAgents folder), or its own folder."""
+    for prefix, _why, _base in SENSITIVE:
+        if p == prefix or p.startswith(prefix.rstrip("/") + "/"):
+            return prefix.rstrip("/")
+    return os.path.dirname(p) or p
+
+
+def rule_covers(rule, hit, session_id=""):
+    """Whether one saved guard rule answers this touch. Scope 'file', 'folder' or 'kind'; a rule saved
+    for one chat only applies in that chat."""
+    if rule.get("session_id") and rule["session_id"] != session_id:
+        return False
+    if rule.get("op") != hit.get("op"):
+        return False
+    scope, path = rule.get("scope"), hit.get("path") or ""
+    if scope == "file":
+        return path == rule.get("path")
+    if scope == "folder":
+        f = str(rule.get("folder") or "")
+        return bool(f) and (path == f or path.startswith(f.rstrip("/") + "/"))
+    if scope == "kind":
+        return kind(hit.get("why")) == rule.get("kind") and rule.get("kind") is not None
+    return False
+
+
 def risky(name, args):
     """Every sensitive place one tool call touches, as {path, op, why, score}, highest score first."""
     out = []

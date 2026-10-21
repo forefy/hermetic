@@ -516,14 +516,18 @@ def _on_llm_request(**kw):
         return None
 
 
-# ---- HDR guard: ask (through Hermes' approval prompt) or block before a risky tool call ----------
-# One level per profile in hermetic/hdr/guard.json: watch (default, records only), ask or block. It acts
-# only on what Hermes does not check itself (hdr_rules.guarded: reading keys and logins, writing startup
-# items and key places Hermes does not list). Its own errors never block.
+# ---- HDR guard: ask (in Hermetic) or block before a risky tool call ------------------------------
+# One level per profile in hermetic/hdr/guard.json: watch (default, records only), ask or block, plus the
+# rules you saved when answering. It acts only on what Hermes does not check itself (hdr_rules.guarded:
+# reading keys and logins, writing startup items and key places Hermes does not list).
+# Ask is Hermetic's own question, independent of Hermes' approvals setting: the call waits while the
+# popover (or a macOS notification) asks you; no answer in time, or nobody at the popover, blocks it.
+# Its own errors never block.
 _GUARD_LEVELS = ("watch", "ask", "block")
 _GUARD_CACHE = {}
 _RULES = {}
 _OP_WORDS = {"read": "read", "write": "write", "code": "use in code", "workdir": "work in"}
+_ASK_SEEN_S = 6.0  # the popover checks for questions every 2s; older than this means nobody is there
 
 
 def _hdr_rules():
@@ -537,23 +541,83 @@ def _hdr_rules():
     return mod
 
 
-def guard_level(home=None) -> str:
-    """This profile's guard level, re-read only when guard.json changes."""
+def _guard_settings(home=None):
+    """(level, rules) for this profile, re-read only when guard.json changes."""
     p = data_dir(home) / "hdr" / "guard.json"
     try:
         mtime = p.stat().st_mtime
     except OSError:
-        return "watch"
+        return "watch", []
     hit = _GUARD_CACHE.get(str(p))
     if hit and hit[0] == mtime:
-        return hit[1]
+        return hit[1], hit[2]
     try:
-        level = json.loads(p.read_text(encoding="utf-8")).get("level")
+        data = json.loads(p.read_text(encoding="utf-8"))
     except Exception:
-        level = None
-    level = level if level in _GUARD_LEVELS else "watch"
-    _GUARD_CACHE[str(p)] = (mtime, level)
-    return level
+        data = {}
+    level = data.get("level") if data.get("level") in _GUARD_LEVELS else "watch"
+    rules = [r for r in data.get("rules") or [] if isinstance(r, dict)]
+    _GUARD_CACHE[str(p)] = (mtime, level, rules)
+    return level, rules
+
+
+def guard_level(home=None) -> str:
+    return _guard_settings(home)[0]
+
+
+def asks_dir() -> Path:
+    """Where questions wait for an answer: one place for every profile, so one popover answers all."""
+    from hermes_constants import get_default_hermes_root
+    return Path(get_default_hermes_root()) / _DATA / "hdr" / "asks"
+
+
+def _ask_wait() -> float:
+    """Seconds a question may wait: inside Hermes' limit for a pre_tool_call hook, which blocks the
+    call itself when a hook runs longer."""
+    try:
+        from hermes_cli.config import load_config_readonly
+        limit = float(((load_config_readonly() or {}).get("plugins") or {}).get("hook_callback_timeout") or 30)
+    except Exception:
+        limit = 30.0
+    return max(3.0, min(20.0, limit - 6.0))
+
+
+def _ask_user(hit, tool_name, session_id):
+    """Ask in Hermetic and wait. The answer dict, or None when nobody is at the popover or time runs out."""
+    import uuid
+    from hermes_constants import get_default_hermes_root, get_hermes_home
+    d = asks_dir()
+    try:
+        if time.time() - (d / "seen").stat().st_mtime > _ASK_SEEN_S:
+            return {"decision": "block", "how": "nobody to ask"}
+    except OSError:
+        return {"decision": "block", "how": "nobody to ask"}
+    home, root = Path(get_hermes_home()).resolve(), Path(get_default_hermes_root()).resolve()
+    rules, wait = _hdr_rules(), _ask_wait()
+    aid = uuid.uuid4().hex[:12]
+    ask = {"id": aid, "ts": time.time(), "until": time.time() + wait, "tool": tool_name, "path": hit["path"], "op": hit["op"],
+           "why": hit["why"], "kind": rules.kind(hit["why"]), "folder": rules.folder_of(hit["path"]),
+           "session_id": session_id, "profile": "default" if home == root else home.name}
+    q, a = d / (aid + ".json"), d / (aid + ".answer.json")
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+        tmp = d / (aid + ".tmp")
+        tmp.write_text(json.dumps(ask), encoding="utf-8")
+        os.replace(tmp, q)
+        while time.time() < ask["until"]:
+            if a.exists():
+                try:
+                    return json.loads(a.read_text(encoding="utf-8"))
+                except ValueError:
+                    pass
+            time.sleep(0.25)
+        return {"decision": "block", "how": "no answer"}
+    finally:
+        for f in (q, a):
+            try:
+                f.unlink()
+            except OSError:
+                pass
 
 
 def _guard_log(row: dict) -> None:
@@ -570,25 +634,38 @@ def _on_pre_tool_call(tool_name="", args=None, task_id="", **kw):
     try:
         if tool_name == "tool_call":  # Hermes unwraps batches; each call inside comes through on its own
             return None
-        level = guard_level()
+        level, saved = _guard_settings()
         if level == "watch":
             return None
         rules = _hdr_rules()
         hits = [h for h in rules.risky(tool_name, args) if rules.guarded(h)]
         if not hits:
             return None
-        top = hits[0]
+        sid = kw.get("session_id") or task_id or ""
+        # your saved rules first: any place a rule blocks blocks the call; places your rules allow drop out
+        ruled = {i: next((r for r in saved if rules.rule_covers(r, h, sid)), None) for i, h in enumerate(hits)}
+        blocked = [i for i, r in ruled.items() if r and r.get("decision") == "block"]
+        open_hits = [h for i, h in enumerate(hits) if not ruled[i]]
+        top = hits[blocked[0]] if blocked else open_hits[0] if open_hits else hits[0]
         what = "%s %s (%s)" % (_OP_WORDS.get(top["op"], top["op"]), top["path"], top["why"])
-        _guard_log({"ts": time.time(), "action": level, "tool": tool_name, "path": top["path"], "op": top["op"],
-                    "why": top["why"], "score": top["score"], "session_id": kw.get("session_id") or task_id or ""})
-        if level == "block":
-            return {"action": "block", "message": "Blocked by Hermetic's HDR guard: this would " + what
-                    + ". If it is needed, ask the user; they can change the guard in Hermetic, HDR."}
-        return {"action": "approve", "message": "Hermetic's HDR guard: this %s call would %s." % (tool_name, what),
-                "rule_key": "hermetic:%s:%s" % (top["op"], top["path"])}
+        if blocked:
+            answer = {"decision": "block", "how": "your rule"}
+        elif not open_hits:
+            answer = {"decision": "allow", "how": "your rule"}
+        elif level == "block":
+            answer = {"decision": "block", "how": "guard set to block"}
+        else:
+            answer = _ask_user(top, tool_name, sid)
+        _guard_log({"ts": time.time(), "action": answer.get("decision"), "how": answer.get("how") or "you", "tool": tool_name,
+                    "path": top["path"], "op": top["op"], "why": top["why"], "score": top["score"], "session_id": sid})
+        if answer.get("decision") == "allow":
+            return None
+        reason = {"no answer": "the user did not answer in time", "nobody to ask": "nobody was at Hermes to ask",
+                  "your rule": "the user's rule blocks it", "guard set to block": "the guard is set to block"}.get(answer.get("how"), "the user said no")
+        return {"action": "block", "message": "Blocked by Hermetic's HDR guard (" + reason + "): this would " + what
+                + ". If it is needed, ask the user; they can allow it in Hermetic, HDR."}
     except Exception:
         return None
-
 
 def register(ctx) -> None:
     try:

@@ -8,6 +8,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -18,6 +19,7 @@ spec = importlib.util.spec_from_file_location("hermetic_init", HERE.parent / "__
 plugin = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(plugin)
 GUARD = Path(HOME) / "hermetic" / "hdr"
+ASK_WAIT = plugin._ask_wait
 
 
 def set_level(level):
@@ -41,11 +43,86 @@ def test_watch_is_the_default_and_never_stops():
     assert call(*SSH_READ) is None and call(*LAUNCH_WRITE) is None
 
 
-def test_ask_escalates_risky_calls_to_hermes_approval():
+def answer_when_asked(decision, delay=0.3):
+    """Play the popover: wait for the question, then answer it."""
+    import threading
+
+    def run():
+        d = plugin.asks_dir()
+        for _ in range(40):
+            qs = [f for f in d.glob("*.json") if not f.name.endswith(".answer.json")] if d.is_dir() else []
+            if qs:
+                aid = qs[0].name[:-5]
+                (d / (aid + ".answer.json")).write_text(json.dumps({"decision": decision, "how": "you"}))
+                return
+            time.sleep(0.05)
+    threading.Timer(delay, run).start()
+
+
+def someone_is_there():
+    d = plugin.asks_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "seen").touch()
+
+
+def test_ask_with_nobody_at_the_popover_blocks_at_once():
     set_level("ask")
+    seen = plugin.asks_dir() / "seen"
+    if seen.exists():
+        seen.unlink()
+    t = time.time()
     r = call(*SSH_READ)
-    assert r["action"] == "approve" and "~/.ssh/config" in r["message"]
-    assert r["rule_key"] == "hermetic:read:~/.ssh/config", "an 'always' answer covers this path only"
+    assert r["action"] == "block" and "nobody was at Hermes" in r["message"] and time.time() - t < 1
+
+
+def test_ask_waits_for_your_answer():
+    set_level("ask")
+    someone_is_there()
+    answer_when_asked("allow")
+    assert call(*SSH_READ) is None, "allowed"
+    someone_is_there()
+    answer_when_asked("block")
+    r = call(*SSH_READ)
+    assert r["action"] == "block" and "the user said no" in r["message"]
+
+
+def test_no_answer_in_time_blocks():
+    set_level("ask")
+    someone_is_there()
+    plugin._ask_wait = lambda: 0.6
+    try:
+        r = call(*SSH_READ)
+    finally:
+        plugin._ask_wait = ASK_WAIT
+    assert r["action"] == "block" and "did not answer in time" in r["message"]
+    assert not [f for f in plugin.asks_dir().glob("*.json")], "the question is cleaned up"
+
+
+def save_rules(level, rules):
+    GUARD.mkdir(parents=True, exist_ok=True)
+    p = GUARD / "guard.json"
+    p.write_text(json.dumps({"level": level, "rules": rules}))
+    os.utime(p, (p.stat().st_atime, p.stat().st_mtime + len(plugin._GUARD_CACHE) + 7))
+    plugin._GUARD_CACHE.clear()
+
+
+def test_saved_rules_answer_without_asking():
+    save_rules("ask", [{"decision": "allow", "scope": "folder", "op": "read", "folder": "~/.ssh"}])
+    assert call("read_file", {"path": "~/.ssh/known_hosts"}) is None, "folder rule"
+    save_rules("ask", [{"decision": "block", "scope": "kind", "op": "read", "kind": "keys"}])
+    r = call("read_file", {"path": "~/.aws/credentials"})
+    assert r["action"] == "block" and "rule" in r["message"]
+    save_rules("block", [{"decision": "allow", "scope": "file", "op": "read", "path": "~/.ssh/config", "session_id": "other-chat"}])
+    assert call(*SSH_READ)["action"] == "block", "a rule for another chat does not apply"
+    save_rules("block", [{"decision": "allow", "scope": "file", "op": "read", "path": "~/.ssh/config", "session_id": "s1"}])
+    assert call(*SSH_READ) is None, "a rule for this chat does"
+
+
+def test_a_call_touching_several_places_needs_all_of_them_allowed():
+    cmd = ("terminal", {"command": "cp ~/.ssh/id_ed25519 ~/Library/LaunchAgents/x.plist"})
+    save_rules("block", [{"decision": "allow", "scope": "folder", "op": "read", "folder": "~/.ssh"}])
+    r = call(*cmd)
+    assert r["action"] == "block" and "LaunchAgents" in r["message"], "the startup write is still blocked"
 
 
 def test_block_stops_risky_calls_and_says_why():
@@ -91,7 +168,8 @@ def test_bad_settings_fall_back_to_watch():
 
 def test_each_stop_is_logged():
     rows = [json.loads(x) for x in (GUARD / "guard.jsonl").read_text().splitlines()]
-    assert {r["action"] for r in rows} == {"ask", "block"}
+    assert {r["action"] for r in rows} == {"allow", "block"}
+    assert {r["how"] for r in rows} >= {"you", "no answer", "nobody to ask", "your rule", "guard set to block"}
     assert all(r["session_id"] == "s1" and r["why"] for r in rows)
 
 

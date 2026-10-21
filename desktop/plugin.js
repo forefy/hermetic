@@ -2672,15 +2672,14 @@ const hdrMore = (list, n, open, setOpen) => list.length > n ? el(ALink, { onClic
 const hdrIn = ts => { const s = ts - Date.now() / 1000; return s <= 0 ? 'due' : s < 3600 ? 'in ' + Math.round(s / 60) + 'm' : s < 86400 ? 'in ' + Math.round(s / 3600) + 'h' : 'in ' + Math.round(s / 86400) + 'd' }
 const hdrEvery = t => { const m = /every\s+(\d+)\s*m/i.exec(t || ''); if (!m) return t; const n = +m[1]; return n % 1440 === 0 ? 'every ' + (n / 1440 === 1 ? 'day' : n / 1440 + ' days') : n % 60 === 0 ? 'every ' + (n / 60 === 1 ? 'hour' : n / 60 + ' hours') : 'every ' + n + ' min' }
 
-// Posture: one strip, a segment per setting; pick a setting to change it right here (or in Hermes Settings)
-const HDR_SETTINGS = { approvals: 'config:safety', allowlist: 'config:safety', browser: 'config:browser', terminal: 'config:workspace', inbound: 'gateway', api: 'gateway', shell_hooks: 'config:advanced' }
+// Posture: one strip, a segment per setting; pick one to see why it matters
 const HdrPosture = ({ rows }) => {
   const rank = { bad: 0, warn: 1, ok: 2 }
   const worst = rows.slice().sort((a, b) => rank[a.tone] - rank[b.tone])[0]
   const [pick, setPick] = useState(null)
   const selKey = pick || (worst && worst.tone !== 'ok' ? worst.key : null)
   const sel = rows.find(r => r.key === selKey)
-  // read only: these are Hermes settings, changed on Hermes' own Settings pages (linked below)
+  // read only: these are Hermes settings, changed in Hermes' own Settings
   return el('div', null,
     el('div', { style: { display: 'flex', gap: 3 } }, rows.map(r => el(Tip, { key: r.key, label: r.label + ': ' + r.value + '. ' + r.why },
       el('span', { onClick: () => setPick(r.key), style: { flex: 1, height: 6, borderRadius: 3, background: HDR_TONE[r.tone] || C.faint, opacity: r.tone === 'ok' ? 0.45 : 1, cursor: 'pointer', outline: r.key === selKey ? '1px solid ' + C.text : 'none', outlineOffset: 1 } })))),
@@ -2690,8 +2689,7 @@ const HdrPosture = ({ rows }) => {
         el(Dot, { tone: r.tone }), el('span', { style: { flex: 1, color: C.sub, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, r.label),
         el('span', { style: { color: HDR_TONE[r.tone] === C.ok ? C.text : HDR_TONE[r.tone], whiteSpace: 'nowrap' } }, r.value))))),
     sel ? el('div', { style: { marginTop: 8, padding: '9px 10px', borderRadius: 8, border: '1px solid ' + C.stroke } },
-      el('div', { style: { fontSize: 11.5, color: C.text, lineHeight: 1.45 } }, el('span', { style: { color: HDR_TONE[sel.tone] } }, sel.label + ' ' + sel.value + '. '), sel.why),
-      HDR_SETTINGS[sel.key] ? el('div', { style: { marginTop: 8, fontSize: 10.5 } }, el(ALink, { onClick: () => host.navigate('/settings?tab=' + HDR_SETTINGS[sel.key]) }, 'change in Hermes settings')) : null)
+      el('div', { style: { fontSize: 11.5, color: C.text, lineHeight: 1.45 } }, el('span', { style: { color: HDR_TONE[sel.tone] } }, sel.label + ' ' + sel.value + '. '), sel.why))
       : null)
 }
 
@@ -2899,8 +2897,7 @@ const HdrGuard = ({ g, profile, days, onChanged }) => {
       busy ? aSmall('Saving…') : null),
     el('div', { style: { fontSize: 10.5, color: C.dim, marginTop: 8 } }, effect),
     g.level === 'ask' && guardNoAsk(g) ? el('div', { style: { marginTop: 8, padding: '7px 10px', borderRadius: 8, background: 'rgba(201,147,74,.1)', border: '1px solid rgba(201,147,74,.35)', fontSize: 11, color: C.sub, lineHeight: 1.45 } },
-      el('span', { style: { color: C.warn } }, 'Approvals are off'), ', so Hermes can’t ask you and Ask lets the call through. ',
-      el(ALink, { onClick: () => host.navigate('/settings?tab=config:safety') }, 'Turn approvals on in Hermes settings'), '.') : null,
+      el('span', { style: { color: C.warn } }, 'Approvals are off'), ', so Hermes can’t ask you and Ask lets the call through. Turn approvals on in Hermes settings.') : null,
     g.level === 'ask' && !guardNoAsk(g) ? el('div', { style: { fontSize: 10.5, color: C.dim, marginTop: 4 } }, 'Scheduled jobs and other runs with nobody to ask treat Ask as Block.') : null,
     err ? el('div', { style: { fontSize: 10.5, color: C.bad, marginTop: 6 } }, err) : null,
     (g.stops || []).length ? el('div', { style: { marginTop: 10 } },

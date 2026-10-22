@@ -136,7 +136,8 @@ if [ -n "$OPEN" ]; then
     -f branch="$BRANCH" -f sha="$EXISTING" -f content="$(base64 < "$OUT/hermetic.yaml" | tr -d '\n')" >/dev/null
   if [ -n "$BODY" ]; then
     sed -e "s/{{SHA}}/$SHA/g" -e "s/{{SHORT}}/$SHORT/g" "$BODY" > "$OUT/body.md"
-    gh pr edit "$NUM" --repo "$UPSTREAM" --body-file "$OUT/body.md" >/dev/null
+    # through the REST API: `gh pr edit` fails on the repo's deprecated Projects (classic) GraphQL field
+    gh api -X PATCH "repos/$UPSTREAM/pulls/$NUM" -F body=@"$OUT/body.md" >/dev/null
   fi
   gh pr comment "$NUM" --repo "$UPSTREAM" --body-file "$OUT/comment.md"
   exit 0

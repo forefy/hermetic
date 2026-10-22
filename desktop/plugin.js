@@ -1124,14 +1124,31 @@ const periodHours = period => {
   const d = new Date()
   return Math.max((d.getUTCHours() * 60 + d.getUTCMinutes()) / 60, 1)
 }
-const periodSpend = (data, account, period) => {
+// One profile's part of an OpenRouter bill that covers every profile on the key: its share of their list
+// cost over the bill's window. Hermes books a chat's cost to the day the chat started, so a single day says
+// little about who spent it (a week-old chat still running books nothing today); today uses the last 7
+// days instead. 1 when no other profile shares the key, null when nobody has list cost in the window.
+const keyShare = (meter, period) => {
+  if (!meter || !meter.orDaily) return 1
+  const last7 = new Set(lastNDays(7))
+  const start = period === 'today' ? null : accountWindowStart(period)
+  const keep = d => (start ? d >= start : last7.has(d))
+  const sum = map => Array.from(map.values()).filter(r => keep(r.day)).reduce((a, r) => a + num(r.cost), 0)
+  const all = sum(meter.orDaily)
+  return all > 0 ? Math.min(1, sum(meter.daily) / all) : null
+}
+const periodSpend = (data, account, period, scope = 'all') => {
+  const days = period === 'today' ? lastNDays(1) : period === '7d' ? lastNDays(7) : lastNDays(DEFAULT_DAYS)
+  const listCost = () => (data ? days.reduce((a, d) => a + (data.daily.get(d) || { cost: 0 }).cost, 0) : 0)
   if (account) {
     const v = period === 'today' ? account.today : period === '7d' ? account.week : account.month
-    if (v != null) return v
+    if (v != null) {
+      if (scope === 'all') return v
+      const f = keyShare(data, period)
+      return f != null ? v * f : listCost()
+    }
   }
-  if (!data) return 0
-  const days = period === 'today' ? lastNDays(1) : period === '7d' ? lastNDays(7) : lastNDays(DEFAULT_DAYS)
-  return days.reduce((a, d) => a + (data.daily.get(d) || { cost: 0 }).cost, 0)
+  return listCost()
 }
 
 // ---- data hook --------------------------------------------------------------
@@ -3060,13 +3077,15 @@ const Body = ({ meter, prices, threshold, retries, yaml, profile, profileLabel, 
   const comparable = period !== 'today'
   const elsewhere = comparable && acct != null ? Math.max(0, acct - periodOR) : null
   const drift = comparable && acct != null && periodOR > 0.5 && acct > 0 ? acct / periodOR : null
-  // one profile sharing the key with others gets its share of the bill (its list cost times the drift);
+  // one profile sharing the key with others gets its share of the bill (keyShare);
   // all profiles get the bill plus the list cost of profiles billed elsewhere
   const share = acct != null && !!meter.orDaily && scope !== 'all'
   const nonOR = acct != null && meter.orDaily && scope === 'all' ? Math.max(0, periodHermes - periodOR) : 0
   const pinfo = (meter.periods && meter.periods[period]) || {}
   const est = pinfo.estimated && pinfo.estimated.size ? Array.from(pinfo.estimated.entries()) : []
-  const headline = shown ? hermesCost : acct != null ? (share ? (drift != null ? periodHermes * drift : periodHermes) : acct + nonOR) : periodHermes
+  const frac = share ? keyShare(meter, period) : null
+  const billedPart = acct == null ? null : share ? (frac != null ? acct * frac : null) : acct + nonOR
+  const headline = shown ? hermesCost : billedPart != null ? billedPart : periodHermes
   const lastDay = m.days[m.days.length - 1]
   const rangeLabel = period === 'today' ? 'today' : windowStart ? dayLabel(windowStart) + ' – ' + dayLabel(lastDay) : dayLabel(m.days[0]) + ' – ' + dayLabel(lastDay)
   // chats billed through more than one provider: their list cost per provider
@@ -3075,7 +3094,7 @@ const Body = ({ meter, prices, threshold, retries, yaml, profile, profileLabel, 
   const provSplit = Object.entries(byProv).filter(([, v]) => v > 0).sort((a, b) => b[1] - a[1])
   const where = acct != null ? (nonOR > 0 || provSplit.length > 1 ? 'OpenRouter and others' : 'OpenRouter') : provSplit.length > 1 ? provSplit.length + ' providers' : scope === 'all' ? 'Hermes' : meter.providerName || 'Hermes'
   const headlineLabel = shown ? dayLabel(shown) + ' on Hermes' : rangeLabel + ' on ' + where
-  const periodRate = (acct != null ? acct : m.periodCost) / periodHours(period)
+  const periodRate = (share ? (billedPart != null ? billedPart : periodHermes) : acct != null ? acct : m.periodCost) / periodHours(period)
   // Days without a billed snapshot (Hermes desktop closed, or before the plugin existed) get a billed
   // estimate from OpenRouter's totals: the week total minus the known snapshots, spread over the
   // snapshot-less days of the week in proportion to their list cost; likewise month-minus-week for the
@@ -3263,8 +3282,8 @@ const Body = ({ meter, prices, threshold, retries, yaml, profile, profileLabel, 
     el(
       'div',
       { style: { display: 'flex', alignItems: 'baseline', gap: 10, minHeight: 34, whiteSpace: 'nowrap' } },
-      el(Tip, { label: (est.length ? 'Hermes has no price for ' + est.map(([m]) => m).join(', ') + '; estimated at OpenRouter list price for ' + est.map(([, id]) => id).join(', ') + '. ' : pinfo.unpriced && !headline ? 'Hermes has no price for this provider and no matching OpenRouter price was found. ' : '') + (shown ? 'List-price estimate for that day' : share ? 'Share of the OpenRouter bill for this profile: list cost times the pricing drift' : nonOR > 0 ? 'OpenRouter bill plus the list cost of profiles billed elsewhere (' + fmtUsd(nonOR) + ')' : '') },
-        el('span', { style: { fontSize: 26, fontWeight: 500, letterSpacing: '-0.01em', fontVariantNumeric: 'tabular-nums', flex: 'none' } }, (pinfo.unpriced && !est.length && !headline ? 'no price' : fmtUsd(headline, { approx: est.length > 0 || (!shown && ((share && drift != null) || nonOR > 0)) })))),
+      el(Tip, { label: (est.length ? 'Hermes has no price for ' + est.map(([m]) => m).join(', ') + '; estimated at OpenRouter list price for ' + est.map(([, id]) => id).join(', ') + '. ' : pinfo.unpriced && !headline ? 'Hermes has no price for this provider and no matching OpenRouter price was found. ' : '') + (shown ? 'List-price estimate for that day' : share ? (frac != null ? 'This profile\'s part of the OpenRouter bill (' + fmtUsd(acct) + ' for every profile on the key), by its share of their list cost' + (period === 'today' ? ' over the last 7 days, since Hermes books a chat to the day it started' : '') : 'No list cost on the key in this window, so this is Hermes\' own estimate') : nonOR > 0 ? 'OpenRouter bill plus the list cost of profiles billed elsewhere (' + fmtUsd(nonOR) + ')' : '') },
+        el('span', { style: { fontSize: 26, fontWeight: 500, letterSpacing: '-0.01em', fontVariantNumeric: 'tabular-nums', flex: 'none' } }, (pinfo.unpriced && !est.length && !headline ? 'no price' : fmtUsd(headline, { approx: est.length > 0 || (!shown && ((share && frac != null && frac < 1) || nonOR > 0)) })))),
       provSplit.length > 1
         ? el(Tip, { label: 'List cost by provider: ' + provSplit.map(([k, v]) => k + ' ' + fmtUsd(v)).join(', ') }, el('span', { title: headlineLabel, style: { fontSize: 11, color: C.sub, cursor: 'help', borderBottom: '1px dotted ' + C.faint, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', flex: '0 1 auto' } }, headlineLabel))
         : el('span', { title: headlineLabel, style: { fontSize: 11, color: C.sub, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', flex: '0 1 auto' } }, headlineLabel),
@@ -4752,7 +4771,7 @@ const Chip = () => {
   const [period, setChipPeriod] = useState(() => sget('period', '7d'))
   const [view, setView] = useState(() => sget('view', 'costs'))
   const pickView = v => { setView(v); sset('view', v) }
-  const spend = periodSpend(data, account, period)
+  const spend = periodSpend(data, account, period, scope)
   const avgRate = spend / periodHours(period)
   const liveRate = rates.reduce((a, r) => a + r.rate, 0)
   const tone = liveRate >= 5 ? 'bad' : liveRate >= 1.5 ? 'warn' : null

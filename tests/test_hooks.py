@@ -75,6 +75,12 @@ def test_the_popover_lists_and_answers_questions():
     assert asyncio.run(api.hdr_guard_asks(profile=None))["asks"] == [], "answered questions drop out"
 
 
+def test_the_script_is_found_behind_an_interpreter():
+    assert api._hook_script("bash " + str(SCRIPT)) == SCRIPT
+    assert api._hook_script("/usr/bin/env sh " + str(SCRIPT) + " --flag") == SCRIPT, "skips the env binary"
+    assert api._hook_script("python3 -c 'print(1)'") is None
+
+
 def test_bad_answers_are_refused():
     for bad in ({"id": "../../x", "decision": "allow"}, {"id": "0123456789ab", "decision": "maybe"},
                 {"id": "0123456789ab", "decision": "allow", "scope": "everything"}):

@@ -2452,14 +2452,23 @@ _HOOK_TEXT_MAX = 64_000
 
 
 def _hook_script(command):
-    """The script file a hook command runs, when its first word is a file."""
+    """The script file a hook command runs: the first word that is a text file, so `bash ~/x.sh` and
+    `/usr/bin/env python3 x.py` give the script, not the interpreter."""
     import shlex
     try:
-        first = shlex.split(str(command))[0]
-    except (ValueError, IndexError):
+        words = shlex.split(str(command))
+    except ValueError:
         return None
-    p = Path(os.path.expanduser(first))
-    return p if p.is_file() else None
+    for w in words:
+        p = Path(os.path.expanduser(w))
+        try:
+            if p.is_file():
+                with p.open("rb") as fh:
+                    if b"\0" not in fh.read(4096):
+                        return p
+        except OSError:
+            continue
+    return None
 
 
 def _hooks_store(home):

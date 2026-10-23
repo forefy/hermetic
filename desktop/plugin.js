@@ -3075,7 +3075,6 @@ const Body = ({ meter, prices, threshold, retries, yaml, profile, profileLabel, 
   const periodOR = meter.orDaily ? Array.from(meter.orDaily.values()).filter(r => (windowStart ? r.day >= windowStart : inPeriod.has(r.day))).reduce((a, r) => a + r.cost, 0) : periodHermes
   // Hermes books a session's cost to its start day, so a one-day comparison is attribution noise.
   const comparable = period !== 'today'
-  const elsewhere = comparable && acct != null ? Math.max(0, acct - periodOR) : null
   const drift = comparable && acct != null && periodOR > 0.5 && acct > 0 ? acct / periodOR : null
   // one profile sharing the key with others gets its share of the bill (keyShare);
   // all profiles get the bill plus the list cost of profiles billed elsewhere
@@ -3086,6 +3085,8 @@ const Body = ({ meter, prices, threshold, retries, yaml, profile, profileLabel, 
   const frac = share ? keyShare(meter, period) : null
   const billedPart = acct == null ? null : share ? (frac != null ? acct * frac : null) : acct + nonOR
   const headline = shown ? hermesCost : billedPart != null ? billedPart : periodHermes
+  // billed minus list cost, for the same profiles the headline covers, so "Hermes" plus this adds up to it
+  const elsewhere = comparable && acct != null ? Math.max(0, share ? (billedPart != null ? billedPart - periodHermes : 0) : acct - periodOR) : null
   const lastDay = m.days[m.days.length - 1]
   const rangeLabel = period === 'today' ? 'today' : windowStart ? dayLabel(windowStart) + ' – ' + dayLabel(lastDay) : dayLabel(m.days[0]) + ' – ' + dayLabel(lastDay)
   // chats billed through more than one provider: their list cost per provider
@@ -3158,7 +3159,7 @@ const Body = ({ meter, prices, threshold, retries, yaml, profile, profileLabel, 
       }
     })
   }
-  const aboveList = drift != null && drift >= 1.3 ? acct - periodOR : 0
+  const aboveList = drift != null && drift >= 1.3 ? elsewhere || 0 : 0
   const tollBilled = m.resets.toll * (drift != null ? drift : 1)
   if (!orProfile) {
     /* provider pinning and routing rules are OpenRouter features */

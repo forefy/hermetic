@@ -216,6 +216,7 @@ async function loadAnalytics(profiles, days, prices) {
         // a profile Hermes priced at $0 despite tokens (custom endpoints), or at under a tenth of list price
         // (it knew the price of a sliver only): blend list prices of its models for every day instead
         const models = (r && r.by_model) || []
+        await loadVendorPrices(models.map(m => m.model), prices)
         const hermesTotal = ((r && r.daily) || []).reduce((a, d) => a + num(d.estimated_cost), 0)
         const listTotal = models.reduce((a, m) => a + (costAt(priceOf(prices, m.model), m.input_tokens, m.output_tokens, m.cache_read_tokens) || 0), 0)
         const priced = hermesTotal > 0 && !(listTotal > 0 && hermesTotal < listTotal * 0.1)
@@ -224,10 +225,11 @@ async function loadAnalytics(profiles, days, prices) {
           const w = { in: 0, out: 0, cache: 0, tin: 0, tout: 0, tcache: 0 }
           for (const m of models) {
             const id = priceIdOf(prices, m.model)
-            const pr = id ? prices[id] : null
+            const pr = priceOf(prices, m.model)
             const tin = num(m.input_tokens), tout = num(m.output_tokens), tc = num(m.cache_read_tokens)
             if (!pr) { if (tin + tout + tc > 0) unpriced = true; continue }
-            if (tin + tout + tc > 0) estimated.set(m.model, id)
+            const vp = vendorPrice.get(m.model)
+            if (tin + tout + tc > 0) estimated.set(m.model, vp ? id + ' on ' + vp.via : id)
             w.in += tin * pr.in; w.tin += tin
             w.out += tout * pr.out; w.tout += tout
             w.cache += tc * (pr.cache != null ? pr.cache : pr.in); w.tcache += tc
@@ -854,7 +856,36 @@ const priceIdOf = (prices, model) => {
   // Fireworks writes versions with a p for the dot: glm-5p3 is glm-5.3
   return priceTail.get(tail) || priceTail.get(tail.replace(/(\d)p(\d)/g, '$1.$2')) || null
 }
-const priceOf = (prices, model) => { const id = priceIdOf(prices, model); return id ? prices[id] : null }
+// A model id that names the provider serving it (fireworks-ai/glm-5p3) is priced at that provider's own
+// OpenRouter endpoint: the model's list price is its cheapest provider's, often several times lower.
+const vendorPrice = new Map() // model id as Hermes reports it -> { in, out, cache, via }
+const providerKey = s => String(s || '').toLowerCase().replace(/[^a-z0-9]/g, '').replace(/ai$/, '')
+const vendorOf = model => {
+  const s = String(model || '').split('/')
+  return s.length > 1 ? (s[0] === 'accounts' ? s[1] : s[0]) : null
+}
+async function loadVendorPrices(models, prices) {
+  const todo = []
+  for (const model of new Set(models)) {
+    const id = priceIdOf(prices, model)
+    const vendor = vendorOf(model)
+    if (id && vendor && providerKey(vendor) !== providerKey(vendorOf(id))) todo.push([model, id, providerKey(vendor)])
+  }
+  if (!todo.length) return
+  const eps = await loadEndpoints(Array.from(new Set(todo.map(t => t[1]))))
+  for (const [model, id, want] of todo) {
+    const mine = (eps[id] || []).filter(e => providerKey(String(e.tag).split('/')[0]) === want || providerKey(e.name) === want)
+    if (!mine.length) { vendorPrice.delete(model); continue }
+    const e = mine.reduce((a, b) => (b.in + b.out < a.in + a.out ? b : a))
+    vendorPrice.set(model, { in: e.in, out: e.out, cache: e.cache, via: e.name })
+  }
+}
+const priceOf = (prices, model) => {
+  const v = vendorPrice.get(model)
+  if (v) return v
+  const id = priceIdOf(prices, model)
+  return id ? prices[id] : null
+}
 const costAt = (p, input, output, cache) =>
   p ? (num(input) * p.in + num(output) * p.out + num(cache) * (p.cache != null ? p.cache : p.in)) / 1e6 : null
 
@@ -3290,7 +3321,7 @@ const Body = ({ meter, prices, threshold, retries, yaml, profile, profileLabel, 
     el(
       'div',
       { style: { display: 'flex', alignItems: 'baseline', gap: 10, minHeight: 34, whiteSpace: 'nowrap' } },
-      el(Tip, { label: (est.length ? 'Hermes has no price for ' + est.map(([m]) => m).join(', ') + '; estimated at OpenRouter list price for ' + est.map(([, id]) => id).join(', ') + '. ' : pinfo.unpriced && !headline ? 'Hermes has no price for this provider and no matching OpenRouter price was found. ' : '') + (shown ? 'List-price estimate for that day' : share ? (frac != null ? 'This profile\'s part of the OpenRouter bill (' + fmtUsd(acct) + ' for every profile on the key), by its share of their list cost' + (period === 'today' ? ' over the last 7 days, since one day\'s split is too noisy' : '') : 'No list cost on the key in this window, so this is Hermes\' own estimate') : nonOR > 0 ? 'OpenRouter bill plus the list cost of profiles billed elsewhere (' + fmtUsd(nonOR) + ')' : '') },
+      el(Tip, { label: (est.length ? 'Hermes has no price for ' + est.map(([m]) => m).join(', ') + '; estimated at the OpenRouter price for ' + est.map(([, id]) => id).join(', ') + '. ' : pinfo.unpriced && !headline ? 'Hermes has no price for this provider and no matching OpenRouter price was found. ' : '') + (shown ? 'List-price estimate for that day' : share ? (frac != null ? 'This profile\'s part of the OpenRouter bill (' + fmtUsd(acct) + ' for every profile on the key), by its share of their list cost' + (period === 'today' ? ' over the last 7 days, since one day\'s split is too noisy' : '') : 'No list cost on the key in this window, so this is Hermes\' own estimate') : nonOR > 0 ? 'OpenRouter bill plus the list cost of profiles billed elsewhere (' + fmtUsd(nonOR) + ')' : '') },
         el('span', { style: { fontSize: 26, fontWeight: 500, letterSpacing: '-0.01em', fontVariantNumeric: 'tabular-nums', flex: 'none' } }, (pinfo.unpriced && !est.length && !headline ? 'no price' : fmtUsd(headline, { approx: est.length > 0 || (!shown && ((share && frac != null && frac < 1) || nonOR > 0)) })))),
       provSplit.length > 1
         ? el(Tip, { label: 'List cost by provider: ' + provSplit.map(([k, v]) => k + ' ' + fmtUsd(v)).join(', ') }, el('span', { title: headlineLabel, style: { fontSize: 11, color: C.sub, cursor: 'help', borderBottom: '1px dotted ' + C.faint, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', flex: '0 1 auto' } }, headlineLabel))

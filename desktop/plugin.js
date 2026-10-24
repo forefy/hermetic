@@ -1132,8 +1132,8 @@ const periodHours = period => {
   return Math.max((d.getUTCHours() * 60 + d.getUTCMinutes()) / 60, 1)
 }
 // One profile's part of an OpenRouter bill that covers every profile on the key: its share of their list
-// cost over the bill's window. Hermes books a chat's cost to the day the chat started, so a single day says
-// little about who spent it (a week-old chat still running books nothing today); today uses the last 7
+// cost over the bill's window. A day's list cost is spread from session totals by replies per day, and
+// OpenRouter's day is a UTC one, so a single day says little about who spent it; today uses the last 7
 // days instead. 1 when no other profile shares the key, null when nobody has list cost in the window.
 const keyShare = (meter, period) => {
   if (!meter || !meter.orDaily) return 1
@@ -3080,7 +3080,7 @@ const Body = ({ meter, prices, threshold, retries, yaml, profile, profileLabel, 
   // OpenRouter's bill covers every profile on the key; compare it with those profiles' list cost
   const inPeriod = new Set(m.series.map(r => r.day))
   const periodOR = meter.orDaily ? Array.from(meter.orDaily.values()).filter(r => (windowStart ? r.day >= windowStart : inPeriod.has(r.day))).reduce((a, r) => a + r.cost, 0) : periodHermes
-  // Hermes books a session's cost to its start day, so a one-day comparison is attribution noise.
+  // A day's list cost is an estimate spread from session totals, against OpenRouter's UTC day: one day is noise.
   const comparable = period !== 'today'
   const drift = comparable && acct != null && periodOR > 0.5 && acct > 0 ? acct / periodOR : null
   // one profile sharing the key with others gets its share of the bill (keyShare);
@@ -3290,7 +3290,7 @@ const Body = ({ meter, prices, threshold, retries, yaml, profile, profileLabel, 
     el(
       'div',
       { style: { display: 'flex', alignItems: 'baseline', gap: 10, minHeight: 34, whiteSpace: 'nowrap' } },
-      el(Tip, { label: (est.length ? 'Hermes has no price for ' + est.map(([m]) => m).join(', ') + '; estimated at OpenRouter list price for ' + est.map(([, id]) => id).join(', ') + '. ' : pinfo.unpriced && !headline ? 'Hermes has no price for this provider and no matching OpenRouter price was found. ' : '') + (shown ? 'List-price estimate for that day' : share ? (frac != null ? 'This profile\'s part of the OpenRouter bill (' + fmtUsd(acct) + ' for every profile on the key), by its share of their list cost' + (period === 'today' ? ' over the last 7 days, since Hermes books a chat to the day it started' : '') : 'No list cost on the key in this window, so this is Hermes\' own estimate') : nonOR > 0 ? 'OpenRouter bill plus the list cost of profiles billed elsewhere (' + fmtUsd(nonOR) + ')' : '') },
+      el(Tip, { label: (est.length ? 'Hermes has no price for ' + est.map(([m]) => m).join(', ') + '; estimated at OpenRouter list price for ' + est.map(([, id]) => id).join(', ') + '. ' : pinfo.unpriced && !headline ? 'Hermes has no price for this provider and no matching OpenRouter price was found. ' : '') + (shown ? 'List-price estimate for that day' : share ? (frac != null ? 'This profile\'s part of the OpenRouter bill (' + fmtUsd(acct) + ' for every profile on the key), by its share of their list cost' + (period === 'today' ? ' over the last 7 days, since one day\'s split is too noisy' : '') : 'No list cost on the key in this window, so this is Hermes\' own estimate') : nonOR > 0 ? 'OpenRouter bill plus the list cost of profiles billed elsewhere (' + fmtUsd(nonOR) + ')' : '') },
         el('span', { style: { fontSize: 26, fontWeight: 500, letterSpacing: '-0.01em', fontVariantNumeric: 'tabular-nums', flex: 'none' } }, (pinfo.unpriced && !est.length && !headline ? 'no price' : fmtUsd(headline, { approx: est.length > 0 || (!shown && ((share && frac != null && frac < 1) || nonOR > 0)) })))),
       provSplit.length > 1
         ? el(Tip, { label: 'List cost by provider: ' + provSplit.map(([k, v]) => k + ' ' + fmtUsd(v)).join(', ') }, el('span', { title: headlineLabel, style: { fontSize: 11, color: C.sub, cursor: 'help', borderBottom: '1px dotted ' + C.faint, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', flex: '0 1 auto' } }, headlineLabel))

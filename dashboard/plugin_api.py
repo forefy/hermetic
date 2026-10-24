@@ -191,6 +191,17 @@ def _session_turns(msgs):
     return out
 
 
+def _session_days(msgs):
+    """{local day: model replies that day} for one session. Hermes keeps a single token and cost total
+    per session, so the usage route spreads it over the days the session actually ran."""
+    out = {}
+    for m in msgs:
+        if m.get("role") == "assistant":
+            day = time.strftime("%Y-%m-%d", time.localtime(float(m.get("timestamp") or 0)))
+            out[day] = out.get(day, 0) + 1
+    return out
+
+
 def _sessions_store(profile):
     return str(_profile_home(profile)[1] / "state.db")
 
@@ -279,33 +290,48 @@ async def config_raw_save(payload: Dict[str, Any] = Body(default={}), profile: O
 
 @router.get("/usage")
 async def usage(days: int = Query(30, ge=1, le=365), profile: Optional[str] = None):
-    """Tokens, cost and calls per local day and per model for sessions started in the period, plus
-    background tasks (titles, compression, review) per task."""
+    """Tokens, cost and calls per local day and per model over the last ``days`` local days (today
+    included), plus background tasks (titles, compression, review) per task. Hermes books a session's
+    totals to the day it started; here each session is spread over the days it ran, by its model
+    replies per day, so a chat started last week and still running counts today too."""
     def _run():
         db = _open_sessions_db(profile)
         try:
-            cutoff = time.time() - days * 86400
-            rows = [r for r in _db_sessions(db, cutoff) if float(r.get("started_at") or 0) > cutoff]
+            first_day = time.strftime("%Y-%m-%d", time.localtime(time.time() - (days - 1) * 86400))
+            start = time.mktime(time.strptime(first_day, "%Y-%m-%d"))
+            store = _sessions_store(profile)
             daily, models, aux = {}, {}, {}
-            for r in rows:
-                day = time.strftime("%Y-%m-%d", time.localtime(float(r["started_at"])))
-                d = daily.setdefault(day, {"day": day, "input_tokens": 0, "output_tokens": 0, "cache_read_tokens": 0, "reasoning_tokens": 0,
-                                           "estimated_cost": 0.0, "actual_cost": 0.0, "sessions": 0, "api_calls": 0})
-                for k in ("input_tokens", "output_tokens", "cache_read_tokens", "reasoning_tokens"):
-                    d[k] += int(r.get(k) or 0)
-                d["estimated_cost"] += float(r.get("estimated_cost_usd") or 0)
-                d["actual_cost"] += float(r.get("actual_cost_usd") or 0)
-                d["sessions"] += 1
-                d["api_calls"] += int(r.get("api_call_count") or 0)
+            for r in _db_sessions(db, start):
+                started = float(r.get("started_at") or 0)
+                start_day = time.strftime("%Y-%m-%d", time.localtime(started))
+                spread = _per_session(db, store, r, "days", _session_days, every=True)
+                replies = sum(spread.values())
+                parts = {d: n / replies for d, n in spread.items()} if replies else {start_day: 1.0}
+                parts = {d: f for d, f in parts.items() if d >= first_day}
+                if not parts:
+                    continue
+                for day, f in parts.items():
+                    d = daily.setdefault(day, {"day": day, "input_tokens": 0, "output_tokens": 0, "cache_read_tokens": 0, "reasoning_tokens": 0,
+                                               "estimated_cost": 0.0, "actual_cost": 0.0, "sessions": 0, "api_calls": 0})
+                    for k in ("input_tokens", "output_tokens", "cache_read_tokens", "reasoning_tokens"):
+                        d[k] += round(int(r.get(k) or 0) * f)
+                    d["estimated_cost"] += float(r.get("estimated_cost_usd") or 0) * f
+                    d["actual_cost"] += float(r.get("actual_cost_usd") or 0) * f
+                    d["api_calls"] += round(int(r.get("api_call_count") or 0) * f)
+                # a session counts once: on the day it started, or on its first day in the period
+                daily[start_day if start_day in parts else min(parts)]["sessions"] += 1
+                share = sum(parts.values())
                 if r.get("model"):
                     m = models.setdefault(r["model"], {"model": r["model"], "input_tokens": 0, "output_tokens": 0, "cache_read_tokens": 0,
                                                        "estimated_cost": 0.0, "sessions": 0, "api_calls": 0})
                     for k in ("input_tokens", "output_tokens", "cache_read_tokens"):
-                        m[k] += int(r.get(k) or 0)
-                    m["estimated_cost"] += float(r.get("estimated_cost_usd") or 0)
+                        m[k] += round(int(r.get(k) or 0) * share)
+                    m["estimated_cost"] += float(r.get("estimated_cost_usd") or 0) * share
                     m["sessions"] += 1
-                    m["api_calls"] += int(r.get("api_call_count") or 0)
+                    m["api_calls"] += round(int(r.get("api_call_count") or 0) * share)
                 # background tasks are summed over a whole chain, so ask once per chain (at its start)
+                if started < start:
+                    continue
                 for task, t in ({} if r.get("parent_session_id") else db.auxiliary_usage_by_task(r["id"]) or {}).items():
                     a = aux.setdefault(task, {"task": task, "input_tokens": 0, "output_tokens": 0, "estimated_cost": 0.0, "api_calls": 0})
                     a["input_tokens"] += int(t.get("input_tokens") or 0)

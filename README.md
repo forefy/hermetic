@@ -111,6 +111,7 @@ Everything Hermetic records stays in `$HERMES_HOME/hermetic/` (ratings, tests, r
 | `tests/test_credentials.py` | Hermetic's own model calls go through Hermes (`ctx.llm`, secret scope) |
 | `tests/test_paths.py` | Skill names and version ids from requests never leave Hermetic's folders |
 | `tests/test_session_cache.py` | HDR and AAI re-read only the sessions that changed |
+| `tests/test_usage_days.py` | A chat's cost spread over the days it ran, not just the day it started |
 | `tests/test_config_routes.py` | Config writes reach only the profile Hermes scoped the request to |
 | `tests/test_limits.mjs` | Which OpenRouter limit stops requests first, credits or the key's cap |
 | `tests/test_share.mjs` | One profile's part of an OpenRouter bill shared with other profiles |

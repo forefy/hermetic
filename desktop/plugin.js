@@ -216,7 +216,7 @@ async function loadAnalytics(profiles, days, prices) {
         // a profile Hermes priced at $0 despite tokens (custom endpoints), or at under a tenth of list price
         // (it knew the price of a sliver only): blend list prices of its models for every day instead
         const models = (r && r.by_model) || []
-        await loadVendorPrices(models.map(m => m.model), prices)
+        await loadVendorPrices(models, prices)
         const hermesTotal = ((r && r.daily) || []).reduce((a, d) => a + num(d.estimated_cost), 0)
         const listTotal = models.reduce((a, m) => a + (costAt(priceOf(prices, m.model), m.input_tokens, m.output_tokens, m.cache_read_tokens) || 0), 0)
         const priced = hermesTotal > 0 && !(listTotal > 0 && hermesTotal < listTotal * 0.1)
@@ -224,12 +224,10 @@ async function loadAnalytics(profiles, days, prices) {
         if (!priced) {
           const w = { in: 0, out: 0, cache: 0, tin: 0, tout: 0, tcache: 0 }
           for (const m of models) {
-            const id = priceIdOf(prices, m.model)
             const pr = priceOf(prices, m.model)
             const tin = num(m.input_tokens), tout = num(m.output_tokens), tc = num(m.cache_read_tokens)
             if (!pr) { if (tin + tout + tc > 0) unpriced = true; continue }
-            const vp = vendorPrice.get(m.model)
-            if (tin + tout + tc > 0) estimated.set(m.model, vp ? id + ' on ' + vp.via : id)
+            if (tin + tout + tc > 0) estimated.set(m.model, priceSource(prices, m.model))
             w.in += tin * pr.in; w.tin += tin
             w.out += tout * pr.out; w.tout += tout
             w.cache += tc * (pr.cache != null ? pr.cache : pr.in); w.tcache += tc
@@ -810,6 +808,21 @@ function spendLimit(a) {
 
 let backendPatched = true
 
+// The focused profile's plan limits or credits, for providers other than OpenRouter (whose bill and
+// limit the account line above covers): Anthropic and Codex windows, Nous credits, provider plugins.
+async function loadLimits(profile) {
+  try {
+    const r = await api({ path: OWN + '/account/usage', profile, timeoutMs: 20_000 })
+    if (!r || !r.account || /^openrouter$/i.test(r.provider || '')) return null
+    const a = r.account
+    const details = (a.details || []).filter(d => !/^(top up|\(or run|https?:)/i.test(String(d).trim()))
+    if (!(a.windows || []).length && !details.length && !a.unavailable) return null
+    return { provider: r.provider, title: a.title, plan: a.plan, windows: a.windows || [], details, unavailable: a.unavailable }
+  } catch {
+    return null
+  }
+}
+
 async function loadAccount(sid) {
   for (const path of [OWN + '/account/usage']) {
     try {
@@ -864,9 +877,43 @@ const vendorOf = model => {
   const s = String(model || '').split('/')
   return s.length > 1 ? (s[0] === 'accounts' ? s[1] : s[0]) : null
 }
+// Gateways that publish the price they charge for each of their model ids, on public pages anyone can
+// read: a model billed through one is priced at that published rate first.
+const GATEWAYS = [{ host: /(^|\.)hopscotchlabs\.ai$/i, name: 'Hopscotch', price: model => hopscotchPrice(model) }]
+// Hopscotch's model page lists each provider's row as "<id> Input / 1M $x Output / 1M $y Cache read / 1M $z".
+const parseHopscotchPage = (html, model) => {
+  const text = String(html || '').replace(/<script[\s\S]*?<\/script>|<style[\s\S]*?<\/style>/gi, ' ').replace(/<[^>]+>/g, ' ').replace(/&amp;/g, '&').replace(/\s+/g, ' ')
+  const id = model.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  const m = new RegExp('(?:^| )' + id + ' Input / 1M \\$([\\d.,]+) Output / 1M \\$([\\d.,]+) Cache read / 1M (?:\\$([\\d.,]+)|N/A)', 'i').exec(text)
+  if (!m) return null
+  const n = s => parseFloat(s.replace(/,/g, ''))
+  return { in: n(m[1]), out: n(m[2]), cache: m[3] ? n(m[3]) : null }
+}
+async function hopscotchPrice(model) {
+  const key = 'hopscotch:' + model
+  const cached = sget(key, null)
+  if (cached && Date.now() - cached.t < PRICES_TTL_MS) return cached.v
+  try {
+    const res = await fetch('https://hopscotchlabs.ai/models/' + model.split('/').map(encodeURIComponent).join('/'))
+    if (!res.ok) throw new Error(String(res.status))
+    const v = parseHopscotchPage(await res.text(), model)
+    sset(key, { t: Date.now(), v })
+    return v
+  } catch {
+    return cached ? cached.v : null
+  }
+}
+// `models`: Hermes' by_model rows ({ model, hosts }) or bare ids.
 async function loadVendorPrices(models, prices) {
   const todo = []
-  for (const model of new Set(models)) {
+  for (const row of models) {
+    const model = typeof row === 'string' ? row : row && row.model
+    if (!model) continue
+    const gateway = GATEWAYS.find(g => ((row && row.hosts) || []).some(h => g.host.test(h)))
+    if (gateway) {
+      const p = await gateway.price(model)
+      if (p) { vendorPrice.set(model, { ...p, via: gateway.name, gateway: true }); continue }
+    }
     const id = priceIdOf(prices, model)
     const vendor = vendorOf(model)
     if (id && vendor && providerKey(vendor) !== providerKey(vendorOf(id))) todo.push([model, id, providerKey(vendor)])
@@ -876,9 +923,18 @@ async function loadVendorPrices(models, prices) {
   for (const [model, id, want] of todo) {
     const mine = (eps[id] || []).filter(e => providerKey(String(e.tag).split('/')[0]) === want || providerKey(e.name) === want)
     if (!mine.length) { vendorPrice.delete(model); continue }
-    const e = mine.reduce((a, b) => (b.in + b.out < a.in + a.out ? b : a))
+    // a provider can list several tiers; the middle one is its standard rate (Fireworks: 0.98, 1.40, 2.10)
+    const sorted = mine.slice().sort((a, b) => a.in + a.out - (b.in + b.out))
+    const e = sorted[Math.floor((sorted.length - 1) / 2)]
     vendorPrice.set(model, { in: e.in, out: e.out, cache: e.cache, via: e.name })
   }
+}
+// How an estimate was priced, for the headline's tooltip.
+const priceSource = (prices, model) => {
+  const v = vendorPrice.get(model)
+  if (v && v.gateway) return v.via + '\'s published price for ' + model
+  const id = priceIdOf(prices, model)
+  return 'the OpenRouter price for ' + id + (v ? ' on ' + v.via : '')
 }
 const priceOf = (prices, model) => {
   const v = vendorPrice.get(model)
@@ -1208,7 +1264,7 @@ function useMeterData() {
       const scope = sget('scope', 'profile') === 'all' ? 'all' : 'profile'
       const scoped = scope === 'all' ? profiles : profiles.filter(p => p.name === profile)
       const shown = scoped.length ? scoped : profiles
-      const [analytics, sessionsResult, retries, account, routingAll, aux, billedHistory, health] = await Promise.all([
+      const [analytics, sessionsResult, retries, account, routingAll, aux, billedHistory, health, limits] = await Promise.all([
         loadAllAnalytics(shown, prices),
         loadSessions(profiles),
         loadRetries(lastNDays(DEFAULT_DAYS)[0]),
@@ -1216,7 +1272,8 @@ function useMeterData() {
         loadRouting(profiles),
         loadAux(profile),
         loadBilledHistory(),
-        loadHealth()
+        loadHealth(),
+        loadLimits(profile)
       ])
       for (const x of sessionsResult.sessions) {
         if (!x.cost && x.input + x.output + x.cache > 0) {
@@ -1287,7 +1344,8 @@ function useMeterData() {
         orProfile,
         orAny,
         // the OpenRouter account card belongs to OpenRouter profiles (or to the all-profiles total)
-        account: scope === 'all' || orProfile ? account || s.account : null
+        account: scope === 'all' || orProfile ? account || s.account : null,
+        limits
       }))
     } catch (e) {
       setState(s => ({ ...s, loading: false, error: (e && e.message) || 'load failed' }))
@@ -1498,6 +1556,42 @@ const Track = ({ value, tick, tone, height }) =>
         })
       : null
   )
+
+// "in 2h 10m" within a day, else the weekday and time it resets.
+const fmtReset = iso => {
+  const t = Date.parse(iso)
+  if (!isFinite(t)) return ''
+  const mins = Math.round((t - Date.now()) / 60000)
+  if (mins <= 0) return 'now'
+  if (mins < 60) return 'in ' + mins + 'm'
+  if (mins < 24 * 60) return 'in ' + Math.floor(mins / 60) + 'h' + (mins % 60 ? ' ' + (mins % 60) + 'm' : '')
+  return new Date(t).toLocaleString(undefined, { weekday: 'short', hour: '2-digit', minute: '2-digit' })
+}
+
+// A plan's limit windows (Anthropic, Codex) or credits (Nous), as Hermes reports them for this profile:
+// the tightest window with its bar, the rest in the tooltip. Whole-account windows come before
+// windows that cap one model family.
+const PlanLimits = ({ limits }) => {
+  const wins = limits.windows.filter(w => w.used_percent != null)
+    .sort((a, b) => (a.scope === 'model') - (b.scope === 'model') || b.used_percent - a.used_percent)
+  const describe = w => w.label + ' ' + Math.round(w.used_percent) + '% used' + (w.reset_at ? ', resets ' + fmtReset(w.reset_at) : w.detail ? ', ' + w.detail : '')
+  const tip = [limits.title + (limits.plan ? ' (' + limits.plan + ')' : '')].concat(limits.windows.map(w => (w.used_percent != null ? describe(w) : w.label + ' unavailable')), limits.details, limits.unavailable ? ['Unavailable: ' + limits.unavailable] : []).join('\n')
+  const top = wins[0]
+  const tone = top ? (top.used_percent >= 95 ? 'bad' : top.used_percent >= 85 ? 'warn' : null) : null
+  const balance = limits.details.find(d => /^total usable/i.test(d)) || limits.details[0]
+  return el(
+    'div',
+    { title: tip, style: { marginTop: 6 } },
+    el(
+      'div',
+      { style: { display: 'flex', justifyContent: 'space-between', gap: 10, fontSize: 11, color: C.sub, fontVariantNumeric: 'tabular-nums', minWidth: 0 } },
+      el('span', { style: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', minWidth: 0 } },
+        top ? describe(top).replace(/, resets .*$/, '') : limits.unavailable ? 'Limits unavailable' : balance),
+      top && top.reset_at ? el('span', { style: { whiteSpace: 'nowrap', color: tone === 'bad' ? C.bad : tone === 'warn' ? C.warn : C.sub } }, 'resets ' + fmtReset(top.reset_at)) : null
+    ),
+    top ? el('div', { style: { marginTop: 5 } }, el(Track, { value: Math.min(1, top.used_percent / 100), height: 3, tone })) : null
+  )
+}
 
 // Points are numbers or { v, est }. Drawn as one uniform line; whether a point is estimated is
 // reported in the cell tooltip, not in the stroke.
@@ -3062,7 +3156,7 @@ const HdrView = ({ profile, period }) => {
 // direction of the view arrow, kept across renders (see the header in Body)
 let navDir = 1
 
-const Body = ({ meter, prices, threshold, retries, yaml, profile, profileLabel, refresh, rates, defaultModel, account, onPeriod, cheapest, orProfile = true, orAny = true, view = 'costs', onView, scope = 'all', profileCount = 1, onScope }) => {
+const Body = ({ meter, prices, threshold, retries, yaml, profile, profileLabel, refresh, rates, defaultModel, account, planLimits, onPeriod, cheapest, orProfile = true, orAny = true, view = 'costs', onView, scope = 'all', profileCount = 1, onScope }) => {
   const currentId = useValue(host.state.focusedStoredSessionId) || null
   const [period, setPeriod] = useState(() => sget('period', '7d'))
   const [hover, setHover] = useState(null)
@@ -3321,7 +3415,7 @@ const Body = ({ meter, prices, threshold, retries, yaml, profile, profileLabel, 
     el(
       'div',
       { style: { display: 'flex', alignItems: 'baseline', gap: 10, minHeight: 34, whiteSpace: 'nowrap' } },
-      el(Tip, { label: (est.length ? 'Hermes has no price for ' + est.map(([m]) => m).join(', ') + '; estimated at the OpenRouter price for ' + est.map(([, id]) => id).join(', ') + '. ' : pinfo.unpriced && !headline ? 'Hermes has no price for this provider and no matching OpenRouter price was found. ' : '') + (shown ? 'List-price estimate for that day' : share ? (frac != null ? 'This profile\'s part of the OpenRouter bill (' + fmtUsd(acct) + ' for every profile on the key), by its share of their list cost' + (period === 'today' ? ' over the last 7 days, since one day\'s split is too noisy' : '') : 'No list cost on the key in this window, so this is Hermes\' own estimate') : nonOR > 0 ? 'OpenRouter bill plus the list cost of profiles billed elsewhere (' + fmtUsd(nonOR) + ')' : '') },
+      el(Tip, { label: (est.length ? 'Hermes has no price for ' + est.map(([m]) => m).join(', ') + '; estimated at ' + est.map(([, how]) => how).join(', ') + '. ' : pinfo.unpriced && !headline ? 'Hermes has no price for this provider and no matching OpenRouter price was found. ' : '') + (shown ? 'List-price estimate for that day' : share ? (frac != null ? 'This profile\'s part of the OpenRouter bill (' + fmtUsd(acct) + ' for every profile on the key), by its share of their list cost' + (period === 'today' ? ' over the last 7 days, since one day\'s split is too noisy' : '') : 'No list cost on the key in this window, so this is Hermes\' own estimate') : nonOR > 0 ? 'OpenRouter bill plus the list cost of profiles billed elsewhere (' + fmtUsd(nonOR) + ')' : '') },
         el('span', { style: { fontSize: 26, fontWeight: 500, letterSpacing: '-0.01em', fontVariantNumeric: 'tabular-nums', flex: 'none' } }, (pinfo.unpriced && !est.length && !headline ? 'no price' : fmtUsd(headline, { approx: est.length > 0 || (!shown && ((share && frac != null && frac < 1) || nonOR > 0)) })))),
       provSplit.length > 1
         ? el(Tip, { label: 'List cost by provider: ' + provSplit.map(([k, v]) => k + ' ' + fmtUsd(v)).join(', ') }, el('span', { title: headlineLabel, style: { fontSize: 11, color: C.sub, cursor: 'help', borderBottom: '1px dotted ' + C.faint, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', flex: '0 1 auto' } }, headlineLabel))
@@ -3361,6 +3455,7 @@ const Body = ({ meter, prices, threshold, retries, yaml, profile, profileLabel, 
     lim
       ? el('div', { style: { marginTop: 8 }, title: lim.tip }, el(Track, { value: 1 - lim.share, height: 3, tone: lim.share <= 0.05 ? 'bad' : lim.share < 0.15 ? 'warn' : null }))
       : null,
+    !lim && planLimits ? el(PlanLimits, { limits: planLimits }) : null,
     period === 'today'
       ? el(
           'div',
@@ -4744,7 +4839,7 @@ const ContextGauge = ({ pct, used, max, threshold }) => {
 // ---- chip -------------------------------------------------------------------
 
 const Chip = () => {
-  const { loading, error, data, prices, threshold, retries, yaml, profile, profileLabel, refresh, account, cheapest, orProfile, orAny, scope, profileCount, setScope } = useMeterData()
+  const { loading, error, data, prices, threshold, retries, yaml, profile, profileLabel, refresh, account, limits, cheapest, orProfile, orAny, scope, profileCount, setScope } = useMeterData()
   const defaultModel = useValue(host.state.model) || ''
   const rates = useLive(prices, defaultModel)
   const focusedUsage = useValue(host.state.focusedUsage)
@@ -4857,7 +4952,7 @@ const Chip = () => {
       asks.length
         ? el(AskCard, { key: asks[0].id, ask: asks[0], more: asks.length - 1, onAnswered: id => { asksWaiting.current = Math.max(0, asks.length - 1); setAsks(x => x.filter(a => a.id !== id)); if (asks.length <= 1) setOpen(false) } })
         : data
-        ? el(Body, { meter: data, prices, threshold, retries, yaml, profile, profileLabel, refresh, rates, defaultModel, account, cheapest, orProfile, orAny, onPeriod: setChipPeriod, view, onView: pickView, scope, profileCount, onScope: setScope })
+        ? el(Body, { meter: data, prices, threshold, retries, yaml, profile, profileLabel, refresh, rates, defaultModel, account, planLimits: limits, cheapest, orProfile, orAny, onPeriod: setChipPeriod, view, onView: pickView, scope, profileCount, onScope: setScope })
         : el('div', { style: { padding: 16, fontSize: 12, color: C.sub, width: 240 } }, error ? error : 'Loading…')
     )
   )

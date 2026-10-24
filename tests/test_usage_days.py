@@ -76,6 +76,15 @@ def test_a_session_with_no_replies_stays_on_its_start_day():
     assert r["daily"][0]["day"] == today and r["daily"][0]["estimated_cost"] == 10.0
 
 
+def test_each_model_says_where_it_was_billed():
+    a = session("hop", 0, replies(0))
+    a["row"]["billing_base_url"] = "https://api.hopscotchlabs.ai/v1"
+    b = session("or", 0, replies(0))
+    b["row"]["billing_base_url"] = "https://openrouter.ai/api/v1"
+    r = run(1, [a, b])
+    assert r["by_model"][0]["hosts"] == ["api.hopscotchlabs.ai", "openrouter.ai"]
+
+
 def test_sessions_wholly_before_the_period_are_left_out():
     r = run(1, [session("old", 3, replies(3, 2))])
     assert r["daily"] == [] and r["by_model"] == []

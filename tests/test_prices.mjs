@@ -11,14 +11,18 @@ const line = re => src.match(re)[0]
 const ENDPOINTS = { 'z-ai/glm-5.3': [
   { tag: 'wafer/fp4', name: 'Wafer', in: 0.079, out: 1.4, cache: 0.078 },
   { tag: 'fireworks', name: 'Fireworks', in: 2.1, out: 6.6, cache: 0.39 },
+  { tag: 'fireworks/standard', name: 'Fireworks', in: 1.4, out: 4.4, cache: 0.26 },
   { tag: 'fireworks/turbo', name: 'Fireworks', in: 0.98, out: 3.08, cache: 0.182 },
   { tag: 'z-ai/fp8', name: 'Z.AI', in: 1.4, out: 4.4, cache: 0.26 }
 ] }
-const { priceIdOf, priceOf, loadVendorPrices } = new Function('ENDPOINTS',
+// hopscotchPrice stands in for reading Hopscotch's public model page
+const HOPSCOTCH = { 'fireworks-ai/glm-5p3': { in: 1.4, out: 4.4, cache: 0.26 } }
+const { priceIdOf, priceOf, loadVendorPrices, parseHopscotchPage, priceSource } = new Function('ENDPOINTS', 'HOPSCOTCH',
   ['let priceTail = null', 'let priceTailOf = null', 'const loadEndpoints = async ids => Object.fromEntries(ids.map(id => [id, ENDPOINTS[id] || []]))',
-    grabConst('priceIdOf'), line(/^const vendorPrice = .*$/m), line(/^const providerKey = .*$/m), grabConst('vendorOf'), grabFn('loadVendorPrices'),
-    grabConst('priceOf')].join('\n') + '\nreturn { priceIdOf, priceOf, loadVendorPrices }'
-)(ENDPOINTS)
+    grabConst('priceIdOf'), line(/^const vendorPrice = .*$/m), line(/^const providerKey = .*$/m), grabConst('vendorOf'), 'const hopscotchPrice = async m => HOPSCOTCH[m] || null', line(/^const GATEWAYS = .*$/m), grabConst('parseHopscotchPage'),
+    grabFn('loadVendorPrices'), grabConst('priceSource'),
+    grabConst('priceOf')].join('\n') + '\nreturn { priceIdOf, priceOf, loadVendorPrices, parseHopscotchPage, priceSource }'
+)(ENDPOINTS, HOPSCOTCH)
 
 const prices = { 'z-ai/glm-5.3': {}, 'z-ai/glm-5.3:batch': {}, 'anthropic/claude-fable-5': {}, 'qwen/qwen3-235b-a22b': {} }
 const cases = [
@@ -43,8 +47,19 @@ for (const [name, model, want] of cases) check(name, priceIdOf(prices, model), w
 // list prices are the cheapest provider's; a model named after its provider gets that provider's price
 const list = { 'z-ai/glm-5.3': { in: 0.079, out: 1.4, cache: 0.078 }, 'anthropic/claude-fable-5': { in: 3, out: 15, cache: 0.3 } }
 await loadVendorPrices(['fireworks-ai/glm-5p3', 'z-ai/glm-5.3', 'acme-cloud/glm-5.3', 'anthropic/claude-fable-5'], list)
-check('the provider named in the id, its cheapest endpoint', priceOf(list, 'fireworks-ai/glm-5p3'), { in: 0.98, out: 3.08, cache: 0.182, via: 'Fireworks' })
+check('the provider named in the id, its middle tier', priceOf(list, 'fireworks-ai/glm-5p3'), { in: 1.4, out: 4.4, cache: 0.26, via: 'Fireworks' })
 check('the model\'s own vendor keeps the list price', priceOf(list, 'z-ai/glm-5.3'), list['z-ai/glm-5.3'])
 check('a provider OpenRouter does not list keeps the list price', priceOf(list, 'acme-cloud/glm-5.3'), list['z-ai/glm-5.3'])
 check('same vendor, no endpoint lookup', priceOf(list, 'anthropic/claude-fable-5'), list['anthropic/claude-fable-5'])
+// billed through Hopscotch: Hopscotch's own published price for that id comes first
+await loadVendorPrices([{ model: 'fireworks-ai/glm-5p3', hosts: ['api.hopscotchlabs.ai'] }], list)
+check('a gateway\'s published price first', priceOf(list, 'fireworks-ai/glm-5p3'), { in: 1.4, out: 4.4, cache: 0.26, via: 'Hopscotch', gateway: true })
+check('the tooltip names the gateway', priceSource(list, 'fireworks-ai/glm-5p3'), "Hopscotch's published price for fireworks-ai/glm-5p3")
+
+// the provider rows on Hopscotch's model page, as its prerendered HTML reads once tags are dropped
+const page = '<h1>GLM 5.3</h1><div>DeepInfra <code>deepinfra/GLM-5.3</code> Input / 1M <b>$0.90</b> Output / 1M $4.00 Cache read / 1M N/A</div>' +
+  '<div>Fireworks AI <code>fireworks-ai/glm-5p3</code> Input / 1M $1.40 Output / 1M $4.40 Cache read / 1M $0.26 Speed</div>'
+check('a provider row on the page', parseHopscotchPage(page, 'fireworks-ai/glm-5p3'), { in: 1.4, out: 4.4, cache: 0.26 })
+check('no cached price on the page', parseHopscotchPage(page, 'deepinfra/GLM-5.3'), { in: 0.9, out: 4, cache: null })
+check('an id the page does not list', parseHopscotchPage(page, 'fireworks-ai/glm-5p3-flash'), null)
 process.exit(failed ? 1 : 0)

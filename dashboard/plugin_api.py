@@ -14,6 +14,7 @@ import os
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 
 from fastapi import APIRouter, Body, Query
 
@@ -220,9 +221,30 @@ _ACCOUNT_CACHE: Dict[tuple, tuple] = {}
 _ACCOUNT_TTL_S = 60.0
 
 
+def _account_snapshot(provider):
+    """Hermes' own account report for a provider: OpenRouter, Anthropic and Codex through
+    fetch_account_usage (which also asks provider plugins), Nous through its portal account. Hermes
+    looks up the credential; Hermetic only ever sees the report."""
+    from agent.account_usage import fetch_account_usage
+    if provider == "nous":
+        from agent.account_usage import build_nous_credits_snapshot
+        from hermes_cli.nous_account import get_nous_portal_account_info
+        return build_nous_credits_snapshot(get_nous_portal_account_info(force_fresh=True))
+    return fetch_account_usage(provider)
+
+
+def _snapshot_fields(snap):
+    """The report's limit windows and detail lines, for the popover to show without parsing text."""
+    if not snap:
+        return None
+    return {"title": snap.title, "plan": snap.plan, "details": list(snap.details), "unavailable": snap.unavailable_reason,
+            "windows": [{"label": w.label, "used_percent": w.used_percent, "reset_at": w.reset_at.isoformat() if w.reset_at else None,
+                         "detail": w.detail, "scope": w.scope} for w in snap.windows]}
+
+
 @router.get("/account/usage")
 async def account_usage(profile: Optional[str] = None):
-    from agent.account_usage import fetch_account_usage, render_account_usage_lines
+    from agent.account_usage import render_account_usage_lines
     from hermes_cli.config import load_config_readonly
 
     def _run():
@@ -230,15 +252,19 @@ async def account_usage(profile: Optional[str] = None):
         model_cfg = cfg.get("model") if isinstance(cfg.get("model"), dict) else {}
         provider = str((model_cfg or {}).get("provider") or "").strip()
         if not provider:
-            return {"provider": None, "lines": []}
+            return {"provider": None, "lines": [], "account": None}
         key = (profile or "", provider)
         now = time.monotonic()
         hit = _ACCOUNT_CACHE.get(key)
         if hit and now - hit[0] < _ACCOUNT_TTL_S:
-            return {"provider": provider, "lines": list(hit[1]), "cached": True}
-        lines = render_account_usage_lines(fetch_account_usage(provider))
-        _ACCOUNT_CACHE[key] = (now, lines)
-        return {"provider": provider, "lines": lines, "cached": False}
+            return {"provider": provider, "lines": list(hit[1]), "account": hit[2], "cached": True}
+        try:
+            snap = _account_snapshot(provider)
+        except Exception:
+            snap = None
+        lines, fields = render_account_usage_lines(snap), _snapshot_fields(snap)
+        _ACCOUNT_CACHE[key] = (now, lines, fields)
+        return {"provider": provider, "lines": lines, "account": fields, "cached": False}
 
     return await asyncio.to_thread(_run)
 
@@ -328,6 +354,10 @@ async def usage(days: int = Query(30, ge=1, le=365), profile: Optional[str] = No
                         m[k] += round(int(r.get(k) or 0) * share)
                     m["estimated_cost"] += float(r.get("estimated_cost_usd") or 0) * share
                     m["sessions"] += 1
+                    # where it was billed, so the popover can price a gateway's model at the gateway's rate
+                    host = urlparse(str(r.get("billing_base_url") or "")).hostname
+                    if host and host not in m.setdefault("hosts", []):
+                        m["hosts"].append(host)
                     m["api_calls"] += round(int(r.get("api_call_count") or 0) * share)
                 # background tasks are summed over a whole chain, so ask once per chain (at its start)
                 if started < start:
@@ -2595,7 +2625,6 @@ async def hdr_hooks_reviewed(payload: Dict[str, Any] = Body(default={}), profile
 async def hdr(days: int = Query(7, ge=1, le=90), profile: Optional[str] = None):
     """Everything HDR shows, from Hermes' own records. Recording only."""
     def _run():
-        from urllib.parse import urlparse
         _n, home = _profile_home(profile)
         cfg = _aai_load_cfg() if not profile or profile in ("default", "current") else {}
         if profile and profile not in ("default", "current"):

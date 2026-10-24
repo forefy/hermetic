@@ -17,6 +17,8 @@ It has three views in the same popover: Costs, AAI and HDR. The dots at the top 
 - Spend per day and per session, live $/hour while a turn runs, and the most expensive session.
 - Cache hit rate: how much of each prompt came from the provider's cache, and what cache resets cost you.
 - Pricing drift: what you were billed compared with list prices.
+- What stops your requests: the OpenRouter credits or key limit, a plan's usage windows (Anthropic, OpenAI Codex) with when they reset, or Nous credits, as Hermes reports them.
+- Usage Hermes has no price for (custom endpoints) is estimated: at the gateway's published price when it publishes one (Hopscotch), else at the serving provider's OpenRouter price. A chat's cost is spread over the days it ran, not booked to the day it started.
 - **Providers** (OpenRouter): which providers actually served your calls, where they are based, and your routing rules, with an editor for them.
 <p align="center">
   <img src="docs/hermetic-providers.png" alt="Which model, providers and regions served your calls" width="400">
@@ -86,7 +88,7 @@ Hermetic does not update itself. Catalog installs update from the Hermes Plugins
 - Replays call OpenRouter with the `OPENROUTER_API_KEY` Hermes holds for the profile, read through Hermes' secret scope. They follow your routing rules and appear in your spend like any other call. A replay costs about $0.01 per test; automatic tests stop at $0.50 a day.
 - No API key ever reaches the popover.
 
-**Network.** The popover reads OpenRouter's public model, provider and zero-retention lists. The backend asks Hermes for your OpenRouter account usage (at most every few minutes, OpenRouter profiles only) to show billed spend. Nothing else leaves your machine.
+**Network.** The popover reads OpenRouter's public model, provider and zero-retention lists, and, only for models a profile was billed for through hopscotchlabs.ai, that model's public page on hopscotchlabs.ai for its price (no key; once a day per model). The backend asks Hermes for its account report on the profile's provider (at most every minute): OpenRouter usage and limits, a plan's usage windows for Anthropic and OpenAI Codex, or Nous credits. Hermes looks up the credential for that; Hermetic only receives the report. Nothing else leaves your machine.
 
 **What it reads.** Hermes' session database (read-only, through Hermes' `SessionDB`), `config.yaml`, the skills and their change history, scheduled jobs, SOUL.md and the memory files (sizes and change times), installed plugin sources (to see what each registers), shell hooks in `config.yaml`, Hermes' hook approvals (`shell-hooks-allowlist.json`), gateway hooks in `hooks/`, the hook scripts themselves (a copy of each, as first seen, is kept in `hermetic/hdr/hooks.json` to show later edits), and its own routing records. HDR runs `ps` and `lsof` locally to list ports opened under Hermes.
 
@@ -112,10 +114,11 @@ Everything Hermetic records stays in `$HERMES_HOME/hermetic/` (ratings, tests, r
 | `tests/test_paths.py` | Skill names and version ids from requests never leave Hermetic's folders |
 | `tests/test_session_cache.py` | HDR and AAI re-read only the sessions that changed |
 | `tests/test_usage_days.py` | A chat's cost spread over the days it ran, not just the day it started |
+| `tests/test_account.py` | Plan windows and credits reach the popover as fields, never a credential |
 | `tests/test_config_routes.py` | Config writes reach only the profile Hermes scoped the request to |
 | `tests/test_limits.mjs` | Which OpenRouter limit stops requests first, credits or the key's cap |
 | `tests/test_share.mjs` | One profile's part of an OpenRouter bill shared with other profiles |
-| `tests/test_prices.mjs` | A provider's model id matched to its OpenRouter list price |
+| `tests/test_prices.mjs` | A model's price: a gateway's published rate, the serving provider's OpenRouter rate, or the list price |
 | `tests/test_detect.mjs` | How a profile's provider is read from its config |
 | `scripts/release.sh` | Tests, validates and pushes a release, then prints the catalog entry; `--pr` opens the catalog PR |
 | `catalog/hermetic.yaml.in` | Template for the catalog entry |

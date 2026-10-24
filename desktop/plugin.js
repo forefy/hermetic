@@ -213,12 +213,16 @@ async function loadAnalytics(profiles, days, prices) {
     profiles.map(async p => {
       try {
         const r = await api({ path: OWN + '/usage?days=' + days, profile: p.isDefault ? 'default' : p.name })
-        // a profile Hermes priced at $0 despite tokens (custom endpoints): blend list prices of its models
-        const priced = ((r && r.daily) || []).reduce((a, d) => a + num(d.estimated_cost), 0) > 0
+        // a profile Hermes priced at $0 despite tokens (custom endpoints), or at under a tenth of list price
+        // (it knew the price of a sliver only): blend list prices of its models for every day instead
+        const models = (r && r.by_model) || []
+        const hermesTotal = ((r && r.daily) || []).reduce((a, d) => a + num(d.estimated_cost), 0)
+        const listTotal = models.reduce((a, m) => a + (costAt(priceOf(prices, m.model), m.input_tokens, m.output_tokens, m.cache_read_tokens) || 0), 0)
+        const priced = hermesTotal > 0 && !(listTotal > 0 && hermesTotal < listTotal * 0.1)
         let blend = null
         if (!priced) {
           const w = { in: 0, out: 0, cache: 0, tin: 0, tout: 0, tcache: 0 }
-          for (const m of (r && r.by_model) || []) {
+          for (const m of models) {
             const id = priceIdOf(prices, m.model)
             const pr = id ? prices[id] : null
             const tin = num(m.input_tokens), tout = num(m.output_tokens), tc = num(m.cache_read_tokens)
@@ -232,7 +236,7 @@ async function loadAnalytics(profiles, days, prices) {
         }
         for (const d of (r && r.daily) || []) {
           const cur = daily.get(d.day) || { day: d.day, cost: 0, input: 0, output: 0, cache: 0, calls: 0, sessions: 0 }
-          const dayCost = num(d.estimated_cost) || (blend ? costAt(blend, d.input_tokens, d.output_tokens, d.cache_read_tokens) : 0)
+          const dayCost = blend ? costAt(blend, d.input_tokens, d.output_tokens, d.cache_read_tokens) : num(d.estimated_cost)
           cur.cost += dayCost
           cur.input += num(d.input_tokens)
           cur.output += num(d.output_tokens)
@@ -246,7 +250,8 @@ async function loadAnalytics(profiles, days, prices) {
           const cur = byModel.get(m.model) || { input: 0, output: 0, cost: 0, calls: 0 }
           cur.input += num(m.input_tokens)
           cur.output += num(m.output_tokens)
-          cur.cost += num(m.estimated_cost) || (!priced ? costAt(priceOf(prices, m.model), m.input_tokens, m.output_tokens, m.cache_read_tokens) || 0 : 0)
+          const listed = !priced ? costAt(priceOf(prices, m.model), m.input_tokens, m.output_tokens, m.cache_read_tokens) : null
+          cur.cost += listed != null ? listed : num(m.estimated_cost)
           cur.calls += num(m.api_calls)
           byModel.set(m.model, cur)
           for (const t of m.aux_tasks || []) {
@@ -845,7 +850,9 @@ const priceIdOf = (prices, model) => {
       if (!priceTail.has(t)) priceTail.set(t, id)
     }
   }
-  return priceTail.get(String(model).split('/').pop().toLowerCase()) || null
+  const tail = String(model).split('/').pop().toLowerCase()
+  // Fireworks writes versions with a p for the dot: glm-5p3 is glm-5.3
+  return priceTail.get(tail) || priceTail.get(tail.replace(/(\d)p(\d)/g, '$1.$2')) || null
 }
 const priceOf = (prices, model) => { const id = priceIdOf(prices, model); return id ? prices[id] : null }
 const costAt = (p, input, output, cache) =>

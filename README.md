@@ -114,6 +114,7 @@ Everything Hermetic records stays in `$HERMES_HOME/hermetic/` (ratings, tests, r
 | `tests/test_config_routes.py` | Config writes reach only the profile Hermes scoped the request to |
 | `tests/test_limits.mjs` | Which OpenRouter limit stops requests first, credits or the key's cap |
 | `tests/test_share.mjs` | One profile's part of an OpenRouter bill shared with other profiles |
+| `tests/test_prices.mjs` | A provider's model id matched to its OpenRouter list price |
 | `tests/test_detect.mjs` | How a profile's provider is read from its config |
 | `scripts/release.sh` | Tests, validates and pushes a release, then prints the catalog entry; `--pr` opens the catalog PR |
 | `catalog/hermetic.yaml.in` | Template for the catalog entry |

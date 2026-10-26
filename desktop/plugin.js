@@ -2487,17 +2487,30 @@ const AaiSettings = ({ profile, ratings }) => {
   if (!st) return aSmall('Loading…')
   const on = st.judge_checks === 'on'
   const ready = ratings.total >= 20 && ratings.low >= 5
-  const check = async () => { setBusy(true); try { setRes(await aaiPost(profile, '/judge')) } finally { setBusy(false) } }
+  const check = async () => {
+    setBusy(true)
+    try { setRes(await aaiPost(profile, '/judge')); setSt(await aaiGet(profile, '/settings')) } finally { setBusy(false) }
+  }
+  const trustTip = 'Trusted when it agrees with your stars (20 ratings, 5 of them low) and fails most replies you corrected, which are wrong answers in your agent\'s own fluent style. Until then, automatic revert ignores its verdict.'
+  const verdict = res && res.n != null
+    ? 'agrees on ' + res.agree + ' of ' + res.decided + (res.corrected ? ', fails ' + res.caught + ' of ' + res.corrected + ' you corrected' : '') + (res.trusted ? ', trusted' : ', not trusted yet')
+    : st.judge_trust ? (st.judge_trusted ? 'trusted' : 'not trusted yet') : null
+  const trusted = res && res.n != null ? res.trusted : st.judge_trusted
   return el('div', null,
     el(AaiGate, { profile }),
     el('div', { style: { borderTop: '1px solid ' + C.stroke, marginTop: 12, paddingTop: 10 } },
       el('label', { style: { display: 'flex', gap: 8, alignItems: 'center', fontSize: 11.5, color: C.text, cursor: 'pointer' } },
         el('input', { type: 'checkbox', checked: on, onChange: async () => setSt(await aaiPost(profile, '/settings', { judge_checks: on ? 'off' : 'on' })) }),
-        'Grade replays with a judge model', el(InfoDot, { tip: 'Another model reads each replayed reply and says pass or fail. The first time a skill is graded, its rubric is written from the skill itself. About $0.0001 per test.' })),
+        'Grade replays with a judge model', el(InfoDot, { tip: 'A model reads each replayed reply and says pass or fail. The first time a skill is graded, its rubric is written from the skill itself. About $0.0001 per test.' })),
+      st.judge_runs_on
+        ? el('div', { style: { display: 'flex', gap: 6, alignItems: 'center', marginTop: 6, fontSize: 11, color: st.judge_same_family ? C.warn : C.dim } },
+            'Runs on ' + st.judge_runs_on + (st.judge_same_family ? ', the same family as your agent' : ''),
+            st.judge_same_family ? el(InfoDot, { tip: 'A judge from the agent\'s own family tends to like its style. Hermes runs plugin calls on your main model; to judge with another, allow it in config.yaml under plugins.entries.hermetic.llm (allow_model_override, allowed_models).' }) : null)
+        : null,
       ready
-        ? el('div', { style: { display: 'flex', gap: 10, alignItems: 'center', marginTop: 8 } },
+        ? el('div', { style: { display: 'flex', gap: 10, alignItems: 'center', marginTop: 8, flexWrap: 'wrap' } },
             el(BigBtn, { ghost: true, onClick: check, disabled: busy }, busy ? 'Checking…' : 'Check the judge against your stars'),
-            res && res.n != null ? el('span', { style: { fontSize: 11, color: res.trusted ? C.ok : C.warn } }, 'agrees on ' + res.agree + ' of ' + res.n + (res.trusted ? ', trusted' : ', not trusted yet')) : null)
+            verdict ? el('span', { style: { display: 'inline-flex', gap: 6, alignItems: 'center', fontSize: 11, color: trusted ? C.ok : C.warn } }, verdict, el(InfoDot, { tip: trustTip })) : null)
         : null))
 }
 

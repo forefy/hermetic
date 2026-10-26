@@ -75,7 +75,7 @@ It has three views in the same popover: Costs, AAI and HDR. The dots at the top 
 - **Tests**: every saved test as a tile, coloured by its last result. Replay them all with your current routing. From 5 tests on, compare your two most-used providers and a second model on the same tests.
 - **Timeline**: skill changes made by chats and by the background review, routing changes, rate-limit days and Hermetic's own actions. Changes that added links, code blocks or script files are flagged.
 - **Changed skills**: every saved version of a skill, and a replay to compare two of them.
-- **Settings**: test skill changes automatically when the background review makes them (off, ask me, or revert), and grade replays with a judge model. Each skill's grading rubric is written from the skill itself the first time it is graded.
+- **Settings**: test skill changes automatically when the background review makes them (off, ask me, or revert), and grade replays with a judge model. Each skill's grading rubric is written from the skill itself the first time it is graded. The judge runs on your main model unless you allow another (below), and the popover says when that is the agent's own model family. Check it against your stars: it is trusted when it agrees with your ratings (20, 5 of them low) and fails most replies you corrected, which are wrong answers in your agent's own fluent style. Until then, automatic revert ignores its verdict.
 
 <p align="center">
   <img src="docs/hermetic-aai-settings.png" alt="Changed skills and settings for automatic tests and the judge" width="400">

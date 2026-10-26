@@ -2765,6 +2765,102 @@ async def hdr_hooks_reviewed(payload: Dict[str, Any] = Body(default={}), profile
     return await asyncio.to_thread(_run)
 
 
+_HDR_OP_RANK = {"write": 3, "code": 2, "read": 1}
+
+
+def _hdr_job(sid, title):
+    """(key, label) a touch is marked expected under: a scheduled job's id for all its runs, else the chat."""
+    m = _aai_re.match(r"^(cron_[0-9a-f]+)_\d{8}_\d{6}$", str(sid or ""))
+    if m:
+        return m.group(1), str(title or "").split(" \u00b7 ")[0]
+    return str(sid or ""), str(title or "")
+
+
+_HDR_SECRET = _aai_re.compile(r"(?i)((?:pass(?:word|wd)?|pw|secret|token|api[_-]?key|auth(?:orization)?|bearer|cookie)\s*[=: ]\s*['\"]?(?:bearer\s+)?)(?![~/$.])([^\s'\"&;|)]{4,})"
+                              r"|\b(sk-[A-Za-z0-9_-]{8,}|gh[pousr]_[A-Za-z0-9]{12,}|xox[abpr]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_.-]+|[A-Za-z0-9+_-]{40,})")
+
+
+def _hdr_mask(text):
+    """Hide values that look like passwords, tokens or keys typed into a command, so the row can be shown or shared."""
+    return _HDR_SECRET.sub(lambda m: (m.group(1) + "\u2022\u2022\u2022") if m.group(1) else "\u2022\u2022\u2022", text)
+
+
+def _hdr_snippet(name, args, path):
+    """The line of the command or code that named the path, so a row can show what actually ran."""
+    if name in _HDR.FILE_TOOLS:
+        return name + " " + path
+    text = str((args or {}).get("command") or (args or {}).get("code") or "")
+    full = os.path.expanduser(path) if path.startswith("~/") else path
+    for ln in text.splitlines():
+        at = ln.find(path) if path in ln else ln.find(full)
+        if at >= 0:
+            start = max(0, at - 60)
+            cut = ln[start:start + 200].strip()
+            return _hdr_mask(("\u2026" if start else "") + cut + ("\u2026" if start + 200 < len(ln) else ""))
+    return ""
+
+
+def _hdr_expected_file(home):
+    return _data_dir(home) / "hdr" / "expected.json"
+
+
+def _hdr_expected_read(home):
+    try:
+        rows = _aai_json.loads(_hdr_expected_file(home).read_text(encoding="utf-8"))
+    except Exception:
+        rows = []
+    return [r for r in rows if isinstance(r, dict) and r.get("path") and r.get("key")]
+
+
+def _hdr_group_sensitive(hits, expected_rows):
+    """One row per path (its riskiest use), and apart from them the reads the user marked expected for a job or chat.
+    Only reads are ever set aside: a write, or a read from anywhere else, still shows."""
+    marks = {(e["path"], e["key"]) for e in expected_rows}
+    rows, quiet = {}, {}
+    for x in hits:
+        key, label = _hdr_job(x.get("sid"), x.get("chat"))
+        if x["op"] == "read" and (x["path"], key) in marks:
+            g = quiet.setdefault((x["path"], key), {"path": x["path"], "why": x["why"], "key": key, "label": label, "times": 0, "ts": 0})
+            g["times"] += 1
+            g["ts"] = max(g["ts"], x["ts"])
+            continue
+        g = rows.get(x["path"])
+        if g is None:
+            g = rows[x["path"]] = dict(x, times=0, chats=[], tools=[], ops=[], ts=0)
+        g["times"] += 1
+        if _HDR_OP_RANK.get(x["op"], 0) > _HDR_OP_RANK.get(g["op"], 0):
+            g["op"] = x["op"]
+        g["score"] = max(g["score"], x["score"])
+        for k, v in (("chats", label), ("tools", x["tool"]), ("ops", x["op"])):
+            if v not in g[k]:
+                g[k].append(v)
+        if x["ts"] >= g["ts"]:
+            g.update(ts=x["ts"], sid=x.get("sid"), snippet=x.get("snippet") or g.get("snippet"), tool=x["tool"], key=key, label=label)
+    out = sorted(rows.values(), key=lambda r: (-r["score"], -r["ts"]))
+    return out, sorted(quiet.values(), key=lambda r: -r["ts"])
+
+
+@router.post("/hdr/expected")
+async def hdr_expected(payload: Dict[str, Any] = Body(default={}), profile: Optional[str] = None):
+    """Mark reads of a path by one scheduled job (or one chat) as expected, or undo that."""
+    path, key = str((payload or {}).get("path") or "")[:400], str((payload or {}).get("key") or "")[:200]
+    if not path or not key:
+        return {"ok": False, "error": "path and key are needed"}
+
+    def _run():
+        _n, home = _profile_home(profile)
+        rows = [r for r in _hdr_expected_read(home) if (r["path"], r["key"]) != (path, key)]
+        if not (payload or {}).get("undo"):
+            rows.append({"path": path, "key": key, "label": str((payload or {}).get("label") or "")[:200], "ts": time.time()})
+        p = _hdr_expected_file(home)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix(".json.tmp")
+        tmp.write_text(_aai_json.dumps(rows), encoding="utf-8")
+        os.replace(tmp, p)
+        return {"ok": True, "expected": len(rows)}
+    return await asyncio.to_thread(_run)
+
+
 @router.get("/hdr")
 async def hdr(days: int = Query(7, ge=1, le=90), profile: Optional[str] = None):
     """Everything HDR shows, from Hermes' own records. Recording only."""
@@ -2810,7 +2906,8 @@ async def hdr(days: int = Query(7, ge=1, le=90), profile: Optional[str] = None):
                     # reading keys is risky in itself; reading startup or system folders is mostly inspection
                     score = _hdr_score(s[0], s[1], op)
                     call_guarded = call_guarded or _HDR.guarded({"why": s[0], "op": op})
-                    sensitive.append({"path": p, "op": op, "tool": name, "chat": title, "ts": ts, "why": s[0], "score": score})
+                    sensitive.append({"path": p, "op": op, "tool": name, "chat": title, "ts": ts, "why": s[0], "score": score,
+                                      "sid": sid, "snippet": _hdr_snippet(name, args, p)})
             if call_guarded:
                 risky_calls += 1
             if name == "memory":
@@ -2880,19 +2977,13 @@ async def hdr(days: int = Query(7, ge=1, le=90), profile: Optional[str] = None):
         prompt_files = _hdr_watch(home, [p for p in watched if p.is_file() and not p.name.endswith(".lock")])
         plugins = _hdr_plugins(home, cfg)
 
-        grouped = {}
-        for x in sensitive:
-            g = grouped.setdefault((x["path"], x["op"]), dict(x, times=0, chats=[]))
-            g["times"] += 1
-            g["ts"] = max(g["ts"], x["ts"])
-            if x["chat"] not in g["chats"]:
-                g["chats"].append(x["chat"])
-        sensitive = sorted(grouped.values(), key=lambda s: (-s["score"], -s["ts"]))
+        sensitive, expected = _hdr_group_sensitive(sensitive, _hdr_expected_read(home))
         roots = sorted(files.items(), key=lambda kv: -kv[1])
         return {
             "days": days, "learning": learning, "learning_since": first_call,
             "domains": domains,
-            "files": {"roots": [{"root": r, "touches": n} for r, n in roots[:12]], "total": sum(files.values()), "sensitive": sensitive[:30]},
+            "files": {"roots": [{"root": r, "touches": n} for r, n in roots[:12]], "total": sum(files.values()), "sensitive": sensitive[:30],
+                      "expected": expected[:30]},
             "runs": {"jobs": jobs, "processes": procs if isinstance(procs, list) else [], "services": services, "subagents": subagents},
             "prompt": {"files": prompt_files, "memory_writes": mem_writes[-20:], "skill_edits": skill_edits,
                        "limits": {"MEMORY.md": (cfg.get("memory") or {}).get("memory_char_limit"), "USER.md": (cfg.get("memory") or {}).get("user_char_limit")},

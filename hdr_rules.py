@@ -52,6 +52,50 @@ def op(cmd, raw):
     return "read"
 
 
+# Code that only looks at a path: every line naming it runs one of these read-only commands (or a read-only
+# Python call), and nothing anywhere in the code could write. Anything else stays "code", which counts as a write.
+READ_CMD = re.compile(r"^(sudo\s+)?(ls|cat|head|tail|stat|file|wc|grep|egrep|rg|find|readlink|du|md5|shasum|mdls|test|\[|"
+                      r"plutil\s+-(p|lint)|defaults\s+read|xattr\s+-l|codesign\s+-d\w*|launchctl\s+(list|print)|crontab\s+-l)(\s|$)")
+FILTERS = re.compile(r"^(grep|egrep|head|tail|sort|uniq|wc|cut|awk|tr|column|less|cat)(\s|$)")
+READ_CALL = re.compile(r"(os\.listdir|os\.scandir|os\.walk|os\.path\.\w+|glob\.glob|\.read_text|\.read_bytes|\.exists|"
+                       r"\.iterdir|\.is_file|\.is_dir|\.stat)\(|\bopen\([^,()]*(,\s*['\"]r[bt]?['\"])?\s*\)")
+WRITES = re.compile(r"open\([^)]*['\"][wax]|\.write_(text|bytes)\(|\.(unlink|rename|replace|symlink_to|hardlink_to|chmod|mkdir|touch|rmdir|write)\(|"
+                    r"\bshutil\.|\bos\.(remove|unlink|rename|replace|makedirs|mkdir|chmod|chown|symlink|link|rmdir|truncate)\b|plistlib\.dump|"
+                    r"\b(rm|cp|mv|touch|chmod|chown|ln|install|ditto|rsync|tee|truncate|mkdir|rmdir|unlink|dd)\s|sed\s+-i|"
+                    r"launchctl\s+(load|unload|bootstrap|bootout|enable|disable|submit|remove|kickstart)|defaults\s+(write|delete|import)|"
+                    r"plutil\s+-(convert|replace|insert|remove|create)|>>|-delete\b|-exec\b|osascript|\bcurl\b[^\n]*\s-o|\bwget\b|"
+                    r"(?<![-=<>!])>\s*['\"]?[~/$]")
+QUIET = re.compile(r"\d?&?>\s*/dev/null|\d>&\d")
+LIT = re.compile(r"[rRfFbBuU]{0,2}(['\"])(.*?)\1")
+
+
+def _read_only_cmd(cmd):
+    segs = [x.strip() for x in re.split(r"\|\||&&|[|;]", cmd) if x.strip()]
+    return bool(segs) and bool(READ_CMD.match(segs[0])) and all(READ_CMD.match(x) or FILTERS.match(x) for x in segs[1:])
+
+
+def code_op(code, raw):
+    """read when the code only lists or reads this path with known read-only commands and writes nothing
+    anywhere; otherwise code (treated as a write: what code does with a path can't be told for sure)."""
+    clean = QUIET.sub(" ", str(code or ""))
+    if WRITES.search(clean):
+        return "code"
+    lines = [ln for ln in clean.splitlines() if raw in ln]
+    for ln in lines:
+        lits = [b for _q, b in LIT.findall(ln) if raw in b]
+        if not lits:
+            if not READ_CALL.search(ln):
+                return "code"
+        for b in lits:
+            b = b.strip()
+            if b.startswith(raw):  # the literal is the path itself: fine only when the line reads it
+                if not READ_CALL.search(ln):
+                    return "code"
+            elif not _read_only_cmd(b):
+                return "code"
+    return "read" if lines else "code"
+
+
 def flatten(calls):
     """(name, args) for every tool call, opening the batch wrapper `tool_call`."""
     for t in calls if isinstance(calls, list) else []:
@@ -89,7 +133,7 @@ def sensitive(p):
 
 
 def score(why, base, how):
-    """Writing (or code using the path) adds 10; reading keys keeps the base; other reads are 30."""
+    """Writing (or code using the path in a way that may write) adds 10; reading keys keeps the base; other reads are 30."""
     return min(100, base + 10) if how in ("write", "code") else (base if why in CRED else 30)
 
 
@@ -107,7 +151,7 @@ def touches(name, args):
         texts.append(cmd)
     elif name in ("execute_code", "browser_exec"):
         code = str(args.get("code") or "")
-        paths += [(tilde(m.group(1)), "code") for m in PATH.finditer(code)]
+        paths += [(tilde(m.group(1)), code_op(code, m.group(1))) for m in PATH.finditer(code)]
         texts.append(code)
     else:
         texts += [v if isinstance(v, str) else json.dumps(v) for v in args.values() if isinstance(v, (str, list))]
@@ -119,7 +163,7 @@ def touches(name, args):
 def guarded(hit):
     """Whether the guard acts on one touch: only what Hermes does not check itself. Reading keys and
     logins (Hermes checks no plain reads), writing startup items, and writing key places Hermes does
-    not list; code that names such a place counts as both."""
+    not list; code that names such a place counts as both, unless it only reads it (code_op)."""
     why, how = hit.get("why"), hit.get("op")
     if why in STARTUP:
         return how in ("write", "code")

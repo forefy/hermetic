@@ -2982,8 +2982,32 @@ const HdrDomains = ({ list }) => {
 }
 
 // Files and secrets: one bar for where tools worked, then the sensitive places as tiles by kind
-const HDR_KIND = w => /keys|login|keychain|vault/i.test(w) ? 'Keys and logins' : /starts programs/.test(w) ? 'Startup items' : /every shell/.test(w) ? 'Shell settings' : 'System'
-const HdrFiles = ({ files, secrets }) => {
+const HDR_KIND = w => /starts programs/.test(w) ? 'Startup items' : /keys|login|keychain|vault/i.test(w) ? 'Keys and logins' : /every shell/.test(w) ? 'Shell settings' : 'System'
+const HDR_GUARD_DOES = { watch: 'recorded only (guard at Watch)', ask: 'the guard asks you first', block: 'the guard blocks them' }
+const hdrOps = s => (s.ops || [s.op]).map(o => (o === 'code' ? 'used in code' : o === 'write' ? 'written' : 'read'))
+const HdrPlace = ({ s, profile, guard, onChanged }) => {
+  const [open, setOpen] = useState(false)
+  const [busy, setBusy] = useState(false)
+  const kind = HDR_KIND(s.why)
+  const level = HDR_GUARD_DOES[(guard && guard.level) || 'watch']
+  const guardLine = kind === 'Startup items' ? 'Writes here: ' + level : kind === 'Keys and logins' ? 'Reads and writes here: ' + level : 'Writes here: Hermes asks first'
+  const expect = async () => {
+    setBusy(true)
+    try { await api(profileReq(profile, { path: '/api/plugins/hermetic/hdr/expected', method: 'POST', body: { path: s.path, key: s.key, label: s.label } })); onChanged && onChanged() } finally { setBusy(false) }
+  }
+  const sub = [...new Set(hdrOps(s))].join(', ') + ' by ' + (s.tools || [s.tool]).join(', ') + (s.times > 1 ? ', ' + s.times + ' times' : '') + ' in ' + s.chats.slice(0, 2).join(', ')
+  return el('div', { style: { borderTop: '1px solid ' + C.stroke } },
+    el('button', { type: 'button', onClick: () => setOpen(!open), 'aria-expanded': open, style: { display: 'flex', alignItems: 'center', gap: 8, width: '100%', padding: '5px 0', background: 'transparent', border: 0, color: 'inherit', font: 'inherit', fontSize: 11.5, textAlign: 'left', cursor: 'pointer', minWidth: 0 } },
+      hdrGrow(el('span', { className: 'mono', style: { fontSize: 10.5 } }, s.path), sub), hdrScore(s.score)),
+    open ? el('div', { style: { display: 'flex', flexDirection: 'column', gap: 7, padding: '2px 0 10px' } },
+      s.snippet ? el('div', { className: 'mono', style: { fontSize: 10.5, lineHeight: 1.5, color: C.text, background: 'rgba(0,0,0,.25)', border: '1px solid ' + C.stroke, borderRadius: 7, padding: '7px 9px', whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' } }, s.snippet) : null,
+      s.op === 'code' ? el('div', { style: { fontSize: 10.5, color: C.dim } }, 'Code named this place in a way that could write, so it counts as a write.') : null,
+      el('div', { style: { fontSize: 10.5, color: C.dim } }, guardLine),
+      el('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 10, alignItems: 'center' } },
+        s.op === 'read' && s.key ? el(BigBtn, { ghost: true, onClick: expect, disabled: busy }, busy ? 'Saving…' : 'Expected for ' + s.label) : null,
+        el(AaiOpenLink, { profile, sessionId: s.sid, label: 'Open the chat' }))) : null)
+}
+const HdrFiles = ({ files, secrets, profile, guard, onChanged }) => {
   const [open, setOpen] = useState(null)
   const roots = files.roots.slice(0, 5)
   const rest = files.total - roots.reduce((a, r) => a + r.touches, 0)
@@ -2993,6 +3017,8 @@ const HdrFiles = ({ files, secrets }) => {
   const tiles = ['Keys and logins', 'Startup items', 'Shell settings', 'System'].map(k => ({ k, list: kinds[k] || [] }))
   const vault = secrets.vault.length
   const sel = open && open !== 'Vault' ? (kinds[open] || []) : null
+  const quiet = open && open !== 'Vault' ? (files.expected || []).filter(e => HDR_KIND(e.why) === open) : []
+  const undo = e => api(profileReq(profile, { path: '/api/plugins/hermetic/hdr/expected', method: 'POST', body: { path: e.path, key: e.key, undo: true } })).then(() => onChanged && onChanged()).catch(() => {})
   return el('div', null,
     el('div', { style: { display: 'flex', height: 10, borderRadius: 5, overflow: 'hidden', gap: 2 } }, parts.map(p => el(Tip, { key: p.label, label: p.label + ', ' + p.n.toLocaleString() + ' touches' }, el('span', { style: { flex: p.n, background: p.color, opacity: 0.8, cursor: 'help' } })))),
     el('div', { style: { display: 'flex', flexWrap: 'wrap', gap: '4px 12px', marginTop: 7 } }, parts.map(p => el('span', { key: p.label, style: { display: 'inline-flex', alignItems: 'center', gap: 5, fontSize: 10.5, color: C.sub } },
@@ -3009,7 +3035,10 @@ const HdrFiles = ({ files, secrets }) => {
           el('div', { style: { fontSize: 10.5, color: C.sub, marginTop: 1 } }, t.k),
           el('div', { style: { fontSize: 10, color: writes ? C.bad : C.dim, marginTop: 2 } }, t.k === 'Vault' ? (n ? 'browser vault uses' : 'not used') : n ? (writes ? writes + ' written' : 'read only') : 'untouched'))
       })),
-    sel ? el('div', { style: { marginTop: 8 } }, sel.map((s, i) => hdrLine('s' + i, hdrGrow(el('span', { className: 'mono', style: { fontSize: 10.5 } }, s.path), s.op + ' by ' + s.tool + (s.times > 1 ? ', ' + s.times + ' times' : '') + ' in ' + s.chats.slice(0, 2).join(', ')), hdrScore(s.score)))) : null,
+    sel ? el('div', { style: { marginTop: 8 } }, sel.map(s => el(HdrPlace, { key: s.path, s, profile, guard, onChanged }))) : null,
+    quiet.length ? el('div', { style: { marginTop: 8 } },
+      el(Tip, { label: 'Reads you marked as expected for a job or chat. A write here, or a read from anywhere else, still shows above.' }, el('span', { style: { fontSize: 10.5, color: C.dim, cursor: 'help' } }, 'Expected')),
+      quiet.map(e => hdrLine('q' + e.path + e.key, hdrGrow(el('span', { className: 'mono', style: { fontSize: 10.5, color: C.sub } }, e.path), 'read ' + e.times + (e.times > 1 ? ' times' : ' time') + ' by ' + e.label), el(ALink, { onClick: () => undo(e) }, 'Undo')))) : null,
     open === 'Vault' ? el('div', { style: { marginTop: 8 } }, [...new Set(secrets.vault.map(v => v.chat))].map(c => hdrLine(c, hdrGrow(c), el('span', { style: { color: C.sub, paddingRight: 4 } }, secrets.vault.filter(v => v.chat === c).length)))) : null)
 }
 
@@ -3244,7 +3273,7 @@ const HdrView = ({ profile, period }) => {
     d.guard ? el(Section, { id: 'hdr-guard', title: 'Guard', right: guardRight(d.guard) }, el(HdrGuard, { g: d.guard, profile, days, onChanged: () => setTick(t => t + 1) })) : null,
     d.hooks ? el(Section, { id: 'hdr-hooks', title: 'Hooks', right: el('span', { style: { display: 'flex', gap: 8 } }, d.hooks.hooks.filter(hookFlagged).length || d.hooks.auto_accept ? el('span', { style: { color: C.warn } }, (d.hooks.hooks.filter(hookFlagged).length || 'auto-accept') + (d.hooks.hooks.filter(hookFlagged).length ? ' to look at' : '')) : null, String(d.hooks.hooks.length)) }, el(HdrHooks, { h: d.hooks, profile, onChanged: () => setTick(t => t + 1) })) : null,
     el(Section, { id: 'hdr-net', title: 'Where data went', right: el('span', { style: { display: 'flex', gap: 8 } }, newDom ? el('span', { style: { color: C.warn } }, newDom + ' new') : null, String(d.domains.length)) }, el(HdrDomains, { list: d.domains })),
-    el(Section, { id: 'hdr-files', title: 'Files and secrets', right: risky.length || d.secrets.vault.length ? el('span', { style: { color: C.warn } }, risky.length + ' sensitive' + (d.secrets.vault.length ? '   ' + d.secrets.vault.length + ' vault' : '')) : null }, el(HdrFiles, { files: d.files, secrets: d.secrets })),
+    el(Section, { id: 'hdr-files', title: 'Files and secrets', right: risky.length || d.secrets.vault.length ? el('span', { style: { color: C.warn } }, risky.length + ' sensitive' + (d.secrets.vault.length ? '   ' + d.secrets.vault.length + ' vault' : '')) : null }, el(HdrFiles, { files: d.files, secrets: d.secrets, profile, guard: g, onChanged: () => { viewCache.delete(ck); setTick(t => t + 1) } })),
     el(Section, { id: 'hdr-runs', title: 'What runs on its own', right: exposed ? el('span', { style: { color: C.bad } }, exposed + ' open') : String(d.runs.jobs.length + d.runs.services.length) }, el(HdrRuns, { runs: d.runs })),
     el(Section, { id: 'hdr-prompt', title: 'What shapes every prompt', right: full.length ? el('span', { style: { color: C.warn } }, full.length + ' nearly full') : d.prompt.files.some(f => f.changed) ? el('span', { style: { color: C.warn } }, 'changed') : null }, el(HdrPrompt, { prompt: d.prompt })),
     el(Section, { id: 'hdr-plugins', title: 'Plugins and middleware', right: d.plugins.some(p => p.undeclared.length) ? el('span', { style: { color: C.bad } }, 'undeclared') : String(d.plugins.filter(p => p.enabled).length) }, el(HdrPipeline, { list: d.plugins })),

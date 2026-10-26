@@ -22,6 +22,11 @@
 | <a href="https://twitter.com/forefy" title="Forefy on Twitter">Twitter</a>
 </p>
 
+<p align="center">
+<a href="docs/hermetic-demo.mp4" title="Watch the 33-second demo"><img src="docs/hermetic-demo-poster.png" alt="Watch the 33-second demo" width="800"/></a>
+<br/><a href="docs/hermetic-demo.mp4">Watch the 33-second demo</a>
+</p>
+
 ## What is Hermetic
 
 Hermetic is a status-bar popover for the [Hermes](https://github.com/NousResearch/hermes-agent) desktop app. It shows what your agent costs, whether its skills and replies are getting better or worse, and what the harness itself touched.

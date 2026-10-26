@@ -203,6 +203,33 @@ def _session_days(msgs):
     return out
 
 
+# Hermes' proactive prune defaults: it summarizes tool results over 8,000 characters and leaves the last
+# 20 messages alone (compression.proactive_prune_min_result_chars, compression.protect_last_n).
+_PRUNE_MIN_CHARS = 8000
+_PRUNE_PROTECT = 20
+
+
+def _session_bulk(msgs):
+    """(tokens re-sent, tokens of old big tool output) for one session: every tool result over 8,000
+    characters, counted once for each model call more than 20 messages after it, the calls a prune
+    would have spared it. Characters / 4 as tokens; the active history only, so what compaction already
+    removed is not counted."""
+    import bisect
+    replies = [i for i, m in enumerate(msgs) if m.get("role") == "assistant"]
+    resent = bulky = 0
+    for i, m in enumerate(msgs):
+        if m.get("role") != "tool":
+            continue
+        size = len(str(m.get("content") or ""))
+        if size <= _PRUNE_MIN_CHARS:
+            continue
+        later = len(replies) - bisect.bisect_right(replies, i + _PRUNE_PROTECT)
+        if later > 0:
+            bulky += size // 4
+            resent += (size // 4) * later
+    return resent, bulky
+
+
 def _sessions_store(profile):
     return str(_profile_home(profile)[1] / "state.db")
 
@@ -391,12 +418,15 @@ async def sessions(days: int = Query(30, ge=1, le=365), profile: Optional[str] =
                     "actual_cost_usd", "billing_provider", "billing_base_url", "started_at")
             counts = ("api_call_count", "message_count", "input_tokens", "output_tokens", "cache_read_tokens", "reasoning_tokens")
             rows = []
+            store = _sessions_store(profile)
             for r in _db_sessions(db, cutoff):
                 if not r.get("api_call_count"):
                     continue
                 row = {k: r.get(k) for k in keys}
                 row.update({k: r.get(k) or 0 for k in counts})
                 row["last_activity_at"] = r.get("last_active") or r.get("last_activity_at") or r.get("started_at")
+                # old big tool output it kept re-sending, for the Costs fix that weighs Hermes' prune
+                row["bulk_resent_tokens"], row["bulk_tokens"] = _per_session(db, store, r, "bulk", _session_bulk)
                 rows.append(row)
             rows.sort(key=lambda r: -(r["actual_cost_usd"] or r["estimated_cost_usd"] or 0))
             rows = rows[:1000]

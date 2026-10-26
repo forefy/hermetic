@@ -85,6 +85,16 @@ def test_each_model_says_where_it_was_billed():
     assert r["by_model"][0]["hosts"] == ["api.hopscotchlabs.ai", "openrouter.ai"]
 
 
+def test_old_big_tool_output_is_counted_per_later_call():
+    big = {"role": "tool", "content": "x" * 40_000}  # 10k tokens, over the 8,000-character prune size
+    small = {"role": "tool", "content": "x" * 4_000}
+    msgs = [big, small] + [{"role": "assistant"}] * 50
+    resent, bulky = api._session_bulk(msgs)
+    # the 20 messages after it are Hermes' protected tail; the replies at positions 21 to 51 come after that
+    assert bulky == 10_000 and resent == 10_000 * 31, (resent, bulky)
+    assert api._session_bulk([big] + [{"role": "assistant"}] * 20) == (0, 0), "nothing past the protected tail"
+
+
 def test_sessions_wholly_before_the_period_are_left_out():
     r = run(1, [session("old", 3, replies(3, 2))])
     assert r["daily"] == [] and r["by_model"] == []

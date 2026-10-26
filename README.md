@@ -62,7 +62,7 @@ It has three views in the same popover: Costs, AAI and HDR. The dots at the top 
   <img src="docs/hermetic-routing-rules.png" alt="OpenRouter routing rules editor" width="400">
 </p>
 
-- **Improve**: one-click config fixes, for example routing to the cheapest provider, running background tasks on a cheaper model, or turning fallback on when calls fail on rate limits. Every fix shows the exact `config.yaml` change before it writes anything, and writes on top of the config as it is at that moment.
+- **Improve**: one-click config fixes, for example routing to the cheapest provider, running background tasks on a cheaper model, turning fallback on when calls fail on rate limits, or turning on Hermes' proactive prune of old tool output when, at the prices your chats were actually served, the re-sends it saves outweigh the full-price re-send each prune causes. Every fix shows the exact `config.yaml` change before it writes anything, and writes on top of the config as it is at that moment.
 
 ## AAI (applied-AI quality)
 
@@ -155,6 +155,7 @@ Everything Hermetic records stays in `$HERMES_HOME/hermetic/` (ratings, tests, r
 | `tests/test_limits.mjs` | Which OpenRouter limit stops requests first, credits or the key's cap |
 | `tests/test_share.mjs` | One profile's part of an OpenRouter bill shared with other profiles |
 | `tests/test_prices.mjs` | A model's price: a gateway's published rate, the serving provider's OpenRouter rate, or the list price |
+| `tests/test_prune.mjs` | Whether Hermes' proactive prune pays at the served prices, and the config change that turns it on |
 | `tests/test_detect.mjs` | How a profile's provider is read from its config |
 | `scripts/release.sh` | Tests, validates and pushes a release, then prints the catalog entry; `--pr` opens the catalog PR |
 | `catalog/hermetic.yaml.in` | Template for the catalog entry |

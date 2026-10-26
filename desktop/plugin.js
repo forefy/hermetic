@@ -295,7 +295,9 @@ const mapSessionRow = (s, profile) => ({
   last: num(s.last_active) || num(s.last_activity_at) || num(s.started_at),
   active: !!s.is_active,
   provider: s.billing_provider || '',
-  base: s.billing_base_url || ''
+  base: s.billing_base_url || '',
+  bulkResent: num(s.bulk_resent_tokens),
+  bulky: num(s.bulk_tokens)
 })
 
 async function loadSessions(profiles) {
@@ -414,6 +416,19 @@ function configUsesOpenRouter(yaml) {
   if (provider === 'openrouter' || /openrouter\.ai/i.test(modelKey(yaml, 'base_url'))) return true
   if (!provider || provider === 'auto') return null
   return false
+}
+
+// A number under compression: in config.yaml, or null when it is not set there.
+function compressionValue(yaml, key) {
+  const lines = String(yaml).split('\n')
+  const i = lines.findIndex(l => /^compression:\s*$/.test(l))
+  if (i < 0) return null
+  for (let j = i + 1; j < lines.length; j++) {
+    if (/^[A-Za-z_]/.test(lines[j])) break
+    const m = lines[j].match(new RegExp('^\\s+' + key + ':\\s*([0-9.]+)'))
+    if (m) return parseFloat(m[1])
+  }
+  return null
 }
 
 function parseThreshold(yaml) {
@@ -1007,7 +1022,25 @@ function liveRates(prices, fallbackModel) {
 
 // ---- model ------------------------------------------------------------------
 
-function computeModel(data, period, hoverDay, prices, threshold, defaultModel, billed) {
+// Per model, the fresh and cached input rates of the providers that actually served it, weighted by the
+// prompt tokens each one took (from the routing records and OpenRouter's per-provider prices). Models with
+// no record are left out, and the caller falls back to the list price.
+function servedRates(data) {
+  const acc = new Map()
+  for (const r of (data && data.routing && data.routing.rows) || []) {
+    const e = ((data.endpoints || {})[r.model] || []).find(x => x.name === r.upstream)
+    const w = num(r.input) + num(r.cache)
+    if (!e || !w) continue
+    const a = acc.get(r.model) || { w: 0, in: 0, cache: 0 }
+    a.w += w
+    a.in += w * e.in
+    a.cache += w * (e.cache != null ? e.cache : e.in)
+    acc.set(r.model, a)
+  }
+  return new Map(Array.from(acc, ([m, a]) => [m, { in: a.in / a.w, cache: a.cache / a.w }]))
+}
+
+function computeModel(data, period, hoverDay, prices, threshold, defaultModel, billed, pruneOn) {
   const pdata = (data.periods && data.periods[period]) || { aux: new Map(), byModel: new Map(), total: 0 }
   const days = period === 'today' ? lastNDays(1) : period === '7d' ? lastNDays(7) : lastNDays(DEFAULT_DAYS)
   const dayset = new Set(days)
@@ -1147,6 +1180,37 @@ function computeModel(data, period, hoverDay, prices, threshold, defaultModel, b
       approx: true,
       action: 'apply',
       change: { kind: 'threshold', value: target }
+    })
+  // Hermes' proactive prune (compression.proactive_prune_tokens) stops re-sending old big tool output,
+  // but each prune rewrites history, so the next call pays full price for everything after it. Weigh
+  // both per chat at the rates of the providers that actually served it (OpenRouter's list price is its
+  // cheapest provider's, often with no cache discount), and offer it only when the profile comes out
+  // ahead overall: pruning is one setting for every chat, the ones it would cost included.
+  const served = servedRates(data)
+  let pruneNet = 0, pruneSave = 0, pruneChats = 0
+  if (!pruneOn) {
+    for (const s of enriched) {
+      if (!s.bulkResent || !s.calls) continue
+      const p = served.get(s.model) || s.price
+      if (!p) continue
+      const cached = p.cache != null ? p.cache : p.in
+      const save = (s.bulkResent * cached) / 1e6
+      const prunes = Math.max(1, Math.ceil(s.bulky / 48000))
+      const cost = (prunes * s.ctxPerCall * Math.max(0, p.in - cached)) / 1e6
+      pruneNet += save - cost
+      if (save > cost) { pruneSave += save - cost; pruneChats++ }
+    }
+  }
+  if (pruneNet > 0.1)
+    improvements.push({
+      id: 'prune',
+      label: 'Prune old tool output (' + pruneChats + (pruneChats === 1 ? ' chat gains' : ' chats gain') + ')',
+      save: pruneNet,
+      approx: true,
+      action: 'apply',
+      tip: 'Old tool results over 8,000 characters are re-sent on every later call. Pruning them saves ' + fmtUsd(pruneSave) +
+        ' where it pays, after the full-price re-send each prune causes, and ' + fmtUsd(pruneNet) + ' across all chats.',
+      change: { kind: 'compression', key: 'proactive_prune_tokens', value: '48000' }
     })
   improvements.sort((a, b) => b.save - a.save)
 
@@ -1820,6 +1884,27 @@ const Section = ({ id, title, right, children, openTick }) => {
 function buildYamlChange(yaml, change) {
   const lines = String(yaml).split('\n')
   const diff = []
+  if (change.kind === 'compression') {
+    const i = lines.findIndex(l => /^compression:\s*$/.test(l))
+    const line = '  ' + change.key + ': ' + change.value
+    if (i < 0) {
+      diff.push({ from: null, to: 'compression:\n' + line })
+      lines.push('', 'compression:', line)
+      return { yaml: lines.join('\n'), diff }
+    }
+    for (let j = i + 1; j < lines.length; j++) {
+      if (/^[A-Za-z_]/.test(lines[j])) break
+      const m = lines[j].match(new RegExp('^(\\s+' + change.key + ':\\s*)(\\S+)(.*)$'))
+      if (m) {
+        diff.push({ from: lines[j], to: m[1] + change.value + m[3] })
+        lines[j] = m[1] + change.value + m[3]
+        return { yaml: lines.join('\n'), diff }
+      }
+    }
+    diff.push({ from: null, to: line })
+    lines.splice(i + 1, 0, line)
+    return { yaml: lines.join('\n'), diff }
+  }
   if (change.kind === 'threshold') {
     const i = lines.findIndex(l => /^compression:\s*$/.test(l))
     if (i >= 0) {
@@ -2019,7 +2104,7 @@ const Improve = ({ items, yaml, profile, onApplied }) => {
           ),
           item.metric != null
             ? el(Tip, { label: item.tip || '' }, el('div', { style: { fontSize: 11, textAlign: 'right', color: C.warn, fontVariantNumeric: 'tabular-nums', whiteSpace: 'nowrap', cursor: 'help' } }, item.metric))
-            : el('div', { style: { fontSize: 12, textAlign: 'right', color: C.text, fontVariantNumeric: 'tabular-nums' } }, fmtUsd(item.save, { approx: item.approx })),
+            : el(Tip, { label: item.tip || '' }, el('div', { style: { fontSize: 12, textAlign: 'right', color: C.text, fontVariantNumeric: 'tabular-nums', cursor: item.tip ? 'help' : undefined } }, fmtUsd(item.save, { approx: item.approx }))),
           el(
             'button',
             {
@@ -3186,7 +3271,8 @@ const Body = ({ meter, prices, threshold, retries, yaml, profile, profileLabel, 
     }
     return out
   }, [account, scope, meter])
-  const m = useMemo(() => computeModel(meter, period, focus, prices, threshold, defaultModel, billed), [meter, period, focus, prices, threshold, defaultModel, billed])
+  const pruneOn = (compressionValue(yaml, 'proactive_prune_tokens') || 0) > 0
+  const m = useMemo(() => computeModel(meter, period, focus, prices, threshold, defaultModel, billed, pruneOn), [meter, period, focus, prices, threshold, defaultModel, billed, pruneOn])
 
   const liveRate = rates.reduce((a, r) => a + r.rate, 0)
   const agents = rates.length

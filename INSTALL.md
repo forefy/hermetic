@@ -9,7 +9,7 @@ Hermes installs plugins switched off by default. The install command below turns
 
 ## Install
 
-From the Hermes plugin catalog, once it is listed there:
+From the [Hermes plugin catalog](https://hermes-agent.nousresearch.com/docs/plugins/hermetic):
 
 ```bash
 hermes plugins install hermetic --enable

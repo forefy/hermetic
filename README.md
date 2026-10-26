@@ -1,8 +1,44 @@
-# hermetic
+# Costs, quality and security for Hermes Desktop
 
-A status-bar popover for the [Hermes](https://github.com/NousResearch/hermes-agent) desktop app. It shows what your agent costs, whether its skills and replies are getting better or worse, and what the harness itself touched.
+<p align="center">
+<a href="https://hermes-agent.nousresearch.com/docs/plugins/hermetic"><img src="docs/hermetic-banner.png" alt="Hermetic" title="Hermetic" width="800"/></a>
+</p>
 
-**Install:** `hermes plugins install hermetic --enable` from the Hermes plugin catalog once it is listed, or `hermes plugins install forefy/hermetic --enable --force` from GitHub. Then see [INSTALL.md](INSTALL.md) (two more steps, and how to check it worked).
+<p align="center">
+<a href="https://hermes-agent.nousresearch.com/docs/plugins/hermetic"><img alt="Hermetic in the Hermes plugin catalog" title="Hermetic in the Hermes plugin catalog" src="https://img.shields.io/badge/dynamic/yaml?url=https%3A%2F%2Fraw.githubusercontent.com%2FNousResearch%2Fhermes-agent%2Fmain%2Fplugin-catalog%2Fhermetic.yaml&query=%24.version&label=Hermes%20catalog&prefix=v&color=a87bff"></a>
+<a href="https://hermes-agent.nousresearch.com/docs/plugins/hermetic"><img alt="Minimum Hermes version" title="Minimum Hermes version" src="https://img.shields.io/badge/dynamic/yaml?url=https%3A%2F%2Fraw.githubusercontent.com%2FNousResearch%2Fhermes-agent%2Fmain%2Fplugin-catalog%2Fhermetic.yaml&query=%24.requires_hermes&label=requires%20Hermes&color=6d8cff"></a>
+<a href="LICENSE"><img alt="License" title="License" src="https://img.shields.io/github/license/forefy/hermetic"></a>
+<img alt="Hermetic GitHub commit activity" title="Hermetic GitHub commit activity" src="https://img.shields.io/github/commit-activity/m/forefy/hermetic">
+<img alt="GitHub last commit" title="GitHub last commit" src="https://img.shields.io/github/last-commit/forefy/hermetic">
+<img alt="Hermetic GitHub repo size" title="Hermetic GitHub repo size" src="https://img.shields.io/github/repo-size/forefy/hermetic">
+<a href="https://github.com/forefy/hermetic/issues"><img alt="Issues" title="Issues" src="https://img.shields.io/github/issues-raw/forefy/hermetic"></a>
+</p>
+
+<p align="center">
+<a href="https://hermes-agent.nousresearch.com/docs/plugins/hermetic" title="Hermetic in the Hermes plugin catalog">Catalog listing</a>
+| <a href="INSTALL.md" title="Install Hermetic">Install</a>
+| <a href="https://github.com/forefy/hermetic/issues/new" title="Report a bug">Report a bug</a>
+| <a href="https://github.com/forefy/hermetic/issues/new?labels=enhancement" title="Request a feature">Feature request</a>
+| <a href="https://twitter.com/forefy" title="Forefy on Twitter">Twitter</a>
+</p>
+
+## What is Hermetic
+
+Hermetic is a status-bar popover for the [Hermes](https://github.com/NousResearch/hermes-agent) desktop app. It shows what your agent costs, whether its skills and replies are getting better or worse, and what the harness itself touched.
+
+```bash
+hermes plugins install hermetic --enable
+```
+
+Then see [INSTALL.md](INSTALL.md) for the two remaining steps and how to check it worked.
+
+- [Costs](#costs)
+- [AAI (applied-AI quality)](#aai-applied-ai-quality)
+- [HDR (harness detection and response)](#hdr-harness-detection-and-response)
+- [Install](#install)
+- [What it does on your machine](#what-it-does-on-your-machine)
+- [Layout](#layout)
+- [Releasing](#releasing)
 
 It has three views in the same popover: Costs, AAI and HDR. The dots at the top right show which one you are on, and the arrow steps through them.
 
@@ -73,7 +109,7 @@ Next: a low-cost judge that checks web pages and new skills before the model rea
 hermes plugins install hermetic --enable
 ```
 
-That is the catalog install, once Hermetic is listed. From GitHub, use `hermes plugins install forefy/hermetic --enable --force`: `--force` is needed there because Hermes' install scan flags the list of sensitive paths HDR watches, and [INSTALL.md](INSTALL.md) explains it. Then restart Hermes and switch on Hermetic's **Desktop** half under Capabilities, Plugins. Hermes installs it switched off, so this is the step that makes the button appear. [INSTALL.md](INSTALL.md) has the steps, what you should see when it worked, and fixes for what can go wrong.
+That is the catalog install, the reviewed version listed in the [Hermes plugin catalog](https://hermes-agent.nousresearch.com/docs/plugins/hermetic). For the latest commit straight from GitHub, use `hermes plugins install forefy/hermetic --enable --force`: `--force` is needed there because Hermes' install scan flags the list of sensitive paths HDR watches, and [INSTALL.md](INSTALL.md) explains it. Then restart Hermes and switch on Hermetic's **Desktop** half under Capabilities, Plugins. Hermes installs it switched off, so this is the step that makes the button appear. [INSTALL.md](INSTALL.md) has the steps, what you should see when it worked, and fixes for what can go wrong.
 
 Hermetic does not update itself. Catalog installs update from the Hermes Plugins page or with `hermes plugins update hermetic`; GitHub installs update by running the install command again.
 

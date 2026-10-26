@@ -24,8 +24,6 @@
 
 https://github.com/user-attachments/assets/9edb1fa1-7460-437f-a577-f987e93c1042
 
-[Watch the 33-second demo on GitHub](https://github.com/forefy/hermetic#readme)
-
 ## What is Hermetic
 
 Hermetic is a status-bar popover for the [Hermes](https://github.com/NousResearch/hermes-agent) desktop app. It shows what your agent costs, whether its skills and replies are getting better or worse, and what the harness itself touched.

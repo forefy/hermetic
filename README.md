@@ -35,10 +35,8 @@ Then see [INSTALL.md](INSTALL.md) for the two remaining steps and how to check i
 - [Costs](#costs)
 - [AAI (applied-AI quality)](#aai-applied-ai-quality)
 - [HDR (harness detection and response)](#hdr-harness-detection-and-response)
-- [Install](#install)
 - [What it does on your machine](#what-it-does-on-your-machine)
-- [Layout](#layout)
-- [Releasing](#releasing)
+- [Updates](#updates)
 
 It has three views in the same popover: Costs, AAI and HDR. The dots at the top right show which one you are on, and the arrow steps through them.
 
@@ -81,8 +79,6 @@ It has three views in the same popover: Costs, AAI and HDR. The dots at the top 
   <img src="docs/hermetic-aai-settings.png" alt="Changed skills and settings for automatic tests and the judge" width="400">
 </p>
 
-Parts that only make sense with OpenRouter (provider routing, provider comparison, fallback) hide themselves when the profile does not use it. Spend, cache, sessions, ratings, corrections, the timeline and skill history work with any provider. Fix drafts and the judge go through Hermes' own model access for plugins, on your main model. Replays rerun a test on a chosen model and provider through OpenRouter, so they need an OpenRouter key set up in Hermes.
-
 ## HDR (harness detection and response)
 
 What the harness touched and how exposed it is. It records and shows everything, and its guard can ask you or block before the riskiest tool calls.
@@ -100,18 +96,6 @@ What the harness touched and how exposed it is. It records and shows everything,
 - **What runs on its own**: scheduled jobs with their schedule and next run, ports opened under Hermes and the chats that opened them, subagents and background processes.
 - **What shapes every prompt**: SOUL.md and the memory files against Hermes' own size limits, when each last changed, and memory and skill writes made from chats.
 - **Plugins and middleware**: where each enabled plugin acts on the path of a model request and of a tool call, and anything it registers without declaring it.
-
-Next: a low-cost judge that checks web pages and new skills before the model reads them.
-
-## Install
-
-```bash
-hermes plugins install hermetic --enable
-```
-
-That is the catalog install, the reviewed version listed in the [Hermes plugin catalog](https://hermes-agent.nousresearch.com/docs/plugins/hermetic). For the latest commit straight from GitHub, use `hermes plugins install forefy/hermetic --enable --force`: `--force` is needed there because Hermes' install scan flags the list of sensitive paths HDR watches, and [INSTALL.md](INSTALL.md) explains it. Then restart Hermes and switch on Hermetic's **Desktop** half under Capabilities, Plugins. Hermes installs it switched off, so this is the step that makes the button appear. [INSTALL.md](INSTALL.md) has the steps, what you should see when it worked, and fixes for what can go wrong.
-
-Hermetic does not update itself. Catalog installs update from the Hermes Plugins page or with `hermes plugins update hermetic`; GitHub installs update by running the install command again.
 
 ## What it does on your machine
 
@@ -134,42 +118,9 @@ Hermetic does not update itself. Catalog installs update from the Hermes Plugins
 
 Everything Hermetic records stays in `$HERMES_HOME/hermetic/` (ratings, tests, replay results, saved skill versions, routing history).
 
-## Layout
-
-| Path | What it is |
-|---|---|
-| `desktop/plugin.js` | The popover: plain ESM for the Hermes plugin SDK, no build step |
-| `__init__.py` | Hooks and middleware: per-call cost and routing records, provider errors, empty-reply debugging |
-| `dashboard/plugin_api.py` | Backend routes under `/api/plugins/hermetic/` |
-| `hdr_rules.py` | What a tool call touches and how risky it is; shared by HDR and the guard |
-| `plugin.yaml` | Package manifest |
-| `tests/test_hdr.py` | HDR detection rules |
-| `tests/test_guard.py` | The guard: what it asks about, blocks and lets through |
-| `tests/test_hooks.py` | Hooks monitoring, and the routes behind the guard's own Ask |
-| `tests/test_credentials.py` | Hermetic's own model calls go through Hermes (`ctx.llm`, secret scope) |
-| `tests/test_paths.py` | Skill names and version ids from requests never leave Hermetic's folders |
-| `tests/test_session_cache.py` | HDR and AAI re-read only the sessions that changed |
-| `tests/test_usage_days.py` | A chat's cost spread over the days it ran, not just the day it started |
-| `tests/test_account.py` | Plan windows and credits reach the popover as fields, never a credential |
-| `tests/test_config_routes.py` | Config writes reach only the profile Hermes scoped the request to |
-| `tests/test_limits.mjs` | Which OpenRouter limit stops requests first, credits or the key's cap |
-| `tests/test_share.mjs` | One profile's part of an OpenRouter bill shared with other profiles |
-| `tests/test_prices.mjs` | A model's price: a gateway's published rate, the serving provider's OpenRouter rate, or the list price |
-| `tests/test_prune.mjs` | Whether Hermes' proactive prune pays at the served prices, and the config change that turns it on |
-| `tests/test_detect.mjs` | How a profile's provider is read from its config |
-| `scripts/release.sh` | Tests, validates and pushes a release, then prints the catalog entry; `--pr` opens the catalog PR |
-| `catalog/hermetic.yaml.in` | Template for the catalog entry |
-
-Run the Python tests inside Hermes' environment, and the rest with node:
-
-```bash
-bash ~/.hermes/hermes-agent/scripts/run-in-hermes-env python3 tests/test_hdr.py
-node tests/test_detect.mjs
-node tests/test_limits.mjs
-```
 
 Check the package with `hermes plugins validate .`
 
-## Releasing
+## Updates
 
-Bump `version` in `plugin.yaml`, commit, then run `scripts/release.sh --pr`. It runs the tests and Hermes' validation, pushes, fills the catalog entry with the new commit, and opens the pin-bump PR on NousResearch/hermes-agent from your fork, asking before it pushes and before it opens the PR. Catalog users get the update once a maintainer merges it.
+Hermes auto-manages plugin updates for you after installation, from this repo we bump `version` in `plugin.yaml`, commit, then run `scripts/release.sh --pr`. It runs the tests and Hermes' validation, pushes, fills the catalog entry with the new commit, and opens the pin-bump PR on NousResearch/hermes-agent. Catalog users get the update once a maintainer merges it.

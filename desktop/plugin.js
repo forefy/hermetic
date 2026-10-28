@@ -2247,6 +2247,24 @@ const aaiPost = async (profile, path, body) => {
 }
 const aaiGet = (profile, path) => api(profileReq(profile, { path: '/api/plugins/hermetic/aai' + path }))
 const aSmall = t => el('span', { style: { fontSize: 10.5, color: C.dim } }, t)
+
+// What a view shows while its first copy loads (a restart reads weeks of sessions): faint blocks in the
+// view's shape that breathe slowly, held still when the system asks for reduced motion.
+function ViewSkeleton() {
+  const ref = useRef(null)
+  useEffect(() => {
+    const node = ref.current
+    if (!node || !node.animate || (window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches)) return
+    const a = node.animate([{ opacity: 0.45 }, { opacity: 1 }, { opacity: 0.45 }], { duration: 1600, iterations: Infinity, easing: 'ease-in-out' })
+    return () => a.cancel()
+  }, [])
+  const bar = (w, h, extra) => el('div', { style: Object.assign({ width: w, height: h, borderRadius: 4, background: C.track }, extra) })
+  return el('div', { ref, role: 'status', 'aria-label': 'Loading', style: { marginTop: 14, display: 'flex', flexDirection: 'column', gap: 10 } },
+    el('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(3, minmax(0, 1fr))', gap: 8 } },
+      [0, 1, 2].map(i => bar('100%', 54, { key: i, borderRadius: 8 }))),
+    bar('40%', 10, { marginTop: 4 }),
+    ['92%', '78%', '85%', '64%'].map((w, i) => bar(w, 10, { key: i })))
+}
 const aTd = (v, color, left) => el('td', { style: { textAlign: left ? 'left' : 'right', color: color || C.sub, borderTop: '1px solid ' + C.stroke, padding: '4px 0', whiteSpace: 'nowrap', maxWidth: left ? 150 : undefined, overflow: 'hidden', textOverflow: 'ellipsis' } }, v)
 const aTable = (cols, rows) =>
   el('table', { style: { width: '100%', borderCollapse: 'collapse', fontSize: 11, fontVariantNumeric: 'tabular-nums', marginTop: 6 } },
@@ -2805,7 +2823,7 @@ const AaiView2 = ({ profile, period, yaml, orProfile, auxOn, onChanged }) => {
     return () => { live = false }
   }, [profile, days, tick])
   if (err) return el('div', { style: { fontSize: 11, color: C.faint, marginTop: 14 } }, err)
-  if (!data) return el('div', { style: { fontSize: 11, color: C.faint, marginTop: 14 } }, 'Loading…')
+  if (!data) return el(ViewSkeleton)
 
   const facts = configFacts(yaml)
   const recentCut = Date.now() / 1000 - 14 * 86400
@@ -3254,7 +3272,7 @@ const HdrView = ({ profile, period }) => {
     return () => { live = false }
   }, [profile, days, tick])
   if (err) return el('div', { style: { fontSize: 11, color: C.faint, marginTop: 14 } }, err)
-  if (!d) return el('div', { style: { fontSize: 11, color: C.faint, marginTop: 14 } }, 'Loading…')
+  if (!d) return el(ViewSkeleton)
   const g = d.guard || { level: 'watch', stops: [], risky_calls: 0 }
   const stopped = (g.stops || []).length
   const newDom = d.domains.filter(x => x.new).length

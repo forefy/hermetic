@@ -38,14 +38,23 @@ def host_ok(h):
     return len(last) == 2 or last in TLDS
 
 
+# Fixed patterns, with the path checked as a plain string after each match: a pattern built per path
+# missed re's cache on every call and made the first HDR load take seconds.
+REDIRECT = re.compile(r"(>>?|\btee(\s+-a)?)\s*['\"]?")
+EDITS = re.compile(r"\b(rm|chmod|chown|touch|mkdir|truncate|sed\s+-i\S*)\b")
+SEP = re.compile(r"[|;&\n]")
+SEPS = re.compile(r"[|;&\n]+")
+
+
 def op(cmd, raw):
     """write when the command redirects into, edits, or copies onto this path; otherwise read."""
-    q = re.escape(raw)
-    if re.search(r"(>>?|\btee(\s+-a)?)\s*['\"]?" + q, cmd):
+    if any(cmd.startswith(raw, m.end()) for m in REDIRECT.finditer(cmd)):
         return "write"
-    if re.search(r"\b(rm|chmod|chown|touch|mkdir|truncate|sed\s+-i\S*)\b[^|;&\n]*" + q, cmd):
-        return "write"
-    for seg in re.split(r"[|;&\n]+", cmd):
+    for m in EDITS.finditer(cmd):
+        at, stop = cmd.find(raw, m.end()), SEP.search(cmd, m.end())
+        if at >= 0 and (stop is None or at <= stop.start()):
+            return "write"
+    for seg in SEPS.split(cmd):
         toks = seg.split()
         if toks and toks[0] in ("cp", "mv", "install", "rsync", "ln", "ditto") and toks[-1].strip("'\"") == raw:
             return "write"

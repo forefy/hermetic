@@ -1271,7 +1271,7 @@ def _aai_call(model, messages, tools=None, provider=None, max_tokens=1500, json_
         body["reasoning"] = reasoning
     req = _aai_urlreq.Request(base + "/chat/completions", data=_aai_json.dumps(body).encode(),
                               headers={"Authorization": "Bearer " + rp["api_key"], "Content-Type": "application/json",
-                                       "X-Title": "Hermetic AAI"})
+                                       "X-Title": "hermetic AAI"})
     t0 = time.time()
     import random as _rnd
     import urllib.error as _uerr

@@ -164,8 +164,8 @@ let pluginOs = null // ctx.os, for the guard's macOS notifications
 const inflight = new Map() // identical reads already on their way share one request
 const api = req => {
   const path = String(req.path || '')
-  if (!path.startsWith(OWN)) return Promise.reject(new Error('Not a Hermetic route: ' + path))
-  if (!pluginRest) return Promise.reject(new Error('Hermetic is still loading'))
+  if (!path.startsWith(OWN)) return Promise.reject(new Error('Not a hermetic route: ' + path))
+  if (!pluginRest) return Promise.reject(new Error('hermetic is still loading'))
   let rel = path.slice(OWN.length) || '/'
   if (!/[?&]profile=/.test(rel)) rel += (rel.includes('?') ? '&' : '?') + 'profile=' + encodeURIComponent(req.profile || 'default')
   const go = () => pluginRest(rel, { method: req.method, body: req.body, timeoutMs: req.timeoutMs })
@@ -2464,7 +2464,7 @@ const AaiVersions = ({ profile, skills, noTests }) => {
           el('tr', { key: v.sha },
             aTd(v.sha.slice(0, 7) + (v.current ? ' (current)' : ''), v.current ? C.text : C.sub, true),
             aTd(v.ts ? (typeof v.ts === 'number' ? ago(v.ts) : String(v.ts).slice(5, 16).replace('T', ' ')) : '–', C.dim),
-            aTd(v.actor === 'agent' ? 'chat' : v.actor === 'curator' ? 'review' : v.actor || 'Hermetic', C.dim),
+            aTd(v.actor === 'agent' ? 'chat' : v.actor === 'curator' ? 'review' : v.actor || 'hermetic', C.dim),
             aTd(el('input', { type: 'checkbox', checked: pick.includes(v.sha), onChange: () => toggle(v.sha) }))))),
     data && data.versions.length > 1 && noTests
       ? el('div', { style: { marginTop: 6 } }, aSmall('Keep a test for this skill to compare versions on it.'))
@@ -2752,7 +2752,7 @@ const TestTiles = ({ profile, cases, onChanged, providers = [], altModel, auxOn,
     cases.length >= 5 && providers.length ? el(CompareProviders, { profile, providers, altModel, auxOn, onApplied }) : null)
 }
 
-const TL_KINDS = [['skills', 'skills', C.ok], ['flagged', 'flagged', C.warn], ['routing', 'routing', C.sub], ['providers', 'providers', C.bad], ['Hermetic', 'Hermetic', 'var(--ui-accent)']]
+const TL_KINDS = [['skills', 'skills', C.ok], ['flagged', 'flagged', C.warn], ['routing', 'routing', C.sub], ['providers', 'providers', C.bad], ['hermetic', 'hermetic', 'var(--ui-accent)']]
 const tlKind = t => (t.who === 'chat' || t.who === 'review' ? 'skills' : t.who === 'config' ? 'routing' : t.who)
 const TimelineView = ({ items }) => {
   const [show, setShow] = useState(() => new Set(TL_KINDS.map(k => k[0])))
@@ -2854,7 +2854,7 @@ const AaiView2 = ({ profile, period, yaml, orProfile, auxOn, onChanged }) => {
   const timeline = []
     .concat(data.events.map(e => ({ ts: e.ts, what: e.skill + ' ' + (e.action === 'create' ? 'created' : 'changed'), who: e.actor === 'agent' ? 'chat' : 'review', tip: e.actor === 'agent' ? 'changed in chat ' + (e.session || '') : 'changed by the background review' })))
     .concat(data.routing.filter(x => !x.first).map(x => ({ ts: x.ts, what: 'Routing rules changed', who: 'config', tip: JSON.stringify(x.routing) })))
-    .concat(data.work.map(w => ({ ts: w.ts, what: w.job === 'archive' ? (w.undo ? 'Unarchived ' : 'Archived ') + w.skills.length + ' skills' : w.job === 'fallback' ? 'Fallback turned on' : w.job === 'prefer' ? 'Routing: ' + w.detail + ' tried first' : w.job === 'ship' ? 'Shipped a new ' + (w.skill || 'skill') + ' version' : w.job === 'revert' ? 'Reverted ' + (w.skill || 'a skill') : w.job, who: 'Hermetic', tip: w.skills ? w.skills.join(', ') : w.detail || '' })))
+    .concat(data.work.map(w => ({ ts: w.ts, what: w.job === 'archive' ? (w.undo ? 'Unarchived ' : 'Archived ') + w.skills.length + ' skills' : w.job === 'fallback' ? 'Fallback turned on' : w.job === 'prefer' ? 'Routing: ' + w.detail + ' tried first' : w.job === 'ship' ? 'Shipped a new ' + (w.skill || 'skill') + ' version' : w.job === 'revert' ? 'Reverted ' + (w.skill || 'a skill') : w.job, who: 'hermetic', tip: w.skills ? w.skills.join(', ') : w.detail || '' })))
   const errDays = {}
   for (const e of limits) { const d = new Date(e.ts * 1000).toDateString(); errDays[d] = errDays[d] || { ts: e.ts, n: 0, p: {} }; errDays[d].n++; errDays[d].p[e.provider] = (errDays[d].p[e.provider] || 0) + 1 }
   for (const v of Object.values(errDays)) timeline.push({ ts: v.ts, what: v.n + ' rate limits', who: 'providers', tip: Object.entries(v.p).map(([k, n]) => k + ' ' + n).join(', ') })
@@ -3130,7 +3130,7 @@ const guardRight = g => {
 }
 const guardFoot = g => !g || g.level === 'watch' ? 'Recording only: nothing is blocked or changed.'
   : g.level === 'block' ? 'Guard on: risky calls are blocked unless your rules allow them.'
-  : 'Guard on: Hermetic asks you before risky calls.'
+  : 'Guard on: hermetic asks you before risky calls.'
 const HdrGuard = ({ g, profile, days, onChanged }) => {
   const [busy, setBusy] = useState(false)
   const [err, setErr] = useState(null)
@@ -3155,7 +3155,7 @@ const HdrGuard = ({ g, profile, days, onChanged }) => {
     el('div', { style: { display: 'flex', alignItems: 'center', gap: 10 } },
       el(SegmentedControl, { value: g.level, onChange: level => level !== g.level && post({ level }), options: GUARD_OPTIONS }),
       busy ? aSmall('Saving…') : null),
-    g.level === 'ask' ? el('div', { style: { fontSize: 10.5, color: C.dim, marginTop: 8, lineHeight: 1.45 } }, 'Hermetic asks you here, or with a macOS notification when Hermes is in the background. No answer in 20 seconds, or nobody at Hermes (scheduled jobs), blocks the call.') : null,
+    g.level === 'ask' ? el('div', { style: { fontSize: 10.5, color: C.dim, marginTop: 8, lineHeight: 1.45 } }, 'hermetic asks you here, or with a macOS notification when Hermes is in the background. No answer in 20 seconds, or nobody at Hermes (scheduled jobs), blocks the call.') : null,
     el('div', { style: { fontSize: 10.5, color: C.dim, marginTop: 6 } }, effect),
     err ? el('div', { style: { fontSize: 10.5, color: C.bad, marginTop: 6 } }, err) : null,
     rules.length ? el('div', { style: { marginTop: 10 } },
@@ -3225,7 +3225,7 @@ const AskCard = ({ ask, more, onAnswered }) => {
       el('span', { style: { width: 30, height: 30, borderRadius: 8, flex: 'none', background: 'rgba(201,147,74,.16)', color: C.warn, display: 'flex', alignItems: 'center', justifyContent: 'center', fontWeight: 600 } }, '!'),
       el('div', { style: { minWidth: 0 } },
         el('div', { style: { fontSize: 12.5, fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, 'The agent wants to ' + (ask.op === 'read' ? 'read ' : ask.op === 'write' ? 'write ' : 'use ') + ask.path),
-        el('div', { style: { fontSize: 10.5, color: C.dim } }, 'Hermetic guard: Hermes doesn’t check this itself'))),
+        el('div', { style: { fontSize: 10.5, color: C.dim } }, 'hermetic guard: Hermes doesn’t check this itself'))),
     el('div', { style: { display: 'grid', gridTemplateColumns: '62px minmax(0,1fr)', gap: '2px 8px', marginTop: 10, fontSize: 11 } },
       ...kv('tool', ask.tool), ...kv('chat', ask.chat || '-'), ...kv('profile', ask.profile || 'default'), ...kv('why', ask.why)),
     el('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginTop: 10, fontSize: 10.5, color: C.dim } }, 'Rule for', el(SegmentedControl, { value: scope, onChange: setScope, options: scopes })),
@@ -3506,7 +3506,7 @@ const Body = ({ meter, prices, threshold, retries, yaml, profile, profileLabel, 
   const head = el(
     'div',
     { style: { display: 'flex', alignItems: 'center', gap: 8 } },
-    el('span', { style: { fontSize: 11, color: C.sub } }, 'Hermetic', el('span', { style: { color: C.dim, marginLeft: 6 } }, VIEWS[vi][1])),
+    el('span', { style: { fontSize: 11, color: C.sub } }, 'hermetic', el('span', { style: { color: C.dim, marginLeft: 6 } }, VIEWS[vi][1])),
     el('span', { style: { flex: 1 } }),
     el(SegmentedControl, {
       value: period,
@@ -5056,7 +5056,7 @@ const Chip = () => {
         'button',
         {
           type: 'button',
-          title: asks.length ? 'Hermetic guard: ' + asks.length + (asks.length === 1 ? ' question waits' : ' questions wait') + ' for your answer' : error ? 'Hermetic: ' + error : loading ? 'Hermetic: loading' : 'Hermetic, ' + periodName + ', ' + fmtUsd(spend) + (account ? '' : backendPatched ? ' (Hermes estimate)' : ' (Hermes estimate, backend plugin off)'),
+          title: asks.length ? 'hermetic guard: ' + asks.length + (asks.length === 1 ? ' question waits' : ' questions wait') + ' for your answer' : error ? 'hermetic: ' + error : loading ? 'hermetic: loading' : 'hermetic, ' + periodName + ', ' + fmtUsd(spend) + (account ? '' : backendPatched ? ' (Hermes estimate)' : ' (Hermes estimate, backend plugin off)'),
           className: cn(
             'inline-flex h-full items-center gap-2 px-2 text-[0.6875rem] transition-colors',
             'hover:bg-(--chrome-action-hover)',
@@ -5088,7 +5088,7 @@ const Chip = () => {
 
 export default {
   id: ID,
-  name: 'Hermetic',
+  name: 'hermetic',
   register(ctx) {
     carryOverLegacyStorage()
     store = ctx.storage

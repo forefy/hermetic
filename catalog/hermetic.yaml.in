@@ -8,7 +8,7 @@ maintainer: forefy
 tier: community
 category: desktop
 docs_url: https://github.com/forefy/hermetic#readme
-title: "Hermetic"
+title: "hermetic"
 image: https://raw.githubusercontent.com/forefy/hermetic/{{SHA}}/docs/hermetic-banner.png
 screenshots:
   - https://raw.githubusercontent.com/forefy/hermetic/{{SHA}}/docs/hermetic-costs.png

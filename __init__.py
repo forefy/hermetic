@@ -662,8 +662,8 @@ def _on_pre_tool_call(tool_name="", args=None, task_id="", **kw):
             return None
         reason = {"no answer": "the user did not answer in time", "nobody to ask": "nobody was at Hermes to ask",
                   "your rule": "the user's rule blocks it", "guard set to block": "the guard is set to block"}.get(answer.get("how"), "the user said no")
-        return {"action": "block", "message": "Blocked by Hermetic's HDR guard (" + reason + "): this would " + what
-                + ". If it is needed, ask the user; they can allow it in Hermetic, HDR."}
+        return {"action": "block", "message": "Blocked by hermetic's HDR guard (" + reason + "): this would " + what
+                + ". If it is needed, ask the user; they can allow it in hermetic, HDR."}
     except Exception:
         return None
 

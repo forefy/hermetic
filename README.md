@@ -127,7 +127,7 @@ On AAI, only when you press replay, compare, draft or judge, or when you turn on
 Network calls are only done to supported providers (e.g. OpenRouter) to get latest price information, usage limits etc. no API keys sent through those calls, and only few requests a day are sent for different model informatics.
 
 
-### What hermetic reads on disk
+### Disk reads
 
 We gave hermetic just enough power to provide extended security, while limiting anything that is not needed for these ops.
 
@@ -141,7 +141,7 @@ We gave hermetic just enough power to provide extended security, while limiting 
 - Hermes' hook approvals (`shell-hooks-allowlist.json`), gateway hooks in `hooks/`, the hook scripts themselves (a copy of each, as first seen, is kept in `hermetic/hdr/hooks.json` to show later edits), and its own routing records.
 - HDR runs `ps` and `lsof` locally to list ports opened under Hermes.
 
-### What hermetic can write, only when you ask
+### Disk writes (only when you ask)
 
 - Routing rules and the fixes you apply (through Hermes' own config functions, shown before writing)
 - archived skills
@@ -157,7 +157,7 @@ We gave hermetic just enough power to provide extended security, while limiting 
 - A thread checks every 5 minutes for skill changes made by the background review, and acts only if you turned automatic tests on. A short-lived thread stores the billed-spend snapshot.
 
 
-### Updates
+### Plugin updates
 
 Hermes auto-manages plugin updates for you after installation, from this repo we bump `version` in `plugin.yaml`, commit, then run `scripts/release.sh --pr`.
 

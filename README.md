@@ -62,7 +62,7 @@ Deep and analytical cost tracking especially when using multi-provider routing (
 
 Evals, model-as-a-judge, and the missing layer for hermes auto-improve (randomly changing skills without proof they improved adds nothing)
 
-- **Ratings**: rate recent replies 1 to 5 stars, and keep a time you corrected Hermes ("no, …", "you forgot …") as a test
+- **Ratings**: rate replies 1 to 5 stars, the ones you pushed back on first ("no, …", "wtf, still broken"), and keep any of those as a test
 - **Evals**: your saved tests replayed on your current routing, each coloured by its last result. From 5 tests on, compare your two most-used providers and a second model on the same tests
 - **LLM as a judge**: grades replays with a rubric drafted from each skill. It has to earn trust against your ratings first (20 of them, 5 low) and fail most replies you corrected, and hermetic warns when it runs on your agent's own model family
 - **Proof for auto-improve**: skill changes from the background review are tested automatically (off, ask me, or revert), and a change that tests worse can be reverted. An untrusted judge never decides a revert

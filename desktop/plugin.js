@@ -2574,6 +2574,7 @@ const RateItem = ({ profile, item, onDone }) => {
       el('span', { style: { flex: 1, minWidth: 0, fontSize: 12, color: C.text, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, item.title),
       el(AaiOpenLink, { profile, sessionId: item.session_id, userTs: item.user_ts })),
     el('div', { style: { fontSize: 11, color: C.sub, marginTop: 3, lineHeight: 1.45, display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden' } }, item.preview),
+    item.followup ? el('div', { style: { fontSize: 11, color: item.frustrated ? C.warn : C.dim, marginTop: 3, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, 'You said next: ' + item.followup) : null,
     el('div', { style: { display: 'flex', alignItems: 'center', gap: 8, marginTop: 6 } },
       el('span', { onMouseLeave: () => setHot(0), style: { display: 'inline-flex', gap: 2 } },
         [1, 2, 3, 4, 5].map(n => el('span', { key: n, onMouseEnter: () => setHot(n), onClick: () => !busy && pick(n), style: { fontSize: 20, lineHeight: '20px', cursor: 'pointer', color: n <= shown ? C.warn : C.faint, transform: hot === n ? 'scale(1.12)' : 'none', transition: 'color 80ms, transform 80ms' } }, '★'))),
@@ -2591,10 +2592,10 @@ const RateTask = ({ profile, ratings, onChanged }) => {
   const [queue, setQueue] = useState(null)
   const [n, setN] = useState({ total: ratings.total || 0, low: ratings.low || 0 })
   useEffect(() => { aaiGet(profile, '/rate-queue?n=5').then(r => setQueue((r && r.items) || [])).catch(() => setQueue([])) }, [profile])
-  if (queue == null) return el(TaskCard, { id: 'aai-t-rate', title: 'Rate recent replies' }, aSmall('Loading…'))
+  if (queue == null) return el(TaskCard, { id: 'aai-t-rate', title: 'Rate replies' }, aSmall('Loading…'))
   const done = s => { setN(x => ({ total: x.total + 1, low: x.low + (s <= 2 ? 1 : 0) })); setQueue(q => q.slice(1)); if (onChanged) onChanged() }
   const good = Math.min(100, ((n.total - n.low) / 20) * 100), low = Math.min(100, (n.low / 20) * 100)
-  return el(TaskCard, { id: 'aai-t-rate', title: 'Rate recent replies', tip: 'Your stars teach the judge what good looks like. After 20 ratings, 5 of them low, it can be checked against you.', count: queue.length ? queue.length + ' left' : 'all rated', done: !queue.length },
+  return el(TaskCard, { id: 'aai-t-rate', title: 'Rate replies', tip: 'Your stars teach the judge what good looks like. Replies you pushed back on come first, taking turns with ones you moved on from, so it learns from both. After 20 ratings, 5 of them low, it can be checked against you.', count: queue.length ? queue.length + ' left' : 'all rated', done: !queue.length },
     queue.slice(0, 1).map(it => el(RateItem, { key: it.message_id, profile, item: it, onDone: done })),
     el('div', { style: { height: 8, background: 'var(--ui-bg-secondary, rgba(0,0,0,.25))', borderRadius: 4, overflow: 'hidden', display: 'flex', marginTop: 8 } },
       el('i', { style: { display: 'block', width: good + '%', background: C.ok } }), el('i', { style: { display: 'block', width: low + '%', background: C.bad } })),

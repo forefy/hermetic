@@ -12,6 +12,7 @@ Profile scoping (?profile=) is applied by the dashboard before the handler runs.
 import asyncio
 import os
 import time
+from itertools import zip_longest
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
@@ -138,10 +139,17 @@ def _db_sessions(db, since=0.0):
     return [r for r in rows if float(r.get("last_active") or r.get("started_at") or 0) > since]
 
 
-def _db_messages(db, session_id, since=0.0, every=False):
-    """A session's messages after ``since``, oldest first: the active conversation, or with ``every``
-    also rows compaction archived or a rewind set aside (an audit counts everything that ran)."""
-    rows = db.get_messages(session_id, include_inactive=every, include_compacted=every) if every else db.get_messages(session_id)
+def _db_messages(db, session_id, since=0.0, every=False, shown=False):
+    """A session's messages after ``since``, oldest first: the active conversation; with ``shown`` the
+    conversation as the user saw it, turns compaction archived included (AAI: a long chat compacts often,
+    and its corrections would vanish); with ``every`` also what a rewind set aside (an audit counts
+    everything that ran)."""
+    if every:
+        rows = db.get_messages(session_id, include_inactive=True, include_compacted=True)
+    elif shown:
+        rows = db.get_messages(session_id, include_compacted=True)
+    else:
+        rows = db.get_messages(session_id)
     return [m for m in rows if float(m.get("timestamp") or 0) > since]
 
 
@@ -151,14 +159,14 @@ _SESSION_CACHE: Dict[tuple, tuple] = {}
 _SESSION_CACHE_MAX = 5000
 
 
-def _per_session(db, store, row, kind, build, every=False):
+def _per_session(db, store, row, kind, build, every=False, shown=False):
     """``build(messages)`` for one session, cached per store (a profile's state.db) and kind."""
     key = (store, row["id"], kind)
     stamp = (row.get("last_active"), row.get("message_count"), row.get("api_call_count"))
     hit = _SESSION_CACHE.get(key)
     if hit and hit[0] == stamp:
         return hit[1]
-    value = build(_db_messages(db, row["id"], every=every))
+    value = build(_db_messages(db, row["id"], every=every, shown=shown))
     if len(_SESSION_CACHE) >= _SESSION_CACHE_MAX:
         try:
             _SESSION_CACHE.pop(next(iter(_SESSION_CACHE)))
@@ -951,30 +959,24 @@ async def aai(days: int = Query(7, ge=1, le=90), profile: Optional[str] = None):
 
 @router.get("/aai/rate-queue")
 async def aai_rate_queue(n: int = Query(5, ge=1, le=20), profile: Optional[str] = None):
-    """Recent assistant replies not yet rated, newest first, with a short preview."""
+    """Replies not yet rated: the ones you pushed back on first, taking turns with ones you moved on from
+    without a complaint (the judge learns from both), then the rest, newest first in each."""
     def _run():
         _name, home = _profile_home(profile)
         rated = {r.get("message_id") for r in _aai_read(_data_dir(home) / "ratings.jsonl")}
         db = _open_sessions_db(profile)
         try:
-            out, since, store = [], _aai_now() - 14 * 86400, _sessions_store(profile)
-            replies = []
-            for r in _db_sessions(db, since):
-                last_user = None
-                for mid, role, ts, text, _skills in _per_session(db, store, r, "turns", _session_turns):
-                    if role == "user":
-                        last_user = ts
-                    elif text and ts > since:
-                        replies.append((mid, r["id"], ts, text, r.get("title"), last_user))
-            for mid, sid, ts, text, title, user_ts in sorted(replies, key=lambda x: -x[2])[:200]:
-                if str(mid) in rated:
-                    continue
-                out.append({"message_id": str(mid), "session_id": sid, "title": title or "untitled", "ts": ts, "preview": text[:160], "user_ts": user_ts})
-                if len(out) >= n:
-                    break
-            return {"items": out}
+            since, store = _aai_now() - 14 * 86400, _sessions_store(profile)
+            replies = _aai_replies(db, store, _db_sessions(db, since), since)
         finally:
             db.close()
+        fresh = sorted((x for x in replies if str(x["mid"]) not in rated), key=lambda x: -x["ts"])
+        hot = [x for x in fresh if x["frustrated"]]
+        calm = [x for x in fresh if not x["frustrated"] and x["next"]]
+        order = [x for pair in zip_longest(hot, calm) for x in pair if x] + [x for x in fresh if not x["next"]]
+        return {"items": [{"message_id": str(x["mid"]), "session_id": x["row"]["id"], "title": x["row"].get("title") or "untitled",
+                           "ts": x["ts"], "preview": x["text"][:160], "user_ts": x["user_ts"], "frustrated": x["frustrated"],
+                           "followup": _aai_said(x["next"][2])[:160] if x["next"] else None} for x in order[:n]]}
 
     return await asyncio.to_thread(_run)
 
@@ -1098,7 +1100,7 @@ def _aai_find_message(db, message_id, session_id=None):
     """(session id, that session's messages) for a message id; searches recent sessions when no session is given."""
     mid = int(message_id)
     for sid in [session_id] if session_id else [r["id"] for r in sorted(_db_sessions(db), key=lambda r: -float(r.get("last_active") or 0))]:
-        msgs = _db_messages(db, sid)
+        msgs = _db_messages(db, sid, shown=True)
         if any(int(m.get("id") or 0) == mid for m in msgs):
             return sid, msgs
     raise ValueError("message not found")
@@ -2091,32 +2093,70 @@ async def aai_rubric_set(payload: Dict[str, Any] = Body(default={}), profile: Op
 _AAI_CORRECTION = _aai_re.compile(
     r"^\s*(no\b|nope\b|wrong\b|that'?s (not|wrong)|not (what|quite|right)|you (didn'?t|did not|forgot|missed|skipped|ignored)|"
     r"again\b|stop\b|don'?t\b|do not\b|why did you|i (said|asked)|please (don'?t|stop|redo)|redo\b|try again)", _aai_re.I)
+# Signs you were unhappy with the reply before yours. A strong one counts alone, wherever it sits in the
+# message; weak ones ("again", "??", a mostly-caps message) only in pairs, since "is it still running?" isn't one.
+_AAI_STRONG = [_AAI_CORRECTION,
+               _aai_re.compile(r"\b(wtf|wth|ffs|damn|shit|fuck\w*)\b", _aai_re.I),
+               _aai_re.compile(r"\byou (said|told me|claimed|didn'?t|did not|forgot|missed|ignored|broke)\b|\bi (already|just) (said|told|asked)\b|"
+                               r"\byou'?re (being |a bit |so |too |really )?(slow|wrong|lazy|useless|not listening)\b", _aai_re.I),
+               _aai_re.compile(r"\b(not|isn'?t|doesn'?t|didn'?t|won'?t|aren'?t|still not) (work|working|worked|fixed|fixing|load|loading|show|showing)\b|"
+                               r"\bbroken\b|\bnothing (changed|happened)\b|\bstill (not|broken|wrong|failing|the same|here)\b", _aai_re.I)]
+_AAI_WEAK = [_aai_re.compile(r"\b(still|again|same (issue|problem|error|bug|thing))\b", _aai_re.I), _aai_re.compile(r"[?!]{2,}")]
+# What Hermes puts in front of your words ("[The user attached an image: ...]"), and the notes it sends in
+# your place (a finished background process, a delegation batch, compaction, a scheduled job, a mode change)
+_AAI_INJECTED = _aai_re.compile(r"^(\s*\[[^\]\n]*\]\s*)+")
+_AAI_HERMES_NOTE = _aai_re.compile(r"^\[(IMPORTANT\b|ASYNC DELEGATION|CONTEXT COMPACTION|Cronjob\b|System:|Continuing toward)")
+
+
+def _aai_said(text):
+    """Your own words in a user message, without what Hermes added in front."""
+    return _AAI_INJECTED.sub("", str(text or "")).strip()
+
+
+def _aai_frustrated(text):
+    t = _aai_said(text)[:300]
+    if any(p.search(t) for p in _AAI_STRONG):
+        return True
+    words = _aai_re.findall(r"[A-Za-z]{3,}", t[:200])
+    shouting = len(words) >= 3 and sum(w.isupper() for w in words) / len(words) >= 0.6
+    return sum(1 for p in _AAI_WEAK if p.search(t)) + shouting >= 2
+
+
+def _aai_replies(db, store, rows, since):
+    """Each turn's final reply after ``since``, with your next message (id, ts, text) or None and whether it
+    showed you were unhappy. Read from the conversation as shown, so compacted turns count too."""
+    out = []
+    for r in rows:
+        pending, skills, user_ts = None, [], None
+        for mid, role, ts, text, loaded in _per_session(db, store, r, "shown_turns", _session_turns, shown=True):
+            if role == "user":
+                if _AAI_HERMES_NOTE.match(text):
+                    continue
+                if pending:
+                    out.append(dict(pending, next=(mid, ts, text), frustrated=_aai_frustrated(text)))
+                pending, skills, user_ts = None, [], ts
+            else:
+                skills += [x for x in loaded if x not in skills]
+                if text and ts > since:
+                    pending = {"mid": mid, "row": r, "ts": ts, "text": text, "user_ts": user_ts, "skills": list(skills)}
+        if pending:
+            out.append(dict(pending, next=None, frustrated=False))
+    return out
 
 
 @router.get("/aai/corrections")
 async def aai_corrections(days: int = Query(14, ge=1, le=90), profile: Optional[str] = None):
-    """Your replies that correct the agent ("no, ...", "you forgot ..."), with the reply they correct."""
+    """Your messages that push back on the agent ("no, ...", "you forgot ...", "wtf, still broken"), with the reply they answer."""
     def _run():
         db = _open_sessions_db(profile)
         since, store = time.time() - days * 86400, _sessions_store(profile)
         try:
-            by_session = {r["id"]: (r.get("title"), [t for t in _per_session(db, store, r, "turns", _session_turns) if t[2] > since])
-                          for r in _db_sessions(db, since)}
+            replies = _aai_replies(db, store, _db_sessions(db, since), since)
         finally:
             db.close()
-        out = []
-        for sid, (title, turns) in by_session.items():
-            last_reply, skills, turn_ts = None, [], None
-            for mid, role, ts, text, loaded in turns:
-                if role == "user":
-                    if last_reply and _AAI_CORRECTION.search(text[:200]):
-                        out.append({"message_id": str(last_reply), "correction_id": str(mid), "text": text[:240], "ts": ts, "title": title or "untitled",
-                                    "skill": skills[0] if skills else None, "session_id": sid, "user_ts": turn_ts})
-                    last_reply, skills, turn_ts = None, [], ts
-                else:
-                    skills += [x for x in loaded if x not in skills]
-                    if text:
-                        last_reply = mid
+        out = [{"message_id": str(x["mid"]), "correction_id": str(x["next"][0]), "text": _aai_said(x["next"][2])[:240], "ts": x["next"][1],
+                "title": x["row"].get("title") or "untitled", "skill": x["skills"][0] if x["skills"] else None,
+                "session_id": x["row"]["id"], "user_ts": x["user_ts"]} for x in replies if x["frustrated"]]
         _n, home = _profile_home(profile)
         gone = {r.get("correction_id") for r in _aai_read(_data_dir(home) / "dismissed.jsonl")}
         kept = {c.get("message_id") for c in _aai_cases(home)}
@@ -2283,7 +2323,7 @@ async def aai_case_detail(id: str = Query(...), profile: Optional[str] = None):
         runs = [r for r in _aai_read(_data_dir(home) / "runs.jsonl") if r.get("case_id") == id][-6:]
         db = _open_sessions_db(profile)
         try:
-            users = [m.get("timestamp") for m in _db_messages(db, turn["session_id"]) if m.get("role") == "user" and int(m.get("id") or 0) < int(case["message_id"])]
+            users = [m.get("timestamp") for m in _db_messages(db, turn["session_id"], shown=True) if m.get("role") == "user" and int(m.get("id") or 0) < int(case["message_id"])]
             u = [users[-1]] if users else None
         finally:
             db.close()

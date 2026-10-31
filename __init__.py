@@ -521,13 +521,13 @@ def _on_llm_request(**kw):
 # rules you saved when answering. It acts only on what Hermes does not check itself (hdr_rules.guarded:
 # reading keys and logins, writing startup items and key places Hermes does not list).
 # Ask is Hermetic's own question, independent of Hermes' approvals setting: the call waits while the
-# popover (or a macOS notification) asks you; no answer in time, or nobody at the popover, blocks it.
+# popover asks you; no answer in time, or nobody at the popover, blocks it.
 # Its own errors never block.
 _GUARD_LEVELS = ("watch", "ask", "block")
 _GUARD_CACHE = {}
 _RULES = {}
-_OP_WORDS = {"read": "read", "write": "write", "code": "use in code", "workdir": "work in"}
-_ASK_SEEN_S = 6.0  # the popover checks for questions every 2s; older than this means nobody is there
+_OP_WORDS = {"read": "reading", "write": "writing", "code": "using in code", "workdir": "working in"}
+_ASK_SEEN_S = 6.0  # an open popover touches "seen" every half second; older than this means nobody is there
 
 
 def _hdr_rules():
@@ -571,15 +571,23 @@ def asks_dir() -> Path:
     return Path(get_default_hermes_root()) / _DATA / "hdr" / "asks"
 
 
+_ASK_NO_LIMIT_S = 120.0  # how long a question waits when Hermes puts no limit on hooks (hook_callback_timeout: 0)
+
+
 def _ask_wait() -> float:
-    """Seconds a question may wait: inside Hermes' limit for a pre_tool_call hook, which blocks the
-    call itself when a hook runs longer."""
+    """Seconds a question may wait: 6s inside Hermes' limit for a pre_tool_call hook (plugins.hook_callback_timeout,
+    30s by default, at most 600), since Hermes blocks the call itself when a hook runs longer."""
     try:
         from hermes_cli.config import load_config_readonly
-        limit = float(((load_config_readonly() or {}).get("plugins") or {}).get("hook_callback_timeout") or 30)
+        raw = ((load_config_readonly() or {}).get("plugins") or {}).get("hook_callback_timeout")
+        limit = 30.0 if raw is None else float(raw)
     except Exception:
         limit = 30.0
-    return max(3.0, min(20.0, limit - 6.0))
+    if limit == 0:
+        return _ASK_NO_LIMIT_S
+    if limit < 0:
+        limit = 30.0
+    return max(3.0, min(limit, 600.0) - 6.0)
 
 
 def _ask_user(hit, tool_name, session_id):
@@ -611,6 +619,14 @@ def _ask_user(hit, tool_name, session_id):
                 except ValueError:
                     pass
             time.sleep(0.25)
+        # left for the popover to say what happened: the question itself is gone a moment later
+        try:
+            out = dict({k: ask[k] for k in ("id", "tool", "path", "op", "why", "session_id", "profile")}, ts=time.time(), how="no answer")
+            tmp = d / (aid + ".outcome.tmp")
+            tmp.write_text(json.dumps(out), encoding="utf-8")
+            os.replace(tmp, d / (aid + ".outcome.json"))
+        except OSError:
+            pass
         return {"decision": "block", "how": "no answer"}
     finally:
         for f in (q, a):
@@ -660,10 +676,10 @@ def _on_pre_tool_call(tool_name="", args=None, task_id="", **kw):
                     "path": top["path"], "op": top["op"], "why": top["why"], "score": top["score"], "session_id": sid})
         if answer.get("decision") == "allow":
             return None
-        reason = {"no answer": "the user did not answer in time", "nobody to ask": "nobody was at Hermes to ask",
-                  "your rule": "the user's rule blocks it", "guard set to block": "the guard is set to block"}.get(answer.get("how"), "the user said no")
-        return {"action": "block", "message": "Blocked by hermetic's HDR guard (" + reason + "): this would " + what
-                + ". If it is needed, ask the user; they can allow it in hermetic, HDR."}
+        reason = {"no answer": "no answer in time", "nobody to ask": "Hermes wasn't open", "your rule": "a saved rule",
+                  "guard set to block": "guard set to Block"}.get(answer.get("how"), "rejected by the user")
+        who = "them" if reason == "rejected by the user" else "the user"
+        return {"action": "block", "message": "hermetic blocked %s: %s, so ask %s if you need it" % (what, reason, who)}
     except Exception:
         return None
 

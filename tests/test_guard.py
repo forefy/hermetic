@@ -72,7 +72,7 @@ def test_ask_with_nobody_at_the_popover_blocks_at_once():
         seen.unlink()
     t = time.time()
     r = call(*SSH_READ)
-    assert r["action"] == "block" and "nobody was at Hermes" in r["message"] and time.time() - t < 1
+    assert r["action"] == "block" and "Hermes wasn't open" in r["message"] and time.time() - t < 1
 
 
 def test_ask_waits_for_your_answer():
@@ -83,7 +83,7 @@ def test_ask_waits_for_your_answer():
     someone_is_there()
     answer_when_asked("block")
     r = call(*SSH_READ)
-    assert r["action"] == "block" and "the user said no" in r["message"]
+    assert r["action"] == "block" and "rejected by the user" in r["message"]
 
 
 def test_no_answer_in_time_blocks():
@@ -94,8 +94,74 @@ def test_no_answer_in_time_blocks():
         r = call(*SSH_READ)
     finally:
         plugin._ask_wait = ASK_WAIT
-    assert r["action"] == "block" and "did not answer in time" in r["message"]
-    assert not [f for f in plugin.asks_dir().glob("*.json")], "the question is cleaned up"
+    assert r["action"] == "block" and "no answer in time" in r["message"]
+    left = list(plugin.asks_dir().glob("*.json"))
+    assert [f.name.endswith(".outcome.json") for f in left] == [True], "the question is cleaned up, what happened is left"
+    o = json.loads(left[0].read_text())
+    assert o["how"] == "no answer" and o["path"] == "~/.ssh/config" and o["tool"] == "terminal"
+    left[0].unlink()
+
+
+def test_the_wait_follows_hermes_hook_limit():
+    import types
+    real = sys.modules.get("hermes_cli.config")
+    try:
+        for value, wait in [(None, 24.0), (120, 114.0), (0, plugin._ASK_NO_LIMIT_S), (900, 594.0), (-5, 24.0), (5, 3.0)]:
+            fake = types.ModuleType("hermes_cli.config")
+            fake.load_config_readonly = lambda v=value: {"plugins": {} if v is None else {"hook_callback_timeout": v}}
+            sys.modules["hermes_cli.config"] = fake
+            assert plugin._ask_wait() == wait, (value, plugin._ask_wait())
+    finally:
+        if real is not None:
+            sys.modules["hermes_cli.config"] = real
+        else:
+            sys.modules.pop("hermes_cli.config", None)
+
+
+def test_the_popover_hears_about_a_question_that_ran_out():
+    import asyncio
+    api_spec = importlib.util.spec_from_file_location("plugin_api", HERE.parent / "dashboard" / "plugin_api.py")
+    api = importlib.util.module_from_spec(api_spec)
+    api_spec.loader.exec_module(api)
+    d = api._asks_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    now = time.time()
+    fresh = {"id": "aaa", "tool": "terminal", "path": "~/.ssh", "op": "read", "why": "SSH keys", "session_id": None, "profile": "default", "ts": now - 5, "how": "no answer"}
+    (d / "aaa.outcome.json").write_text(json.dumps(fresh))
+    (d / "bbb.outcome.json").write_text(json.dumps(dict(fresh, id="bbb", ts=now - 300)))
+    (d / "ccc.outcome.json").write_text(json.dumps(dict(fresh, id="ccc", ts=now - 3600)))
+    r = asyncio.run(api.hdr_guard_asks(profile=None, wait=0, have=""))
+    assert r["asks"] == [] and [o["id"] for o in r["ran_out"]] == ["aaa"], "only the last two minutes are shown"
+    assert (d / "bbb.outcome.json").exists() and not (d / "ccc.outcome.json").exists(), "old ones are cleared"
+    for f in d.glob("*.outcome.json"):
+        f.unlink()
+
+
+def test_the_popover_request_is_held_until_a_question_comes():
+    """A background window's timers fire about once a minute, so the popover keeps one request open instead."""
+    import asyncio
+    import threading
+    api_spec = importlib.util.spec_from_file_location("plugin_api", HERE.parent / "dashboard" / "plugin_api.py")
+    api = importlib.util.module_from_spec(api_spec)
+    api_spec.loader.exec_module(api)
+    d = api._asks_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    key = asyncio.run(api.hdr_guard_asks(profile=None, wait=0, have=""))["key"]
+    t = time.time()
+    assert asyncio.run(api.hdr_guard_asks(profile=None, wait=1.5, have=key))["asks"] == [] and time.time() - t >= 1, "nothing new: held"
+    seen = (d / "seen").stat().st_mtime
+    assert time.time() - seen < 1, "while held, the guard can tell someone is at Hermes"
+    now = time.time()
+    ask = {"id": "q1", "ts": now, "until": now + 4, "tool": "terminal", "path": "~/.ssh/config", "op": "read", "why": "SSH keys", "session_id": None, "profile": "default"}
+    threading.Timer(0.7, lambda: (d / "q1.json").write_text(json.dumps(ask))).start()
+    t = time.time()
+    r = asyncio.run(api.hdr_guard_asks(profile=None, wait=10, have=key))
+    assert [a["id"] for a in r["asks"]] == ["q1"] and time.time() - t < 2.5, "a new question answers the held request at once"
+    (d / "q1.answer.json").write_text(json.dumps({"decision": "block"}))
+    t = time.time()
+    assert asyncio.run(api.hdr_guard_asks(profile=None, wait=10, have=r["key"]))["asks"] == [] and time.time() - t < 1.5, "and so does its answer"
+    (d / "q1.answer.json").unlink()
+    (d / "q1.json").unlink()
 
 
 def save_rules(level, rules):

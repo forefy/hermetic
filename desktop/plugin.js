@@ -160,7 +160,6 @@ function carryOverLegacyStorage() {
 // home and secrets), so the active backend answers for every local profile.
 const OWN = '/api/plugins/hermetic'
 let pluginRest = null // ctx.rest, set in register()
-let pluginOs = null // ctx.os, for the guard's macOS notifications
 const inflight = new Map() // identical reads already on their way share one request
 const api = req => {
   const path = String(req.path || '')
@@ -3135,7 +3134,7 @@ const HdrPipeline = ({ list }) => {
 }
 
 // Guard: one level for the risky calls Hermes does not check itself (hdr_rules.guarded). Ask is Hermetic's own
-// question (the AskCard below, or a macOS notification), whatever Hermes' approvals setting; Block stops the call
+// question (the AskCard below), whatever Hermes' approvals setting; Block stops the call
 const GUARD_OPTIONS = [{ id: 'watch', label: 'Watch' }, { id: 'ask', label: 'Ask' }, { id: 'block', label: 'Block' }]
 const GUARD_HOW = { you: 'by you', 'no answer': 'no answer in time', 'nobody to ask': 'nobody at Hermes', 'your rule': 'your rule', 'guard set to block': 'guard set to block' }
 const opWord = op => (op === 'read' ? 'reading' : op === 'write' ? 'writing' : 'using')
@@ -3174,7 +3173,7 @@ const HdrGuard = ({ g, profile, days, onChanged }) => {
     el('div', { style: { display: 'flex', alignItems: 'center', gap: 10 } },
       el(SegmentedControl, { value: g.level, onChange: level => level !== g.level && post({ level }), options: GUARD_OPTIONS }),
       busy ? aSmall('Saving…') : null),
-    g.level === 'ask' ? el('div', { style: { fontSize: 10.5, color: C.dim, marginTop: 8, lineHeight: 1.45 } }, 'hermetic asks you here, or with a macOS notification when Hermes is in the background. No answer in 20 seconds, or nobody at Hermes (scheduled jobs), blocks the call.') : null,
+    g.level === 'ask' ? el('div', { style: { fontSize: 10.5, color: C.dim, marginTop: 8, lineHeight: 1.45 } }, 'hermetic asks here and blocks the call if nobody answers within 24s') : null,
     el('div', { style: { fontSize: 10.5, color: C.dim, marginTop: 6 } }, effect),
     err ? el('div', { style: { fontSize: 10.5, color: C.bad, marginTop: 6 } }, err) : null,
     rules.length ? el('div', { style: { marginTop: 10 } },
@@ -3219,6 +3218,15 @@ const HdrHooks = ({ h, profile, onChanged }) => {
 
 // Hermetic's own Ask, LuLu style: the guard holds a risky call and this card asks who, what and why, with a
 // rule (this file, its folder or the whole kind; once, this chat or always). No answer in time blocks it.
+const opIng = op => (op === 'read' ? 'reading ' : op === 'write' ? 'writing ' : 'using ')
+const inChat = chat => (chat ? ' (' + chat + ')' : '')
+
+// Above the popover for two minutes after a question ran out, so a block never passes unseen.
+const RanOutNote = ({ o }) =>
+  el('div', { role: 'status', style: { padding: '8px 16px', fontSize: 11, lineHeight: 1.45, color: C.sub, borderBottom: '1px solid ' + C.stroke, maxWidth: 400, boxSizing: 'border-box' } },
+    el('span', { style: { color: C.bad } }, 'Blocked ' + opIng(o.op) + o.path),
+    ', no answer in time' + inChat(o.chat))
+
 const AskCard = ({ ask, more, onAnswered }) => {
   const [scope, setScope] = useState('file')
   const [remember, setRemember] = useState('once')
@@ -3244,7 +3252,7 @@ const AskCard = ({ ask, more, onAnswered }) => {
       el('span', { style: { width: 30, height: 30, borderRadius: 8, flex: 'none', background: 'rgba(201,147,74,.16)', color: C.warn, display: 'flex', alignItems: 'center', justifyContent: 'center', fontWeight: 600 } }, '!'),
       el('div', { style: { minWidth: 0 } },
         el('div', { style: { fontSize: 12.5, fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, 'The agent wants to ' + (ask.op === 'read' ? 'read ' : ask.op === 'write' ? 'write ' : 'use ') + ask.path),
-        el('div', { style: { fontSize: 10.5, color: C.dim } }, 'hermetic guard: Hermes doesn’t check this itself'))),
+        el('div', { style: { fontSize: 10.5, color: C.dim } }, 'Hermes doesn’t check this itself'))),
     el('div', { style: { display: 'grid', gridTemplateColumns: '62px minmax(0,1fr)', gap: '2px 8px', marginTop: 10, fontSize: 11 } },
       ...kv('tool', ask.tool), ...kv('chat', ask.chat || '-'), ...kv('profile', ask.profile || 'default'), ...kv('why', ask.why)),
     el('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginTop: 10, fontSize: 10.5, color: C.dim } }, 'Rule for', el(SegmentedControl, { value: scope, onChange: setScope, options: scopes })),
@@ -5010,19 +5018,29 @@ const Chip = () => {
     }
   }, [open])
 
-  // the guard's questions: listed every 2s (which also tells the guard someone is at Hermes); a new one
-  // opens the popover and, when Hermes is in the background, a macOS notification with Allow and Block
+  // the guard's questions: one request at a time, held by the backend until something changes (a background
+  // window's timers fire about once a minute, a reply arrives at once), which also tells the guard someone is
+  // at Hermes; a new question opens the popover
   const [asks, setAsks] = useState([])
   const askSeen = useRef(new Set())
-  const answerAsk = (id, decision) => api({ path: OWN + '/hdr/guard/answer', method: 'POST', body: { id, decision } }).then(() => setAsks(x => { const rest = x.filter(a => a.id !== id); asksWaiting.current = rest.length; return rest })).catch(() => {})
+  const [ranOut, setRanOut] = useState(null) // the last question that ran out (blocked, no answer) in the past 2 minutes
   useEffect(() => {
     let live = true
-    let pauseUntil = 0 // an older backend without this route: check again in a minute, not every 2s
-    const tick = async () => {
-      if (Date.now() < pauseUntil) return
-      try {
-        const r = await api({ path: OWN + '/hdr/guard/asks' })
+    let have = ''
+    const sleep = ms => new Promise(done => setTimeout(done, ms))
+    const loop = async () => {
+      while (live) {
+        let r
+        try {
+          r = await api({ path: OWN + '/hdr/guard/asks?wait=25&have=' + encodeURIComponent(have), timeoutMs: 40_000 })
+        } catch (e) {
+          // an older backend without this route: check again in a minute; a restarting one: in a few seconds
+          await sleep(/404|Not Found/i.test(String(e && e.message)) ? 60_000 : 5000)
+          continue
+        }
         if (!live) return
+        if (r && r.key == null) await sleep(2000) // a backend that answers at once: ask every 2s as before
+        have = (r && r.key) || ''
         const list = (r && r.asks) || []
         asksWaiting.current = list.length
         setAsks(list)
@@ -5030,20 +5048,13 @@ const Chip = () => {
           if (askSeen.current.has(a.id)) continue
           askSeen.current.add(a.id)
           setOpen(true)
-          if (pluginOs && pluginOs.notify) {
-            try {
-              pluginOs.notify({ title: 'Allow the agent to ' + (a.op === 'read' ? 'read ' : a.op === 'write' ? 'write ' : 'use ') + a.path + '?', body: a.tool + (a.chat ? ' in “' + a.chat + '”' : '') + '. Blocked in ' + Math.round(a.left) + 's if nobody answers.',
-                onActivate: () => setOpen(true), actions: [{ id: 'allow', label: 'Allow', onAction: () => answerAsk(a.id, 'allow') }, { id: 'block', label: 'Block', onAction: () => answerAsk(a.id, 'block') }] })
-            } catch { /* notifications are a bonus; the card in the popover still asks */ }
-          }
         }
-      } catch (e) {
-        if (/404|Not Found/i.test(String(e && e.message))) pauseUntil = Date.now() + 60_000
+        const gone = (r && r.ran_out) || []
+        setRanOut(gone.length ? gone[gone.length - 1] : null)
       }
     }
-    tick()
-    const t = setInterval(tick, 2000)
-    return () => { live = false; clearInterval(t) }
+    loop()
+    return () => { live = false }
   }, [])
 
   const week = lastNDays(7)
@@ -5075,7 +5086,7 @@ const Chip = () => {
         'button',
         {
           type: 'button',
-          title: asks.length ? 'hermetic guard: ' + asks.length + (asks.length === 1 ? ' question waits' : ' questions wait') + ' for your answer' : error ? 'hermetic: ' + error : loading ? 'hermetic: loading' : 'hermetic, ' + periodName + ', ' + fmtUsd(spend) + (account ? '' : backendPatched ? ' (Hermes estimate)' : ' (Hermes estimate, backend plugin off)'),
+          title: asks.length ? 'hermetic guard: ' + (asks.length === 1 ? 'a question waits' : asks.length + ' questions wait') + ' for you' : ranOut ? 'hermetic guard blocked ' + opIng(ranOut.op) + ranOut.path + ', no answer in time' : error ? 'hermetic: ' + error : loading ? 'hermetic: loading' : 'hermetic, ' + periodName + ', ' + fmtUsd(spend) + (account ? '' : backendPatched ? ' (Hermes estimate)' : ' (Hermes estimate, backend plugin off)'),
           className: cn(
             'inline-flex h-full items-center gap-2 px-2 text-[0.6875rem] transition-colors',
             'hover:bg-(--chrome-action-hover)',
@@ -5086,7 +5097,7 @@ const Chip = () => {
             fontVariantNumeric: 'tabular-nums'
           }
         },
-        asks.length ? el('span', { style: { width: 7, height: 7, borderRadius: 4, flex: 'none', background: C.warn } }) : null,
+        asks.length || ranOut ? el('span', { style: { width: 7, height: 7, borderRadius: 4, flex: 'none', background: asks.length ? C.warn : C.bad } }) : null,
         ctxPct != null ? el(ContextGauge, { pct: ctxPct, used: ctxSrc.context_used, max: ctxSrc.context_max, threshold }) : null,
         el(Spark, { values: spark, tone: quotaLow ? 'bad' : tone, marks: resets.filter(r => r.cause === 'swap') }),
         el('span', { style: { color: tone ? 'inherit' : C.text } }, label),
@@ -5099,7 +5110,7 @@ const Chip = () => {
       asks.length
         ? el(AskCard, { key: asks[0].id, ask: asks[0], more: asks.length - 1, onAnswered: id => { asksWaiting.current = Math.max(0, asks.length - 1); setAsks(x => x.filter(a => a.id !== id)); if (asks.length <= 1) setOpen(false) } })
         : data
-        ? el(Body, { meter: data, prices, threshold, retries, yaml, profile, profileLabel, refresh, rates, defaultModel, account, planLimits: limits, cheapest, orProfile, orAny, onPeriod: setChipPeriod, view, onView: pickView, scope, profileCount, onScope: setScope })
+        ? el('div', null, ranOut ? el(RanOutNote, { o: ranOut }) : null, el(Body, { meter: data, prices, threshold, retries, yaml, profile, profileLabel, refresh, rates, defaultModel, account, planLimits: limits, cheapest, orProfile, orAny, onPeriod: setChipPeriod, view, onView: pickView, scope, profileCount, onScope: setScope }))
         : el('div', { style: { padding: 16, fontSize: 12, color: C.sub, width: 240 } }, error ? error : 'Loading…')
     )
   )
@@ -5112,7 +5123,6 @@ export default {
     carryOverLegacyStorage()
     store = ctx.storage
     pluginRest = ctx.rest
-    pluginOs = ctx.os || null
     initResets()
     ctx.register({
       id: 'chip',

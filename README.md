@@ -112,7 +112,7 @@ The `llm_execution` middleware only reads the generation id and finish reason of
 A `pre_tool_call` hook checks each tool call against HDR's rules (`hdr_rules.py`). hermetic HDR has these settings configurable:
 
 - `Watch` (default) does nothing.
-- `Ask` the call waits up to 20 seconds, while hermetic asks how to act (question waits at `~/.hermes/hermetic/hdr/asks/`) - no answer, or no popover checking in, blocks the call.
+- `Ask` the call waits until 6 seconds before Hermes' hook limit (`plugins.hook_callback_timeout`, 24 seconds by default), while hermetic asks how to act (question waits at `~/.hermes/hermetic/hdr/asks/`) - no answer, or no popover checking in, blocks the call.
 - `Block` stops the tool call. Rules you save are kept in each profile's `hermetic/hdr/guard.json`, and every decision is noted in `hermetic/hdr/guard.jsonl`. The guard never approves anything Hermes would ask about, and if its own check fails, the call goes ahead as if the guard were off.
 
 ### Plugin-initiated model calls

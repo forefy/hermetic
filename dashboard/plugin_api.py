@@ -2612,14 +2612,28 @@ def _asks_dir():
     return _data_dir(Path(get_default_hermes_root())) / "hdr" / "asks"
 
 
+_HDR_OUTCOME_SHOW_S, _HDR_OUTCOME_KEEP_S = 120, 600  # a question that ran out is shown for 2 minutes, its file kept 10
+_HDR_ASKS_HOLD_S = 25  # the longest the popover's request for questions is held, inside the desktop's 30s request limit
+
+
 @router.get("/hdr/guard/asks")
-async def hdr_guard_asks(profile: Optional[str] = None):
-    """Questions waiting for an answer, oldest first, with the chat they came from."""
-    def _run():
-        d = _asks_dir()
-        d.mkdir(parents=True, exist_ok=True)
-        (d / "seen").touch()
-        now, out = time.time(), []
+async def hdr_guard_asks(profile: Optional[str] = None, wait: float = Query(0, ge=0, le=_HDR_ASKS_HOLD_S), have: str = ""):
+    """Questions waiting for an answer, oldest first, with the chat they came from, and the ones that ran out
+    in the last two minutes (blocked with no answer), so the popover can say so. With ``wait`` the request is
+    held until that changes from ``have`` (a question comes, is answered or runs out): a background window's timers fire about once a minute, but a reply reaches it at once. Being held
+    also tells the guard someone is at Hermes."""
+    def _chat(a):
+        try:
+            db = _open_sessions_db(a.get("profile"))
+            try:
+                return (db.get_session(a.get("session_id")) or {}).get("title") or ""
+            finally:
+                db.close()
+        except Exception:
+            return ""
+
+    def _scan(d):
+        now, out, ran_out = time.time(), [], []
         for f in sorted(d.glob("*.json")):
             if f.name.endswith(".answer.json"):
                 continue
@@ -2627,20 +2641,32 @@ async def hdr_guard_asks(profile: Optional[str] = None):
                 a = _aai_json.loads(f.read_text(encoding="utf-8"))
             except Exception:
                 continue
+            if f.name.endswith(".outcome.json"):
+                age = now - float(a.get("ts") or 0)
+                if age > _HDR_OUTCOME_KEEP_S:
+                    f.unlink(missing_ok=True)
+                elif age <= _HDR_OUTCOME_SHOW_S:
+                    ran_out.append(a)
+                continue
             if float(a.get("until") or 0) <= now or (d / (str(a.get("id")) + ".answer.json")).exists():
                 continue
-            a["left"] = round(float(a["until"]) - now, 1)
-            a["chat"] = ""
-            try:
-                db = _open_sessions_db(a.get("profile"))
-                try:
-                    a["chat"] = (db.get_session(a.get("session_id")) or {}).get("title") or ""
-                finally:
-                    db.close()
-            except Exception:
-                pass
-            out.append(a)
-        return {"asks": sorted(out, key=lambda a: a["ts"])}
+            left = float(a["until"]) - now
+            out.append(dict(a, left=round(left, 1)))
+        key = ",".join(str(a["id"]) for a in out) + "|" + ",".join(str(a.get("id")) for a in ran_out)
+        return out, ran_out, key
+
+    def _run():
+        d = _asks_dir()
+        d.mkdir(parents=True, exist_ok=True)
+        start = time.time()
+        while True:
+            (d / "seen").touch()
+            out, ran_out, key = _scan(d)
+            if key != have or time.time() - start + 0.5 > wait:
+                break
+            time.sleep(0.5)
+        return {"asks": [dict(a, chat=_chat(a)) for a in sorted(out, key=lambda a: a["ts"])],
+                "ran_out": [dict(a, chat=_chat(a)) for a in sorted(ran_out, key=lambda a: a["ts"])], "key": key}
     return await asyncio.to_thread(_run)
 
 

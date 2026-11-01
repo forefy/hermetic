@@ -105,7 +105,7 @@ When using a model provider (e.g. openrouter which this plugin supports best) he
 - max price
 - minimum throughput and maximum latency
 
-On Nous Portal it adds only your data collection and zero data retention rules, the two provider fields the Portal accepts.
+On Nous Portal it adds only your data collection and zero data retention rules, the two provider fields the Portal accepts, and the Portal refuses a model with no endpoint that meets them.
 
 The `llm_execution` middleware only reads the generation id and finish reason off the result, or on Nous Portal the cost it billed.
 

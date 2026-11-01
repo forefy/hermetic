@@ -4250,7 +4250,7 @@ const RoutingSection = ({ policyOn = true, providerName, rows, since, recording,
   }
   const degraded = (health || []).map(k => HEALTH_LABEL[k] || k)
   const auxDrift = !!(aux && aux.enabled && ((aux.out_of_sync || []).length || (aux.stale || []).length))
-  const auxTasks = aux ? aux.tasks.filter(t => t.openrouter).length : 0
+  const auxTasks = aux ? aux.tasks.filter(t => t.route || t.openrouter).length : 0
   const canApply = yamlChanged || auxChanged
   const syncAux = async enabled => api(profileReq(profile, { path: '/api/plugins/hermetic/aux-routing', method: 'POST', body: { enabled } }))
   const apply = async () => {
@@ -4800,7 +4800,7 @@ const RoutingSection = ({ policyOn = true, providerName, rows, since, recording,
             ? el(
                 'span',
                 { style: { marginLeft: 12, whiteSpace: 'nowrap' } },
-                el(T, { tone: 'warn', title: 'Background tasks have older rules than the main agent, or a task left OpenRouter', onClick: async () => { await syncAux(true); onApplied() } }, el('span', { style: { color: C.warn } }, 'background out of date, sync'))
+                el(T, { tone: 'warn', title: 'Background tasks have older rules than the main agent', onClick: async () => { await syncAux(true); onApplied() } }, el('span', { style: { color: C.warn } }, 'background out of date, sync'))
               )
             : null,
           el('span', { style: { flex: 1 } }),

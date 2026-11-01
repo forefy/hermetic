@@ -529,10 +529,80 @@ def merge_into_request(request, extra):
     return new
 
 
+def _nous_privacy(model):
+    """Of the routing rules, the two Nous Portal honours (data_collection and zdr; it answers any other
+    provider field with a 400). Hermes sends provider routing only to OpenRouter, so on the Portal
+    these would otherwise be dropped."""
+    from hermes_cli.config import load_config_readonly
+    pr = (load_config_readonly() or {}).get("provider_routing")
+    if not isinstance(pr, dict):
+        return {}
+    merged = dict(pr)
+    try:
+        from hermes_constants import resolve_per_model_provider_routing
+        merged.update(resolve_per_model_provider_routing(model or "", pr.get("models")) or {})
+    except Exception:
+        pass
+    out = {}
+    dc = str(merged.get("data_collection") or "").strip().lower()
+    if dc in ("deny", "allow"):
+        out["data_collection"] = dc
+    if isinstance(merged.get("zdr"), bool):
+        out["zdr"] = merged["zdr"]
+    return out
+
+
+_API = {}
+_RESYNC_AT = {}
+_RESYNC_EVERY_S = 60.0
+
+
+def _plugin_api():
+    mod = _API.get("m")
+    if mod is None:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("_hermetic_api", str(Path(__file__).resolve().parent / "dashboard" / "plugin_api.py"))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _API["m"] = mod
+    return mod
+
+
+def _maybe_resync_aux() -> None:
+    """At most once a minute per profile, off the request thread: keep the background tasks' mirrored
+    routing in step with the main provider (see plugin_api.aux_resync)."""
+    try:
+        import contextvars
+        from hermes_constants import get_hermes_home
+        key, now = str(get_hermes_home()), time.time()
+        if now - _RESYNC_AT.get(key, 0) < _RESYNC_EVERY_S:
+            return
+        _RESYNC_AT[key] = now
+        ctx = contextvars.copy_context()
+        threading.Thread(target=ctx.run, args=(_resync_aux,), name="hermetic-aux", daemon=True).start()
+    except Exception:
+        pass
+
+
+def _resync_aux() -> None:
+    try:
+        _plugin_api().aux_resync()
+    except Exception:
+        pass
+
+
 def _on_llm_request(**kw):
+    _maybe_resync_aux()
     try:
         provider = str(kw.get("provider") or "").lower()
         base_url = str(kw.get("base_url") or "").lower()
+        if provider == "nous" or "nousresearch.com" in base_url:
+            request = kw.get("request")
+            extra = _nous_privacy(kw.get("model") or (request.get("model") if isinstance(request, dict) else ""))
+            new = merge_into_request(request, extra)
+            if new is None:
+                return None
+            return {"request": new, "source": "hermetic", "reason": "privacy rules for Nous Portal: " + ", ".join(sorted(extra))}
         if provider != "openrouter" and "openrouter" not in base_url:
             return None
         rid = kw.get("api_request_id")

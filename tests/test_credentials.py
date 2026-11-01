@@ -149,12 +149,15 @@ def test_replays_on_a_nous_profile_go_to_nous_portal():
     def check(sent):
         rt = api._aai_runtime()
         assert rt == {"api_key": "nous-jwt", "base_url": "https://inference-api.nousresearch.com/v1", "kind": "nous"}
-        out = api._aai_call("x/m", MSGS, provider={"data_collection": "deny"})
+        out = api._aai_call("x/m", MSGS, provider={"data_collection": "deny", "zdr": True, "sort": "latency", "ignore": ["a"]})
         req = sent[-1]
         body = json.loads(req.data)
         assert req.full_url == "https://inference-api.nousresearch.com/v1/chat/completions"
         assert req.get_header("Authorization") == "Bearer nous-jwt" and not req.get_header("X-title")
-        assert "provider" not in body and "usage" not in body, "OpenRouter's own fields stay off Nous calls"
+        assert body["provider"] == {"data_collection": "deny", "zdr": True}, "only the privacy rules, the Portal refuses the rest"
+        assert "usage" not in body, "OpenRouter's own fields stay off Nous calls"
+        api._aai_call("x/m", MSGS, provider={"sort": "price"})
+        assert "provider" not in json.loads(sent[-1].data), "no provider object when there are no privacy rules"
         assert body["tags"] == ["product=hermes-agent"]
         assert abs(out["cost"] - (600e-6 + 400e-7 + 100 * 4e-6)) < 1e-12, "priced at the Portal's list, cache reads at the cache price"
     _on_nous(check)

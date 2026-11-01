@@ -525,9 +525,11 @@ async def routing(days: int = Query(30, ge=1, le=365), profile: Optional[str] = 
 # ---- background (auxiliary) tasks ---------------------------------------------------------------
 # Hermes deliberately does not apply ``provider_routing`` to auxiliary calls (titles, compression,
 # search, review, ...). Each task accepts its own ``auxiliary.<task>.extra_body.provider``, which is
-# sent verbatim to whatever provider the task uses, so it is only written for tasks that go to
-# OpenRouter. The tasks this plugin manages are remembered so they can be cleaned up when a task
-# moves to another provider or mirroring is switched off.
+# sent verbatim to whatever provider the task uses, so it is written only for tasks that go to
+# OpenRouter (the whole routing) or Nous Portal (only the privacy rules, all the Portal honours; it
+# answers anything more with a 400). The tasks this plugin manages are remembered so they can be
+# cleaned up when a task moves to another provider or mirroring is switched off, and
+# aux_resync() keeps them in step when the main provider changes.
 
 
 _AUX_SKIP = {"moa_reference", "moa_aggregator"}  # MoA routes per preset slot, not per task
@@ -566,16 +568,33 @@ def _aux_task_names():
     return [k for k, v in aux.items() if isinstance(v, dict) and k not in _AUX_SKIP]
 
 
-def _task_goes_to_openrouter(task_cfg, main_cfg):
+_NOUS_ROUTING_KEYS = ("data_collection", "zdr")  # all of a provider object Nous Portal honours
+
+
+def _route_of(prov, base):
+    if "openrouter" in base or prov == "openrouter":
+        return "openrouter"
+    if "nousresearch.com" in base or prov == "nous":
+        return "nous"
+    return None
+
+
+def _task_route(task_cfg, main_cfg):
+    """Where an auxiliary task's calls go, as far as routing goes: "openrouter", "nous" or None."""
     prov = str((task_cfg or {}).get("provider") or "auto").strip().lower()
     base = str((task_cfg or {}).get("base_url") or "").lower()
-    if "openrouter" in base or prov == "openrouter":
-        return True
-    if prov in ("auto", "", "main"):
-        mp = str((main_cfg or {}).get("provider") or "").strip().lower()
-        mb = str((main_cfg or {}).get("base_url") or "").lower()
-        return mp == "openrouter" or "openrouter" in mb
-    return False
+    if prov in ("auto", "", "main") and not base:
+        prov = str((main_cfg or {}).get("provider") or "").strip().lower()
+        base = str((main_cfg or {}).get("base_url") or "").lower()
+    return _route_of(prov, base)
+
+
+def _routing_for(route, want):
+    if route == "openrouter":
+        return dict(want or {})
+    if route == "nous":
+        return {k: want[k] for k in _NOUS_ROUTING_KEYS if k in (want or {})}
+    return {}
 
 
 def _routing_object(cfg):
@@ -611,20 +630,26 @@ def _aux_status(cfg):
     aux = cfg.get("auxiliary") if isinstance(cfg.get("auxiliary"), dict) else {}
     main = cfg.get("model") if isinstance(cfg.get("model"), dict) else {}
     want = _routing_object(cfg)
-    tasks = []
+    tasks, stale, out_of_sync = [], [], []
     for name in _aux_task_names():
         tcfg = aux.get(name) if isinstance(aux.get(name), dict) else {}
         eb = tcfg.get("extra_body") if isinstance(tcfg.get("extra_body"), dict) else {}
         cur = eb.get("provider") if isinstance(eb.get("provider"), dict) else None
+        route = _task_route(tcfg, main)
+        w = _routing_for(route, want)
         tasks.append({
             "task": name,
-            "openrouter": _task_goes_to_openrouter(tcfg, main),
+            "route": route,
+            "openrouter": route == "openrouter",
             "managed": name in state.get("managed", []),
             "has_routing": cur is not None,
-            "in_sync": cur == want if cur is not None else not want,
+            "in_sync": cur == w if cur is not None else not w,
         })
-    stale = [t["task"] for t in tasks if t["managed"] and not t["openrouter"]]
-    out_of_sync = [t["task"] for t in tasks if t["managed"] and t["openrouter"] and not t["in_sync"]]
+        if name in state.get("managed", []):
+            if not w:
+                stale.append(name)  # nothing to mirror there any more
+            elif not tasks[-1]["in_sync"]:
+                out_of_sync.append(name)
     return {"enabled": bool(state.get("enabled")), "want": want, "tasks": tasks,
             "stale": stale, "out_of_sync": out_of_sync}
 
@@ -637,53 +662,72 @@ async def aux_routing_status():
     return await asyncio.to_thread(_run)
 
 
+def _aux_apply(enabled, only_managed=False):
+    """Mirror the main routing onto every auxiliary task that goes to OpenRouter or Nous Portal, each
+    getting what its provider takes (enabled=True), or remove it from the tasks this plugin manages
+    (enabled=False). only_managed leaves every other task as it is. Uses Hermes' own config writer,
+    and writes only when something changes."""
+    from hermes_cli.config import load_config, save_config
+    cfg = load_config()
+    state = _read_state()
+    managed = set(state.get("managed", []))
+    aux = cfg.get("auxiliary") if isinstance(cfg.get("auxiliary"), dict) else {}
+    cfg["auxiliary"] = aux
+    main = cfg.get("model") if isinstance(cfg.get("model"), dict) else {}
+    want = _routing_object(cfg)
+    written, removed = [], []
+    for name in _aux_task_names():
+        if only_managed and name not in managed:
+            continue
+        tcfg = aux.get(name) if isinstance(aux.get(name), dict) else {}
+        w = _routing_for(_task_route(tcfg, main), want)
+        eb = tcfg.get("extra_body") if isinstance(tcfg.get("extra_body"), dict) else {}
+        if enabled and w:
+            if eb.get("provider") != w:
+                eb = dict(eb)
+                eb["provider"] = w
+                tcfg = dict(tcfg)
+                tcfg["extra_body"] = eb
+                aux[name] = tcfg
+                written.append(name)
+            managed.add(name)
+        elif name in managed:
+            # only remove what this plugin put there
+            if "provider" in eb:
+                eb = {k: v for k, v in eb.items() if k != "provider"}
+                tcfg = dict(tcfg)
+                if eb:
+                    tcfg["extra_body"] = eb
+                else:
+                    tcfg.pop("extra_body", None)
+                aux[name] = tcfg
+                removed.append(name)
+            managed.discard(name)
+    if written or removed:
+        save_config(cfg)
+    if bool(state.get("enabled")) != enabled or set(state.get("managed", [])) != managed:
+        _write_state({"enabled": enabled, "managed": sorted(managed)})
+    return {"written": written, "removed": removed, **_aux_status(load_config())}
+
+
+def aux_resync():
+    """With mirroring on, bring the managed tasks in step after the main provider or the routing
+    changed (a task now on Nous Portal must not keep OpenRouter's fields). Called from the plugin's
+    request hook; does nothing while mirroring is off or everything is in step."""
+    if not _read_state().get("enabled"):
+        return None
+    from hermes_cli.config import load_config
+    st = _aux_status(load_config())
+    if not (st["stale"] or st["out_of_sync"]):
+        return None
+    return _aux_apply(True, only_managed=True)
+
+
 @router.post("/aux-routing")
 async def aux_routing_apply(payload: Dict[str, Any] = Body(default={})):
-    """Mirror the main routing onto every OpenRouter-bound auxiliary task (enabled=true), or remove
-    it from the tasks this plugin manages (enabled=false). Uses Hermes' own config writer."""
+    """Mirror the main routing onto the background tasks (enabled=true), or remove it (enabled=false)."""
     enabled = bool((payload or {}).get("enabled"))
-
-    def _run():
-        from hermes_cli.config import load_config, save_config
-        cfg = load_config()
-        state = _read_state()
-        managed = set(state.get("managed", []))
-        aux = cfg.get("auxiliary") if isinstance(cfg.get("auxiliary"), dict) else {}
-        cfg["auxiliary"] = aux
-        main = cfg.get("model") if isinstance(cfg.get("model"), dict) else {}
-        want = _routing_object(cfg)
-        written, removed = [], []
-        for name in _aux_task_names():
-            tcfg = aux.get(name) if isinstance(aux.get(name), dict) else {}
-            to_or = _task_goes_to_openrouter(tcfg, main)
-            eb = tcfg.get("extra_body") if isinstance(tcfg.get("extra_body"), dict) else {}
-            if enabled and to_or and want:
-                if eb.get("provider") != want:
-                    eb = dict(eb)
-                    eb["provider"] = want
-                    tcfg = dict(tcfg)
-                    tcfg["extra_body"] = eb
-                    aux[name] = tcfg
-                    written.append(name)
-                managed.add(name)
-            elif name in managed:
-                # only remove what this plugin put there
-                if "provider" in eb:
-                    eb = {k: v for k, v in eb.items() if k != "provider"}
-                    tcfg = dict(tcfg)
-                    if eb:
-                        tcfg["extra_body"] = eb
-                    else:
-                        tcfg.pop("extra_body", None)
-                    aux[name] = tcfg
-                    removed.append(name)
-                managed.discard(name)
-        if written or removed:
-            save_config(cfg)
-        _write_state({"enabled": enabled, "managed": sorted(managed)})
-        return {"written": written, "removed": removed, **_aux_status(load_config())}
-
-    return await asyncio.to_thread(_run)
+    return await asyncio.to_thread(_aux_apply, enabled)
 
 
 # ---- every profile, including ones created later ------------------------------------------------
@@ -1370,6 +1414,8 @@ def _aai_call(model, messages, tools=None, provider=None, max_tokens=1500, json_
     if nous:
         if provider and provider.get("only"):
             raise RuntimeError("Nous Portal picks the provider itself, so comparing providers needs OpenRouter")
+        if _routing_for("nous", provider):
+            body["provider"] = _routing_for("nous", provider)  # the privacy rules, all the Portal takes
         try:
             from agent.portal_tags import nous_portal_tags
             body["tags"] = nous_portal_tags()  # the attribution Hermes sends with every Portal call

@@ -105,6 +105,8 @@ When using a model provider (e.g. openrouter which this plugin supports best) he
 - max price
 - minimum throughput and maximum latency
 
+On Nous Portal it adds only your data collection and zero data retention rules, the two provider fields the Portal accepts.
+
 The `llm_execution` middleware only reads the generation id and finish reason off the result, or on Nous Portal the cost it billed.
 
 ### Tool calls
@@ -144,6 +146,7 @@ We gave hermetic just enough power to provide extended security, while limiting 
 ### Disk writes (only when you ask)
 
 - Routing rules and the fixes you apply (through Hermes' own config functions, shown before writing)
+- background tasks you chose to give your routing rules, kept in step when your main provider changes
 - archived skills
 - skill versions you ship or revert
 - the guard's level and your guard rules
@@ -155,6 +158,7 @@ We gave hermetic just enough power to provide extended security, while limiting 
 ### What can run in the background
 
 - A thread checks every 5 minutes for skill changes made by the background review, and acts only if you turned automatic tests on. A short-lived thread stores the billed-spend snapshot.
+- At most once a minute, a short-lived thread checks that background tasks given your routing rules still match the main provider.
 
 
 ### Plugin updates

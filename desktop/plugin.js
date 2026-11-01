@@ -410,6 +410,8 @@ function modelKey(yaml, key) {
   return m ? m[1].trim() : ''
 }
 
+const configUsesNous = yaml => modelKey(yaml, 'provider').toLowerCase() === 'nous' || /nousresearch\.com/i.test(modelKey(yaml, 'base_url'))
+
 function configUsesOpenRouter(yaml) {
   const provider = modelKey(yaml, 'provider').toLowerCase()
   if (provider === 'openrouter' || /openrouter\.ai/i.test(modelKey(yaml, 'base_url'))) return true
@@ -831,7 +833,17 @@ async function loadLimits(profile) {
     const a = r.account
     const details = (a.details || []).filter(d => !/^(top up|\(or run|https?:)/i.test(String(d).trim()))
     if (!(a.windows || []).length && !details.length && !a.unavailable) return null
-    return { provider: r.provider, title: a.title, plan: a.plan, windows: a.windows || [], details, unavailable: a.unavailable }
+    return { provider: r.provider, title: a.title, plan: a.plan, windows: a.windows || [], details, unavailable: a.unavailable, credits: a.credits != null ? num(a.credits) : null }
+  } catch {
+    return null
+  }
+}
+
+// What Nous Portal billed per day for this profile's calls, next to the same calls at its list prices.
+async function loadNousBilled(profile) {
+  try {
+    const r = await api(profileReq(profile, { path: OWN + '/nous/billed?days=30', timeoutMs: 20_000 }))
+    return (r && r.days) || null
   } catch {
     return null
   }
@@ -1327,7 +1339,7 @@ function useMeterData() {
       const scope = sget('scope', 'profile') === 'all' ? 'all' : 'profile'
       const scoped = scope === 'all' ? profiles : profiles.filter(p => p.name === profile)
       const shown = scoped.length ? scoped : profiles
-      const [analytics, sessionsResult, retries, account, routingAll, aux, billedHistory, health, limits] = await Promise.all([
+      const [analytics, sessionsResult, retries, account, routingAll, aux, billedHistory, health, limits, nousBilled] = await Promise.all([
         loadAllAnalytics(shown, prices),
         loadSessions(profiles),
         loadRetries(lastNDays(DEFAULT_DAYS)[0]),
@@ -1336,8 +1348,12 @@ function useMeterData() {
         loadAux(profile),
         loadBilledHistory(),
         loadHealth(),
-        loadLimits(profile)
+        loadLimits(profile),
+        configUsesNous(yaml) ? loadNousBilled(profile) : null
       ])
+      // Nous credits that are only topped up have no allowance to measure against: under $1 left after
+      // paid calls this week is low (a free-only account at $0 is not)
+      if (limits && limits.credits != null && limits.credits < 1 && lastNDays(7).some(d => num(((nousBilled || {})[d] || {}).billed) > 0)) limits.low = true
       for (const x of sessionsResult.sessions) {
         if (!x.cost && x.input + x.output + x.cache > 0) {
           const c = costAt(priceOf(prices, x.model), x.input, x.output, x.cache)
@@ -1395,7 +1411,7 @@ function useMeterData() {
         error: null,
         cheapest,
         data: { ...analytics, sessions: sessionsResult.sessions.filter(x => inScope.has(x.profile)), sessionsComplete: sessionsResult.complete, routing, endpoints, aux, health,
-          orDaily: orAnalytics ? orAnalytics.daily : null, providerName: providerLabel(yaml) },
+          orDaily: orAnalytics ? orAnalytics.daily : null, providerName: providerLabel(yaml), nousBilled },
         scope,
         profileCount: profiles.length,
         prices,
@@ -1642,13 +1658,14 @@ const PlanLimits = ({ limits }) => {
   const top = wins[0]
   const tone = top ? (top.used_percent >= 95 ? 'bad' : top.used_percent >= 85 ? 'warn' : null) : null
   const balance = limits.details.find(d => /^total usable/i.test(d)) || limits.details[0]
+  const low = !top && limits.low
   return el(
     'div',
     { title: tip, style: { marginTop: 6 } },
     el(
       'div',
       { style: { display: 'flex', justifyContent: 'space-between', gap: 10, fontSize: 11, color: C.sub, fontVariantNumeric: 'tabular-nums', minWidth: 0 } },
-      el('span', { style: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', minWidth: 0 } },
+      el('span', { title: low ? 'Under $1 of credits left after paid calls this week' : undefined, style: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', minWidth: 0, color: low ? C.bad : undefined } },
         top ? describe(top).replace(/, resets .*$/, '') : limits.unavailable ? 'Limits unavailable' : balance),
       top && top.reset_at ? el('span', { style: { whiteSpace: 'nowrap', color: tone === 'bad' ? C.bad : tone === 'warn' ? C.warn : C.sub } }, 'resets ' + fmtReset(top.reset_at)) : null
     ),
@@ -3363,6 +3380,10 @@ const Body = ({ meter, prices, threshold, retries, yaml, profile, profileLabel, 
   // A day's list cost is an estimate spread from session totals, against OpenRouter's UTC day: one day is noise.
   const comparable = period !== 'today'
   const drift = comparable && acct != null && periodOR > 0.5 && acct > 0 ? acct / periodOR : null
+  // Nous Portal: what it billed for this profile's calls against the same calls at its list prices
+  const nousDays = meter.nousBilled ? (shown ? [shown] : m.days).map(d => meter.nousBilled[d]).filter(Boolean) : []
+  const nous = nousDays.reduce((a, d) => ({ billed: a.billed + num(d.billed), list: a.list + num(d.list), calls: a.calls + num(d.calls), floors: a.floors + num(d.floors) }), { billed: 0, list: 0, calls: 0, floors: 0 })
+  const nousDrift = drift == null && nous.list >= 0.05 ? nous.billed / nous.list : null
   // one profile sharing the key with others gets its share of the bill (keyShare);
   // all profiles get the bill plus the list cost of profiles billed elsewhere
   const share = acct != null && !!meter.orDaily && scope !== 'all'
@@ -3650,7 +3671,15 @@ const Body = ({ meter, prices, threshold, retries, yaml, profile, profileLabel, 
               (tokensAll > 0 ? ', ≈ ' + fmtUsd(acct / (tokensAll / 1e6)) + ' per M tokens billed vs ' + fmtUsd(periodHermes / (tokensAll / 1e6)) + ' list' : '') +
               (m.auxCost > 0 ? ', aux on paid lane ' + fmtUsd(m.auxCost) : '')
           })
-        : el(Cell, {
+        : nousDrift != null
+          ? el(Cell, {
+              tone: nousDrift >= 2 ? 'bad' : nousDrift >= 1.3 ? 'warn' : 'ok',
+              label: 'Pricing drift',
+              value: nousDrift.toFixed(1) + '×',
+              sub: nous.floors ? nous.floors + (nous.floors === 1 ? ' minimum charge' : ' minimum charges') : 'list price',
+              tip: 'Nous Portal billed ' + fmtUsd(nous.billed) + ' for ' + nous.calls + (nous.calls === 1 ? ' call' : ' calls') + ', ' + fmtUsd(nous.list) + ' at its list prices' + (nous.floors ? ', ' + nous.floors + ' raised to its minimum charge' : '')
+            })
+          : el(Cell, {
             tone: routingTone,
             label: orAny ? 'Routing' : 'Background',
             value: m.auxCost > 0 ? fmtUsd(m.auxCost) : 'clean',
@@ -5068,9 +5097,10 @@ const Chip = () => {
   const liveRate = rates.reduce((a, r) => a + r.rate, 0)
   const tone = liveRate >= 5 ? 'bad' : liveRate >= 1.5 ? 'warn' : null
   const running = rates.length > 0
-  // credits or the API key cap nearly used up: 5% or less left turns the spark red
+  // credits, the API key cap or a plan's own limit (a Nous spend cap) nearly used up: 5% or less left turns the spark red
   const quotaLeft = spendLimit(account) ? spendLimit(account).share : null
-  const quotaLow = quotaLeft != null && quotaLeft <= 0.05
+  const planUsed = limits ? Math.max(0, ...limits.windows.filter(w => w.scope !== 'model' && w.used_percent != null).map(w => w.used_percent)) : 0
+  const quotaLow = (quotaLeft != null && quotaLeft <= 0.05) || planUsed >= 95 || !!(limits && limits.low)
 
   const label = error ? '-' : running ? fmtRate(liveRate) : fmtUsd(spend)
   const sub = error ? '' : running ? fmtUsd(spend) + (rates.length > 1 ? '\u2003' + rates.length + ' agents' : '') : fmtRate(avgRate)

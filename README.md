@@ -47,8 +47,8 @@ Deep and analytical cost tracking especially when using multi-provider routing (
 
 - Spend analytics per day, per session and live $/hour while turns run
 - Cache hit rate: how much of each prompt came from the provider's cache, and what cache resets cost you.
-- Pricing drift: what you were billed compared with list prices.
-- OpenRouter spend limits with warnings when close to hit limits
+- Pricing drift: what you were billed compared with list prices, on OpenRouter and, call by call, on Nous Portal.
+- OpenRouter spend limits and Nous Portal spend caps, with warnings when close to hit limits
 - **Providers** (OpenRouter): which providers actually served your calls, where they are based, and your routing rules, with an extra verbose policy editor for them.
 - **Improvement suggestions**: one-click config fixes, for example routing to the cheapest provider, running background tasks on a cheaper model, turning fallback on when calls fail on rate limits, or turning on Hermes' proactive prune of old tool output when, at the prices your chats were actually served, the re-sends it saves outweigh the full-price re-send each prune causes. Every fix shows the exact `config.yaml` change before it writes anything, and writes on top of the config as it is at that moment.
 
@@ -105,7 +105,7 @@ When using a model provider (e.g. openrouter which this plugin supports best) he
 - max price
 - minimum throughput and maximum latency
 
-The `llm_execution` middleware only reads the generation id and finish reason off the result.
+The `llm_execution` middleware only reads the generation id and finish reason off the result, or on Nous Portal the cost it billed.
 
 ### Tool calls
 
@@ -119,7 +119,7 @@ A `pre_tool_call` hook checks each tool call against HDR's rules (`hdr_rules.py`
 
 On AAI, only when you press replay, compare, draft or judge, or when you turn on automatic tests.
 - Fix drafts, the judge and rubric drafts use Hermes' plugin model access (`ctx.llm`) on your main model. To let the judge use a different model, allow it in `config.yaml` under `plugins.entries.hermetic.llm` (`allow_model_override: true` and `allowed_models`).
-- Replays call OpenRouter with the `OPENROUTER_API_KEY` Hermes holds for the profile, read through Hermes' secret scope. They follow your routing rules and appear in your spend like any other call. A replay costs about $0.01 per test; automatic tests stop at $0.50 a day.
+- Replays go to the profile's main provider: OpenRouter with the `OPENROUTER_API_KEY` Hermes holds for the profile, read through Hermes' secret scope and following your routing rules, or Nous Portal with Hermes' own Nous sign-in. They appear in your spend like any other call. A replay costs about $0.01 per test; automatic tests stop at $0.50 a day.
 - No API key ever reaches the popover - we're proud of this achievement as hermetic itself is a security-awareness tool, so we always try to act like one.
 
 ### Plugin-initiated network calls

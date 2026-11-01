@@ -10,6 +10,7 @@ Profile scoping (?profile=) is applied by the dashboard before the handler runs.
 """
 
 import asyncio
+import math
 import os
 import time
 from itertools import zip_longest
@@ -264,17 +265,35 @@ def _account_snapshot(provider):
     if provider == "nous":
         from agent.account_usage import build_nous_credits_snapshot
         from hermes_cli.nous_account import get_nous_portal_account_info
-        return build_nous_credits_snapshot(get_nous_portal_account_info(force_fresh=True))
-    return fetch_account_usage(provider)
+        info = get_nous_portal_account_info(force_fresh=True)
+        usable = getattr(getattr(info, "paid_service_access_info", None), "total_usable_credits", None)
+        return build_nous_credits_snapshot(info), {"window": _nous_spend_cap(info),
+                                                   "credits": usable if isinstance(usable, (int, float)) and math.isfinite(usable) else None}
+    return fetch_account_usage(provider), None
 
 
-def _snapshot_fields(snap):
-    """The report's limit windows and detail lines, for the popover to show without parsing text."""
+def _nous_spend_cap(info):
+    """The spend cap a Nous Portal organisation sets for each member, as a limit window: Hermes' own
+    report leaves it out, and requests stop once it is reached."""
+    access = getattr(info, "paid_service_access_info", None)
+    cap, spent = getattr(access, "member_spend_cap_usd", None), getattr(access, "member_spend_usd", None)
+    ok = lambda v: isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+    if not (ok(cap) and cap > 0 and ok(spent)):
+        return None
+    return {"label": "Spend cap", "used_percent": max(0.0, min(100.0, spent / cap * 100.0)), "reset_at": None,
+            "detail": "$%.2f of $%.2f" % (max(0.0, spent), cap), "scope": None}
+
+
+def _snapshot_fields(snap, extra=None):
+    """The report's limit windows and detail lines, for the popover to show without parsing text, plus
+    what hermetic adds for Nous (the spend cap window, the usable credits as a number)."""
     if not snap:
         return None
+    extra = extra or {}
     return {"title": snap.title, "plan": snap.plan, "details": list(snap.details), "unavailable": snap.unavailable_reason,
+            "credits": extra.get("credits"),
             "windows": [{"label": w.label, "used_percent": w.used_percent, "reset_at": w.reset_at.isoformat() if w.reset_at else None,
-                         "detail": w.detail, "scope": w.scope} for w in snap.windows]}
+                         "detail": w.detail, "scope": w.scope} for w in snap.windows] + ([extra["window"]] if extra.get("window") else [])}
 
 
 @router.get("/account/usage")
@@ -294,10 +313,10 @@ async def account_usage(profile: Optional[str] = None):
         if hit and now - hit[0] < _ACCOUNT_TTL_S:
             return {"provider": provider, "lines": list(hit[1]), "account": hit[2], "cached": True}
         try:
-            snap = _account_snapshot(provider)
+            snap, extra = _account_snapshot(provider)
         except Exception:
-            snap = None
-        lines, fields = render_account_usage_lines(snap), _snapshot_fields(snap)
+            snap, extra = None, None
+        lines, fields = render_account_usage_lines(snap), _snapshot_fields(snap, extra)
         _ACCOUNT_CACHE[key] = (now, lines, fields)
         return {"provider": provider, "lines": lines, "account": fields, "cached": False}
 
@@ -687,6 +706,42 @@ async def billed():
     return await asyncio.to_thread(_run)
 
 
+# ---- what Nous Portal billed, call by call (see __init__.py: _note_nous_bill) ----------------------
+
+@router.get("/nous/billed")
+async def nous_billed(days: int = Query(30, ge=1, le=90), profile: Optional[str] = None):
+    """Per local day: what Nous Portal billed and the same calls at its list prices, read through
+    Hermes. A call billed above list (a minimum charge, a sale that ended) shows as drift."""
+    def _run():
+        _n, home = _profile_home(profile)
+        since = time.time() - days * 86400
+        rows = [r for r in _aai_read(_data_dir(home) / "nous-billed.jsonl") if float(r.get("ts") or 0) >= since]
+        if not rows:
+            return {"days": {}}
+        try:
+            from hermes_cli.models_pricing import get_pricing_for_provider
+            prices = get_pricing_for_provider("nous", cached_only=True) or get_pricing_for_provider("nous") or {}
+        except Exception:
+            prices = {}
+        out = {}
+        for r in rows:
+            p = prices.get(r.get("model") or "")
+            if not p:
+                continue
+            cache = int(r.get("cache") or 0)
+            fresh = max(0, int(r.get("input") or 0) - cache)
+            listed = (fresh * float(p.get("prompt") or 0) + cache * float(p.get("input_cache_read") or p.get("prompt") or 0)
+                      + int(r.get("output") or 0) * float(p.get("completion") or 0))
+            d = out.setdefault(time.strftime("%Y-%m-%d", time.localtime(float(r["ts"]))), {"billed": 0.0, "list": 0.0, "calls": 0, "floors": 0})
+            d["billed"] += float(r.get("billed") or 0)
+            d["list"] += listed
+            d["calls"] += 1
+            d["floors"] += 1 if r.get("floor") else 0
+        return {"days": out}
+
+    return await asyncio.to_thread(_run)
+
+
 # ---- health: which Hermes internals are missing (the popover shows a line only when degraded) -----
 
 @router.get("/health")
@@ -1051,9 +1106,9 @@ async def aai_work(payload: Dict[str, Any] = Body(default={}), profile: Optional
 
 
 # ==== AAI phases 2 and 3: cases, plan-only replay, bake-off, gate, draft fixes, judge, export ========
-# Every model call here goes through OpenRouter with the profile's own routing rules (zero retention,
-# no data collection, blocks) and is costed; the gate is off until the user turns it on, and it stops
-# at a daily budget. Nothing here sends the API key anywhere but OpenRouter.
+# Every replay goes to the profile's main provider: OpenRouter with the profile's own routing rules (zero
+# retention, no data collection, blocks), or Nous Portal. Each is costed; the gate is off until the user
+# turns it on, and it stops at a daily budget. Nothing here sends a credential anywhere but that provider.
 
 import difflib as _aai_difflib
 import urllib.request as _aai_urlreq
@@ -1216,16 +1271,63 @@ class _aai_secret_scope:
         return False
 
 
-def _aai_runtime():
-    """OpenRouter connection for replays. A replay has to resend the agent's own tool definitions and
-    pin providers through OpenRouter routing, which Hermes' plugin LLM lane does not offer, so it calls
-    OpenRouter directly with the key Hermes holds, read through Hermes' secret API (never from files)."""
+def _aai_main_provider(cfg):
+    m = (cfg or {}).get("model") if isinstance((cfg or {}).get("model"), dict) else {}
+    prov, base = str(m.get("provider") or "").strip().lower(), str(m.get("base_url") or "").lower()
+    return "nous" if prov == "nous" or "nousresearch.com" in base else "openrouter"
+
+
+def _aai_runtime(cfg=None):
+    """Connection for replays, following the profile's main provider: Nous Portal through Hermes' own
+    Nous sign-in, otherwise OpenRouter. A replay has to resend the agent's own tool definitions (and on
+    OpenRouter pin providers through its routing), which Hermes' plugin LLM lane does not offer, so it
+    calls the provider directly with the credential Hermes holds, read through Hermes (never from files)."""
+    if cfg is None:
+        try:
+            cfg = _aai_load_cfg()
+        except Exception:
+            cfg = {}
+    if _aai_main_provider(cfg) == "nous":
+        try:
+            with _aai_secret_scope():
+                from hermes_cli.runtime_provider import resolve_runtime_provider
+                rt = resolve_runtime_provider(requested="nous")
+        except Exception as exc:
+            raise RuntimeError("Replays on Nous Portal need you signed in to Nous in Hermes") from exc
+        if not (rt or {}).get("api_key") or not rt.get("base_url"):
+            raise RuntimeError("Replays on Nous Portal need you signed in to Nous in Hermes")
+        return {"api_key": rt["api_key"], "base_url": str(rt["base_url"]).rstrip("/"), "kind": "nous"}
     with _aai_secret_scope():
         from agent.secret_scope import get_secret
         key = get_secret("OPENROUTER_API_KEY")
     if not key:
         raise RuntimeError("Replays need an OpenRouter key (OPENROUTER_API_KEY) set up in Hermes")
-    return {"api_key": key, "base_url": "https://openrouter.ai/api/v1"}
+    return {"api_key": key, "base_url": "https://openrouter.ai/api/v1", "kind": "openrouter"}
+
+
+def _aai_http_error(exc):
+    """The provider's own error message (\"requires available credits\", a bad model id) instead of a bare status."""
+    try:
+        body = _aai_json.loads(exc.read().decode("utf-8", "replace") or "{}")
+        err = body.get("error") if isinstance(body.get("error"), dict) else body
+        msg = str(err.get("message") or "").strip()
+    except Exception:
+        msg = ""
+    return RuntimeError(msg[:300]) if msg else exc
+
+
+def _aai_nous_cost(model, usage):
+    """For a Nous Portal answer whose usage leaves out the cost: priced at the Portal's own list prices,
+    as Hermes reads them."""
+    try:
+        from hermes_cli.models_pricing import get_pricing_for_provider
+        p = (get_pricing_for_provider("nous") or {}).get(model) or {}
+        cached = int(((usage.get("prompt_tokens_details") or {}).get("cached_tokens")) or 0)
+        fresh = max(0, int(usage.get("prompt_tokens") or 0) - cached)
+        read = float(p.get("input_cache_read") or p.get("prompt") or 0)
+        return fresh * float(p.get("prompt") or 0) + cached * read + int(usage.get("completion_tokens") or 0) * float(p.get("completion") or 0)
+    except Exception:
+        return 0.0
 
 
 _AAI_LLM = {}
@@ -1260,20 +1362,30 @@ def _aai_helper(model, messages, tools=None, provider=None, max_tokens=1500, jso
 
 def _aai_call(model, messages, tools=None, provider=None, max_tokens=1500, json_mode=False, tool_choice="auto", reasoning=None):
     rp = _aai_runtime()
-    base = rp["base_url"]
-    body = {"model": model, "messages": messages, "max_tokens": max_tokens, "usage": {"include": True}}
+    base, nous = rp["base_url"], rp.get("kind") == "nous"
+    body = {"model": model, "messages": messages, "max_tokens": max_tokens}
     if tools:
         body["tools"] = tools
         body["tool_choice"] = tool_choice
-    if provider:
-        body["provider"] = provider
+    if nous:
+        if provider and provider.get("only"):
+            raise RuntimeError("Nous Portal picks the provider itself, so comparing providers needs OpenRouter")
+        try:
+            from agent.portal_tags import nous_portal_tags
+            body["tags"] = nous_portal_tags()  # the attribution Hermes sends with every Portal call
+        except Exception:
+            pass
+    else:
+        body["usage"] = {"include": True}
+        if provider:
+            body["provider"] = provider
     if json_mode:
         body["response_format"] = {"type": "json_object"}
     if reasoning:
         body["reasoning"] = reasoning
     req = _aai_urlreq.Request(base + "/chat/completions", data=_aai_json.dumps(body).encode(),
                               headers={"Authorization": "Bearer " + rp["api_key"], "Content-Type": "application/json",
-                                       "X-Title": "hermetic AAI"})
+                                       **({} if nous else {"X-Title": "hermetic AAI"})})
     t0 = time.time()
     import random as _rnd
     import urllib.error as _uerr
@@ -1284,7 +1396,7 @@ def _aai_call(model, messages, tools=None, provider=None, max_tokens=1500, json_
             break
         except _uerr.HTTPError as exc:
             if exc.code != 429 or attempt == 2:
-                raise
+                raise _aai_http_error(exc) from None
             wait = exc.headers.get("Retry-After") if exc.headers else None
             try:
                 wait = min(20.0, float(wait))
@@ -1296,7 +1408,8 @@ def _aai_call(model, messages, tools=None, provider=None, max_tokens=1500, json_
     usage = data.get("usage") or {}
     return {"content": msg.get("content") or "", "tool_calls": msg.get("tool_calls") or [], "finish": ch.get("finish_reason"),
             "provider": data.get("provider"), "id": data.get("id"), "secs": round(time.time() - t0, 2),
-            "cost": float(usage.get("cost") or 0), "input": int(usage.get("prompt_tokens") or 0), "output": int(usage.get("completion_tokens") or 0)}
+            "cost": float(usage.get("cost") or 0) or (_aai_nous_cost(model, usage) if nous else 0.0),
+            "input": int(usage.get("prompt_tokens") or 0), "output": int(usage.get("completion_tokens") or 0)}
 
 
 def _aai_provider_obj(cfg, pin=None, fast=False):

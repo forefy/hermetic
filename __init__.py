@@ -228,7 +228,8 @@ def _note_reply(kw, row, rid) -> None:
 
 
 def _on_llm_execution(**kw):
-    """Pass-through; reads the generation id and OpenRouter's native finish reason off the result."""
+    """Pass-through; reads the generation id and OpenRouter's native finish reason off the result, or
+    what Nous Portal billed."""
     result = kw["next_call"](kw.get("request"))
     try:
         rid = kw.get("api_request_id")
@@ -244,9 +245,45 @@ def _on_llm_execution(**kw):
                 _EXEC[rid] = {"gen": gen if isinstance(gen, str) else "", "native": native if isinstance(native, str) else ""}
                 while len(_EXEC) > _EXEC_MAX:
                     _EXEC.popitem(last=False)
+        elif provider == "nous" or "nousresearch.com" in base_url:
+            _note_nous_bill(kw, result)
     except Exception:
         pass
     return result
+
+
+def _usage_field(u, name):
+    """A usage field off an SDK object (extra fields included), a namespace or a dict."""
+    if u is None:
+        return None
+    if isinstance(u, dict):
+        return u.get(name)
+    v = getattr(u, name, None)
+    return v if v is not None else (getattr(u, "model_extra", None) or {}).get(name)
+
+
+def _note_nous_bill(kw, result) -> None:
+    """What Nous Portal billed for a call, as its answer reports it (Hermes' own hooks carry only
+    tokens), for pricing drift: the popover prices the same tokens at the Portal's list."""
+    usage = _usage_field(result, "usage")
+    cost = _usage_field(usage, "cost")
+    if not isinstance(cost, (int, float)) or isinstance(cost, bool):
+        return
+    cached = _usage_field(_usage_field(usage, "prompt_tokens_details"), "cached_tokens")
+    row = {"ts": time.time(), "session": kw.get("session_id") or "",
+           "model": _usage_field(result, "model") or kw.get("model") or "", "billed": float(cost),
+           "floor": 1 if _usage_field(_usage_field(usage, "cost_details"), "floor_applied") else 0,
+           "input": int(_usage_field(usage, "prompt_tokens") or 0), "output": int(_usage_field(usage, "completion_tokens") or 0),
+           "cache": int(cached or 0)}
+    path = data_dir() / "nous-billed.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(row, separators=(",", ":")) + "\n")
+    try:
+        if path.stat().st_size > _MAX_BYTES:
+            _compact(path)
+    except OSError:
+        pass
 
 
 def _routing_summary() -> str:

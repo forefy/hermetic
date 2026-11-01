@@ -3,12 +3,21 @@
 Run inside Hermes' environment: bash ~/.hermes/hermes-agent/scripts/run-in-hermes-env python3 tests/test_frustration.py
 """
 import asyncio
+import atexit
 import importlib.util
 import json
+import shutil
 import sys
 import tempfile
 import time
 from pathlib import Path
+
+
+def _tmp():
+    """A temporary folder that is removed when the test run ends."""
+    d = Path(tempfile.mkdtemp(prefix="hermetic-test-"))
+    atexit.register(shutil.rmtree, d, True)
+    return d
 
 HERE = Path(__file__).resolve().parent
 spec = importlib.util.spec_from_file_location("plugin_api", HERE.parent / "dashboard" / "plugin_api.py")
@@ -65,14 +74,14 @@ def test_compacted_turns_are_read():
 
 
 def test_corrections_include_compacted_ones():
-    use_fake(Path(tempfile.mkdtemp()))
+    use_fake(_tmp())
     items = asyncio.run(api.aai_corrections(days=14, profile=None))["items"]
     assert [(x["message_id"], x["correction_id"]) for x in items] == [("2", "3")]
     assert items[0]["text"] == "wtf the chart is still broken??", "what Hermes added in front is left out"
 
 
 def test_rate_queue_puts_pushback_first_then_takes_turns():
-    home = Path(tempfile.mkdtemp())
+    home = _tmp()
     use_fake(home)
     items = asyncio.run(api.aai_rate_queue(n=5, profile=None))["items"]
     assert [x["message_id"] for x in items] == ["2", "4", "8"], "pushed back on, moved on from, then no answer yet"

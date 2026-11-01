@@ -7,6 +7,7 @@ import asyncio
 import importlib.util
 import json
 import os
+import shutil
 import sys
 import tempfile
 import threading
@@ -206,4 +207,5 @@ if __name__ == "__main__":
             except AssertionError as exc:
                 failed += 1
                 print("FAIL", name, exc)
+    shutil.rmtree(HOME, ignore_errors=True)
     sys.exit(1 if failed else 0)

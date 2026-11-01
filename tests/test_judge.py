@@ -2,10 +2,19 @@
 
 Run inside Hermes' environment: bash ~/.hermes/hermes-agent/scripts/run-in-hermes-env python3 tests/test_judge.py
 """
+import atexit
 import importlib.util
+import shutil
 import sys
 import tempfile
 from pathlib import Path
+
+
+def _tmp():
+    """A temporary folder that is removed when the test run ends."""
+    d = Path(tempfile.mkdtemp(prefix="hermetic-test-"))
+    atexit.register(shutil.rmtree, d, True)
+    return d
 
 HERE = Path(__file__).resolve().parent
 spec = importlib.util.spec_from_file_location("plugin_api", HERE.parent / "dashboard" / "plugin_api.py")
@@ -65,7 +74,7 @@ def test_trust_follows_the_model_that_was_checked():
 
 def _gate(trusted):
     """One skill change, two tests; the judge fails both after the change, every other check passes."""
-    tmp = Path(tempfile.mkdtemp())
+    tmp = _tmp()
     skill_file = tmp / "SKILL.md"
     skill_file.write_text("new", encoding="utf-8")
     state = {"gate_mode": "revert", "daily_budget": 0.5, "judge_model": "deepseek/deepseek-v4.1-flash", "last_ledger_ts": 1.0,
@@ -101,7 +110,7 @@ def test_check_route_counts_corrections_and_saves_trust():
     """A judge that likes everything agrees with good stars but passes the corrected replies: not trusted."""
     import asyncio
     import json
-    tmp = Path(tempfile.mkdtemp())
+    tmp = _tmp()
     saved = {}
     ratings = [{"message_id": f"g{i}", "value": "good", "score": 5} for i in range(16)] + [{"message_id": f"b{i}", "value": "bad", "score": 1} for i in range(6)]
     api._profile_home = lambda profile: ("p", tmp)

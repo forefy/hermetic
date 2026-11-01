@@ -2,10 +2,20 @@
 
     python tests/test_hdr.py
 """
+import atexit
 import importlib.util
 import os
+import shutil
 import sys
+import tempfile
 from pathlib import Path
+
+
+def _tmp():
+    """A temporary folder that is removed when the test run ends."""
+    d = Path(tempfile.mkdtemp(prefix="hermetic-test-"))
+    atexit.register(shutil.rmtree, d, True)
+    return d
 
 HERE = Path(__file__).resolve().parent
 spec = importlib.util.spec_from_file_location("plugin_api", HERE.parent / "dashboard" / "plugin_api.py")
@@ -98,8 +108,7 @@ def test_one_row_per_place_and_expected_reads_set_aside():
 
 def test_expected_route_saves_and_undoes():
     import asyncio
-    import tempfile
-    tmp = Path(tempfile.mkdtemp())
+    tmp = _tmp()
     api._profile_home = lambda profile: ("p", tmp)
     body = {"path": "/Library/LaunchDaemons/", "key": "cron_4825824d6b1f", "label": "Endpoint threat hunt (bi-daily)"}
     assert asyncio.run(api.hdr_expected(body, profile=None))["expected"] == 1

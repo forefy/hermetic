@@ -48,7 +48,7 @@ Deep and analytical cost tracking especially when using multi-provider routing (
 - Spend analytics per day, per session and live $/hour while turns run
 - Cache hit rate: how much of each prompt came from the provider's cache, and what cache resets cost you.
 - Pricing drift: what you were billed compared with list prices, on OpenRouter and, call by call, on Nous Portal.
-- OpenRouter spend limits and Nous Portal spend caps, with warnings when close to hit limits
+- OpenRouter spend limits and workspace budgets, and Nous Portal spend caps, with warnings when close to hit limits
 - **Providers** (OpenRouter): which providers actually served your calls, where they are based, and your routing rules, with an extra verbose policy editor for them.
 - **Improvement suggestions**: one-click config fixes, for example routing to the cheapest provider, running background tasks on a cheaper model, turning fallback on when calls fail on rate limits, or turning on Hermes' proactive prune of old tool output when, at the prices your chats were actually served, the re-sends it saves outweigh the full-price re-send each prune causes. Every fix shows the exact `config.yaml` change before it writes anything, and writes on top of the config as it is at that moment.
 
@@ -126,7 +126,7 @@ On AAI, only when you press replay, compare, draft or judge, or when you turn on
 
 ### Plugin-initiated network calls
 
-Network calls are only done to supported providers (e.g. OpenRouter) to get latest price information, usage limits etc. no API keys sent through those calls, and only few requests a day are sent for different model informatics.
+Network calls are only done to supported providers (e.g. OpenRouter) to get latest price information, usage limits etc. no API keys sent through those calls, and only few requests a day are sent for different model informatics. The one exception is OpenRouter's workspace and guardrail budgets, which Hermes does not report, so hermetic reads them with the profile's OpenRouter key, sent only to openrouter.ai.
 
 
 ### Disk reads

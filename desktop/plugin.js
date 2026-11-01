@@ -793,7 +793,7 @@ function parseAccountLines(lines) {
   if (!lines || !lines.length) return null
   const text = lines.join('\n')
     if (!/openrouter/i.test(text)) return null
-    const limitM = text.match(/\$([\d,.]+) of \$([\d,.]+) remaining/)
+    const limitM = text.match(/\$([\d,.]+) of \$([\d,.]+) remaining(?:\s*\S\s*resets (daily|weekly|monthly))?/)
     return {
       t: Date.now(),
       total: money(/API key usage: \$([\d,.]+) total/, text),
@@ -802,24 +802,38 @@ function parseAccountLines(lines) {
       month: money(/\$([\d,.]+) this month/, text),
       balance: money(/Credits balance: \$([\d,.]+)/, text),
       remaining: limitM ? parseFloat(limitM[1].replace(/,/g, '')) : null,
-      limit: limitM ? parseFloat(limitM[2].replace(/,/g, '')) : null
+      limit: limitM ? parseFloat(limitM[2].replace(/,/g, '')) : null,
+      limitReset: limitM ? limitM[3] || null : null
     }
 }
 
-// What actually stops requests: the API key's cap or the prepaid credits, whichever runs out
-// first. Credits bought = this key's spend + the balance, exact while it is the only key spending.
-function spendLimit(a) {
+// What actually stops requests: the API key's cap, the prepaid credits or a workspace or guardrail
+// budget, whichever runs out first. With a period (today, 7d, 30d) the limit that resets on that
+// period (daily, weekly, monthly) comes first, else whichever runs out first. total picks among the
+// ones that never reset instead (credits, a key cap without reset, lifetime budgets). Credits bought
+// = this key's spend + the balance, exact while it is the only key spending. lowest is the smallest
+// share left of any of them, for the chip. canTotal: there is both kind to switch between.
+const PERIOD_RESET = { today: 'daily', '7d': 'weekly', '30d': 'monthly' }
+function spendLimit(a, period, total) {
   if (!a) return null
   const keyLeft = a.limit > 0 && a.remaining != null ? a.remaining : null
   const credits = a.balance != null && a.total != null ? { left: a.balance, bought: a.total + a.balance } : null
-  if (keyLeft == null && !credits) return null
-  const byCredits = !!credits && (keyLeft == null || credits.left < keyLeft)
-  const cap = byCredits ? credits.bought : a.limit
-  const left = byCredits ? credits.left : keyLeft
-  const tip = byCredits
-    ? fmtUsd(credits.left) + ' credits left' + (keyLeft != null ? ' (key cap $' + Math.round(a.limit) + ', ' + fmtUsd(keyLeft) + ' left on the key)' : '') + '. Credits bought = spent + balance'
-    : fmtUsd(keyLeft) + ' left on the API key cap' + (credits ? ' (' + fmtUsd(credits.left) + ' credits left)' : '')
-  return { used: byCredits ? a.total : a.limit - a.remaining, cap, left, by: byCredits ? 'credits' : 'key', share: cap > 0 ? left / cap : 0, tip }
+  const budgets = (a.budgets || []).map(b => ({ used: b.spent, cap: b.limit, left: b.limit - b.spent, by: 'budget', label: b.label, interval: b.interval, reset_at: b.reset_at }))
+  const all = budgets.concat(credits ? [{ used: a.total, cap: credits.bought, left: credits.left, by: 'credits' }] : [], keyLeft != null ? [{ used: a.limit - a.remaining, cap: a.limit, left: keyLeft, by: 'key', interval: a.limitReset || null }] : [])
+  if (!all.length) return null
+  const want = PERIOD_RESET[period]
+  const same = all.filter(x => want && x.interval === want)
+  const lasting = all.filter(x => !x.interval || x.interval === 'lifetime')
+  const canTotal = lasting.length > 0 && lasting.length < all.length
+  const pool = total && lasting.length ? lasting : same.length ? same : all
+  const pick = pool.reduce((m, x) => (x.left < m.left ? x : m))
+  const line = x => x.by === 'credits' ? fmtUsd(x.left) + ' credits left (credits bought = spent + balance)'
+    : x.by === 'key' ? fmtUsd(x.left) + ' left on the API key cap of $' + Math.round(x.cap) + (x.interval ? ', resets ' + x.interval : '')
+    : x.label + ' ' + fmtUsd(Math.max(0, x.left)) + ' left of $' + Math.round(x.cap) + (x.reset_at ? ', resets ' + fmtReset(x.reset_at) : '')
+  const pace = a.week && pick.by !== 'budget' ? ', ~' + Math.max(0, pick.left / (a.week / 7)).toFixed(1) + ' days at this week\'s pace' : ''
+  const tip = [line(pick) + pace].concat(all.filter(x => x !== pick).map(line)).join('\n')
+  const share = x => (x.cap > 0 ? Math.max(0, x.left) / x.cap : 0)
+  return { used: pick.used, cap: pick.cap, left: pick.left, by: pick.by, interval: pick.interval, reset_at: pick.reset_at, share: share(pick), lowest: Math.min.apply(null, all.map(share)), canTotal, tip }
 }
 
 let backendPatched = true
@@ -856,7 +870,7 @@ async function loadAccount(sid) {
       if (r && Array.isArray(r.lines)) {
         backendPatched = true
         const parsed = parseAccountLines(r.lines)
-        if (parsed) return parsed
+        if (parsed) return Object.assign(parsed, { budgets: (r.account && r.account.budgets) || [] })
         break
       }
     } catch {
@@ -3367,7 +3381,17 @@ const Body = ({ meter, prices, threshold, retries, yaml, profile, profileLabel, 
   const multiple = typicalHourly > 0 ? liveRate / typicalHourly : 0
 
   const acct = account ? (period === 'today' ? account.today : period === '7d' ? account.week : account.month) : null
-  const lim = spendLimit(account)
+  const [limTotal, setLimTotal] = useState(() => !!sget('limTotal', false))
+  const lim = spendLimit(account, period, limTotal)
+  const flipLimit = e => {
+    e.stopPropagation()
+    setLimTotal(!limTotal)
+    sset('limTotal', !limTotal)
+  }
+  // the limit's kind, clickable to switch between the period's limit and what never resets
+  const limWord = word => (lim && lim.canTotal
+    ? el('span', { onClick: flipLimit, title: limTotal ? 'Show the limit nearest to stopping requests' : 'Show what is left in total', style: { cursor: 'pointer', textDecoration: 'underline dotted', textUnderlineOffset: 2 } }, word)
+    : word)
   // Billed figures are OpenRouter's UTC calendar week / month to date, so the Hermes side is summed
   // over the same window rather than the trailing 7 / 30 days the bars show.
   const windowStart = acct != null && period !== 'today' ? accountWindowStart(period) : null
@@ -3621,9 +3645,12 @@ const Body = ({ meter, prices, threshold, retries, yaml, profile, profileLabel, 
                 'span',
                 {
                   style: { marginLeft: 'auto', whiteSpace: 'nowrap', color: lim.share <= 0.05 ? C.bad : lim.share < 0.15 ? C.warn : undefined },
-                  title: lim.tip + (account.week ? ', ~' + Math.max(0, lim.left / (account.week / 7)).toFixed(1) + ' days at this week\'s pace' : '')
+                  title: lim.tip
                 },
-                fmtUsd(lim.used) + ' used / $' + Math.round(lim.cap) + (lim.by === 'credits' ? ' credits' : '')
+                // a limit that resets with the view shows its spend, one that never resets what is left of it
+                lim.interval && lim.interval !== 'lifetime'
+                  ? [fmtUsd(lim.used) + ' used / $' + Math.round(lim.cap) + ' ', limWord(lim.interval)]
+                  : [fmtUsd(Math.max(0, lim.left)) + ' ', limWord(lim.by === 'credits' ? 'credits left' : lim.by === 'key' ? 'left on key cap' : 'budget left')]
               )
             : null
         )
@@ -5098,7 +5125,7 @@ const Chip = () => {
   const tone = liveRate >= 5 ? 'bad' : liveRate >= 1.5 ? 'warn' : null
   const running = rates.length > 0
   // credits, the API key cap or a plan's own limit (a Nous spend cap) nearly used up: 5% or less left turns the spark red
-  const quotaLeft = spendLimit(account) ? spendLimit(account).share : null
+  const quotaLeft = spendLimit(account) ? spendLimit(account).lowest : null
   const planUsed = limits ? Math.max(0, ...limits.windows.filter(w => w.scope !== 'model' && w.used_percent != null).map(w => w.used_percent)) : 0
   const quotaLow = (quotaLeft != null && quotaLeft <= 0.05) || planUsed >= 95 || !!(limits && limits.low)
 

@@ -260,8 +260,11 @@ _ACCOUNT_TTL_S = 60.0
 def _account_snapshot(provider):
     """Hermes' own account report for a provider: OpenRouter, Anthropic and Codex through
     fetch_account_usage (which also asks provider plugins), Nous through its portal account. Hermes
-    looks up the credential; Hermetic only ever sees the report."""
+    looks up the credential and Hermetic only sees the report, except for OpenRouter's workspace and
+    guardrail budgets, which Hermes' report leaves out (see _openrouter_budgets)."""
     from agent.account_usage import fetch_account_usage
+    if provider == "openrouter":
+        return fetch_account_usage(provider), {"budgets": _openrouter_budgets()}
     if provider == "nous":
         from agent.account_usage import build_nous_credits_snapshot
         from hermes_cli.nous_account import get_nous_portal_account_info
@@ -284,14 +287,49 @@ def _nous_spend_cap(info):
             "detail": "$%.2f of $%.2f" % (max(0.0, spent), cap), "scope": None}
 
 
+_OR_BUDGET_SCOPE = {"workspace": "Workspace", "member": "Your", "workspace_default_member": "Your",
+                    "api_key": "Key", "workspace_default_key": "Key"}  # key_limit: Hermes reports the key's own cap
+_OR_BUDGET_INTERVAL = ("daily", "weekly", "monthly", "lifetime")
+
+
+def _openrouter_budgets(fetch=None):
+    """The workspace and guardrail budgets that stop this profile's OpenRouter key, each with its
+    limit, spend and reset: GET /key lists them under ``budgets``, which Hermes' account report does
+    not read. Uses the key Hermes holds for the profile (as replays do), sent only to OpenRouter.
+    Empty when there are none or the call fails."""
+    try:
+        if fetch is None:
+            rt = _aai_runtime({"model": {"provider": "openrouter"}})
+            req = _aai_urlreq.Request(rt["base_url"] + "/key", headers={"Authorization": "Bearer " + rt["api_key"]})
+            with _aai_urlreq.urlopen(req, timeout=10) as r:
+                fetch = (_aai_json.loads(r.read().decode()) or {}).get("data") or {}
+        rows = fetch.get("budgets") if isinstance(fetch.get("budgets"), list) else []
+    except Exception:
+        return []
+    ok = lambda v: isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+    out = []
+    for b in rows:
+        if not isinstance(b, dict):
+            continue
+        who, interval = _OR_BUDGET_SCOPE.get(b.get("scope")), str(b.get("reset_interval") or "").lower()
+        limit, spent = b.get("limit_usd"), b.get("spend_usd")
+        if not who or interval not in _OR_BUDGET_INTERVAL or not (ok(limit) and limit > 0 and ok(spent)):
+            continue
+        out.append({"label": who + " " + ("total" if interval == "lifetime" else interval) + " budget", "interval": interval,
+                    "limit": float(limit), "spent": max(0.0, float(spent)),
+                    "reset_at": b.get("resets_at") if interval != "lifetime" and isinstance(b.get("resets_at"), str) else None})
+    return out
+
+
 def _snapshot_fields(snap, extra=None):
     """The report's limit windows and detail lines, for the popover to show without parsing text, plus
-    what hermetic adds for Nous (the spend cap window, the usable credits as a number)."""
+    what hermetic adds: for Nous the spend cap window and the usable credits as a number, for
+    OpenRouter the workspace and guardrail budgets."""
     if not snap:
         return None
     extra = extra or {}
     return {"title": snap.title, "plan": snap.plan, "details": list(snap.details), "unavailable": snap.unavailable_reason,
-            "credits": extra.get("credits"),
+            "credits": extra.get("credits"), "budgets": extra.get("budgets") or [],
             "windows": [{"label": w.label, "used_percent": w.used_percent, "reset_at": w.reset_at.isoformat() if w.reset_at else None,
                          "detail": w.detail, "scope": w.scope} for w in snap.windows] + ([extra["window"]] if extra.get("window") else [])}
 

@@ -3,12 +3,22 @@
 Shared by the HDR view (dashboard/plugin_api.py) and the guard hook (__init__.py), so both score a
 call the same way. Pure functions, no Hermes imports.
 """
+import fnmatch
 import json
 import os
 import re
 
 URL = re.compile(r"https?://([A-Za-z0-9.-]+\.[A-Za-z]{2,})(?::\d+)?", re.I)
-PATH = re.compile(r"(?<![\w.-])(~/[^\s'\"`|;&<>()]+|/(?:Users|tmp|private|etc|var|opt|Library|Applications|usr/local)[^\s'\"`|;&<>()]*)")
+PATH = re.compile(r"(?<![\w.-])(~/[^\s'\"`|;&<>()]+|/(?:Users|home|root|tmp|private|etc|var|opt|Library|Applications|usr/local)[^\s'\"`|;&<>()]*)")
+# The home folder however a command or code writes it ($HOME, ${HOME}, ${HOME:-x}, ~name/), and any user's
+# home folder, all read as ~ so `cat $HOME/.ssh/id_rsa` is the same read as `cat ~/.ssh/id_rsa`
+HOME_VAR = re.compile(r"\$\{HOME(?::?[-=+?][^}]*)?\}|\$HOME(?!\w)")
+NAMED_HOME = re.compile(r"(?<![\w.-])~[A-Za-z_][\w.-]*/")
+ANY_HOME = re.compile(r"^/(?:Users|home)/[^/]+(?=/|$)|^/(?:var/)?root(?=/|$)")
+# Key places by their own names, wherever they sit in a command or code: a path built in pieces
+# (os.path.join(home, ".ssh"), a variable, a relative path from the home folder) still names them
+KEY_PLACES = re.compile(r"(?<![\w-])(\.ssh|\.aws|\.gnupg|\.kube|\.netrc|\.config/gh|\.docker/config\.json|Library/Keychains|"
+                        r"\.hermes/(?:auth\.json|vault|\.env))(?![\w-])")
 TLDS = {"com", "net", "org", "io", "dev", "ai", "app", "co", "me", "gov", "edu", "cloud", "tech", "xyz", "info", "biz",
         "sh", "so", "gg", "ly", "to", "page", "site", "online", "example", "test", "local", "internal"}
 
@@ -131,11 +141,36 @@ def tilde(p):
     return "~" + p[len(home):] if p.startswith(home) else p
 
 
+def home_text(t):
+    """Text with the home folder written as ~, however it was named."""
+    return NAMED_HOME.sub("~/", HOME_VAR.sub("~", t))
+
+
+def shell_text(cmd):
+    """A command as the shell reads its paths: backslashes and quotes dropped, the home folder as ~."""
+    return home_text(re.sub(r"\\(.)", r"\1", cmd).replace("'", "").replace('"', ""))
+
+
+def _glob_place(p):
+    """The watched place a wildcard path could open (~/.s*/id_rsa, ~/.*/credentials), compared part by part."""
+    parts = p.split("/")
+    for prefix, why, base in SENSITIVE:
+        want = prefix.rstrip("/").split("/")
+        if len(parts) >= len(want) and all(fnmatch.fnmatchcase(w, g) for w, g in zip(want, parts)):
+            return why, base
+    return None
+
+
 def sensitive(p):
     """(why, base score) when a path is one HDR watches, else None."""
+    p = ANY_HOME.sub("~", p, count=1)
     for prefix, why, base in SENSITIVE:
         if p == prefix or p.startswith(prefix.rstrip("/") + "/") or (prefix.endswith("/") and p.startswith(prefix)):
             return why, base
+    if any(c in p for c in "*?["):
+        hit = _glob_place(p)
+        if hit:
+            return hit
     if p.endswith("/.env") or p.endswith(".env") and "/" in p:
         return "keys file", 70
     return None
@@ -149,21 +184,34 @@ def score(why, base, how):
 def touches(name, args):
     """(paths with op, hosts) one tool call names."""
     paths, hosts = [], set()
-    texts = []
+    texts, named, how_of = [], "", None
     if name in FILE_TOOLS and args.get("path"):
-        paths.append((tilde(args["path"]), FILE_TOOLS[name]))
+        named = home_text(str(args["path"]))
+        paths.append((tilde(named), FILE_TOOLS[name]))
+        how_of = lambda raw: FILE_TOOLS[name]
     elif name == "terminal":
         cmd = str(args.get("command") or "")
-        paths += [(tilde(m.group(1)), op(cmd, m.group(1))) for m in PATH.finditer(cmd)]
+        named = shell_text(cmd)
+        paths += [(tilde(m.group(1)), op(named, m.group(1))) for m in PATH.finditer(named)]
         if args.get("workdir"):
-            paths.append((tilde(args["workdir"]), "workdir"))
+            paths.append((tilde(home_text(str(args["workdir"]))), "workdir"))
         texts.append(cmd)
+        how_of = lambda raw: op(named, raw)
     elif name in ("execute_code", "browser_exec"):
         code = str(args.get("code") or "")
-        paths += [(tilde(m.group(1)), code_op(code, m.group(1))) for m in PATH.finditer(code)]
+        named = home_text(code)
+        paths += [(tilde(m.group(1)), code_op(named, m.group(1))) for m in PATH.finditer(named)]
         texts.append(code)
+        how_of = lambda raw: code_op(named, raw)
     else:
         texts += [v if isinstance(v, str) else json.dumps(v) for v in args.values() if isinstance(v, (str, list))]
+    # a key place named only in pieces or relative to the home folder: the place itself, once
+    seen = {folder_of(ANY_HOME.sub("~", p, count=1)) for p, _ in paths if sensitive(p)}
+    for m in KEY_PLACES.finditer(named):
+        place = "~/" + m.group(1)
+        if place not in seen:
+            seen.add(place)
+            paths.append((place, how_of(m.group(1))))
     for t in texts:
         hosts.update(h.lower() for h in URL.findall(t) if host_ok(h))
     return paths, hosts

@@ -3054,8 +3054,12 @@ def _hdr_snippet(name, args, path):
         return name + " " + path
     text = str((args or {}).get("command") or (args or {}).get("code") or "")
     full = os.path.expanduser(path) if path.startswith("~/") else path
-    for ln in text.splitlines():
-        at = ln.find(path) if path in ln else ln.find(full)
+    # the path as written, expanded, or as the shell reads it ($HOME/..., quoted parts), else its key place
+    rel = path[2:] if path.startswith("~/") else None
+    tries = [path, full] + ([rel, rel.split("/")[0]] if rel else [])
+    lines = [(ln, _HDR.shell_text(ln)) for ln in text.splitlines()]
+    for t, ln, seen in ((t, ln, seen) for t in tries for ln, seen in lines):
+        at = ln.find(t) if t in ln else 0 if t in seen else -1
         if at >= 0:
             start = max(0, at - 60)
             cut = ln[start:start + 200].strip()

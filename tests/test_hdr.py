@@ -125,6 +125,17 @@ def test_snippet_shows_the_line_that_named_the_place():
     long = "echo a; " * 40 + "ls -la /Library/LaunchDaemons/; " + "echo b; " * 40
     snip = api._hdr_snippet("terminal", {"command": long}, "/Library/LaunchDaemons/")
     assert "/Library/LaunchDaemons/" in snip and snip.startswith("\u2026") and snip.endswith("\u2026") and len(snip) <= 202
+    assert api._hdr_snippet("terminal", {"command": "cd /tmp\ncat $HOME/.ssh/id_rsa"}, "~/.ssh/id_rsa") == "cat $HOME/.ssh/id_rsa"
+    assert api._hdr_snippet("terminal", {"command": 'echo hi\ncat ~/".ssh"/id_rsa'}, "~/.ssh/id_rsa") == 'cat ~/".ssh"/id_rsa'
+
+
+def test_other_homes_and_spellings_are_the_same_place():
+    assert api._hdr_sensitive("/home/ubuntu/.ssh/id_rsa")[0] == "SSH keys"
+    assert api._hdr_sensitive("/root/.aws/credentials")[0] == "cloud keys"
+    assert api._hdr_sensitive("~/.s*/id_rsa")[0] == "SSH keys"
+    assert api._hdr_sensitive("/home") is None and api._hdr_sensitive("~/projects/*.py") is None
+    paths, _ = api._hdr_touches("terminal", {"command": "cat ${HOME}/.aws/credentials"})
+    assert paths == [("~/.aws/credentials", "read")], "one place, no duplicate from its name"
 
 
 def test_snippet_hides_typed_secrets():

@@ -4,7 +4,10 @@ with the OpenRouter workspace and guardrail budgets the report leaves out.
 Run inside Hermes' environment: bash ~/.hermes/hermes-agent/scripts/run-in-hermes-env python3 tests/test_account.py
 """
 import importlib.util
+import shutil
+import subprocess
 import sys
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -66,6 +69,27 @@ def test_budgets_reach_the_popover():
     f = api._snapshot_fields(snap, {"budgets": api._openrouter_budgets(KEY)})
     assert len(f["budgets"]) == 3 and f["windows"] == []
     assert api._snapshot_fields(snap)["budgets"] == []
+
+
+def test_a_git_checkout_shows_its_branch_and_a_pinned_one_does_not():
+    repo = Path(tempfile.mkdtemp(prefix="hermetic-checkout-test-"))
+    try:
+        def git(*a):
+            subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@example.com",
+                            "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null", *a], capture_output=True, check=True)
+        git("init", "-q", "-b", "main")
+        (repo / "plugin.yaml").write_text("version: 1.0.0\n")
+        git("add", "plugin.yaml")
+        git("commit", "-q", "-m", "x")
+        co = api._own_checkout(repo)
+        assert co["branch"] == "main" and len(co["commit"]) >= 7 and co["edited"] is False
+        (repo / "plugin.yaml").write_text("version: 1.0.1\n")
+        assert api._own_checkout(repo)["edited"] is True
+        git("checkout", "-q", "--detach")
+        assert api._own_checkout(repo) is None, "a catalog install sits detached at its pinned commit"
+        assert api._own_checkout(repo / "nowhere") is None
+    finally:
+        shutil.rmtree(repo, ignore_errors=True)
 
 
 if __name__ == "__main__":

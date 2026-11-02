@@ -852,9 +852,36 @@ async def health():
                     break
         except OSError:
             pass
-        return {"missing": sorted(set(missing) | _DEGRADED), "version": version}
+        return {"missing": sorted(set(missing) | _DEGRADED), "version": version, "checkout": _own_checkout()}
 
     return await asyncio.to_thread(_run)
+
+
+_CHECKOUT = {"at": 0.0, "value": None}
+
+
+def _own_checkout(root=None):
+    """{branch, commit, edited} when hermetic runs from a git checkout on a branch (a dev clone or a
+    GitHub install following main), else None: catalog installs sit detached at the pinned commit."""
+    own = root is None
+    if own and time.time() - _CHECKOUT["at"] < 60:
+        return _CHECKOUT["value"]
+    import subprocess
+    root = Path(root or Path(__file__).resolve().parent.parent)
+    value = None
+    if (root / ".git").exists():
+        def git(*a):
+            return subprocess.run(["git", "-C", str(root), *a], capture_output=True, text=True, timeout=3).stdout.strip()
+        try:
+            branch = git("rev-parse", "--abbrev-ref", "HEAD")
+            if branch and branch != "HEAD":
+                value = {"branch": branch, "commit": git("rev-parse", "--short", "HEAD"),
+                         "edited": bool(git("status", "--porcelain", "--untracked-files=no"))}
+        except (OSError, subprocess.SubprocessError):
+            value = None
+    if own:
+        _CHECKOUT.update(at=time.time(), value=value)
+    return value
 
 
 # ==== AAI (applied AI): record what changes the agent's setup, and the work to improve it ==========

@@ -844,7 +844,15 @@ async def health():
                     missing.append(key)
             except Exception:
                 missing.append(key)
-        return {"missing": sorted(set(missing) | _DEGRADED)}
+        version = None
+        try:
+            for line in (Path(__file__).resolve().parent.parent / "plugin.yaml").read_text().splitlines():
+                if line.startswith("version:"):
+                    version = line.split(":", 1)[1].strip().strip("\"'") or None
+                    break
+        except OSError:
+            pass
+        return {"missing": sorted(set(missing) | _DEGRADED), "version": version}
 
     return await asyncio.to_thread(_run)
 

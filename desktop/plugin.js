@@ -682,10 +682,14 @@ async function loadBilledHistory() {
   }
 }
 
+// The installed version, from the backend's plugin.yaml, shown small at the bottom of the popover
+let hermeticVersion = null
+
 // Hermes internals the backend plugin could not find (a Hermes update renamed them); fallbacks run.
 async function loadHealth() {
   try {
     const r = await api({ path: '/api/plugins/hermetic/health' })
+    if (r && r.version) hermeticVersion = r.version
     return (r && r.missing) || []
   } catch {
     return []
@@ -3600,11 +3604,20 @@ const Body = ({ meter, prices, threshold, retries, yaml, profile, profileLabel, 
         }, el('span', { style: { width: 6, height: 6, borderRadius: 3, background: i === vi ? C.text : C.faint, transition: 'background .12s' } }))))),
     arrow(to, dir > 0 ? 'm6 3 5 5-5 5' : 'm10 3-5 5 5 5')
   )
-  if (view === 'hdr') return el('div', { style: cardStyle }, head, el(HdrView, { profile, period }))
-  if (isAai) return el('div', { style: cardStyle }, head, el(AaiView2, { profile, period, yaml, orProfile, auxOn: !!(meter.aux && meter.aux.enabled), onChanged: refresh }))
-  return el(
-    'div',
-    { style: cardStyle },
+  // the running version and a way to reach the author, small at the bottom of every view
+  // (a plain link: Hermes Desktop opens it in the browser)
+  const foot = el('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: 8, marginTop: 'auto', paddingTop: 14, fontSize: 10, color: C.faint } },
+    hermeticVersion ? el('span', null, 'v' + hermeticVersion) : null,
+    el(Tip, { label: 'Message @forefy on X' },
+      el('a', { href: 'https://x.com/messages/compose?recipient_id=1469398978185809922&text=' + encodeURIComponent('hermetic' + (hermeticVersion ? ' v' + hermeticVersion : '') + ': '), 'aria-label': 'Message @forefy on X', className: 'hover:text-(--ui-text-primary)', style: { display: 'inline-flex', color: C.faint } },
+        el('svg', { width: 10, height: 10, viewBox: '0 0 24 24', 'aria-hidden': true },
+          el('path', { fill: 'currentColor', d: 'M18.244 2.25h3.308l-7.227 8.26 8.502 11.24H16.17l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25H8.08l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z' }))))
+  )
+  // a column at least as tall as the card, so the footer sits at the bottom when a view is short
+  const card = (...kids) => el('div', { style: cardStyle }, el('div', { style: { minHeight: '100%', display: 'flex', flexDirection: 'column' } }, ...kids))
+  if (view === 'hdr') return card(head, el(HdrView, { profile, period }), foot)
+  if (isAai) return card(head, el(AaiView2, { profile, period, yaml, orProfile, auxOn: !!(meter.aux && meter.aux.enabled), onChanged: refresh }), foot)
+  return card(
     head,
     el(
       'div',
@@ -3752,7 +3765,8 @@ const Body = ({ meter, prices, threshold, retries, yaml, profile, profileLabel, 
       profileLabel,
       onApplied: refresh
     }),
-    pending.length ? el(Improve, { items: pending, yaml, profile, onApplied: refresh }) : null
+    pending.length ? el(Improve, { items: pending, yaml, profile, onApplied: refresh }) : null,
+    foot
   )
 }
 

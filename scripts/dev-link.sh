@@ -23,3 +23,4 @@ link() {
 link "$HH/plugins/hermetic" "$REPO"
 link "$HH/desktop-plugins/hermetic" "$REPO/desktop"
 echo "Done. Restart Hermes (menu: Quit and Keep Windows) so the backend loads from the repo."
+echo "After later backend edits: python3 scripts/reload-backend.py"

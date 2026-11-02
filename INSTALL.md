@@ -83,3 +83,11 @@ git clone https://github.com/forefy/hermetic.git
 cd hermetic
 ./scripts/dev-link.sh
 ```
+
+Edits to `desktop/plugin.js` show up in the popover as you save. The backend (routes, hooks, guard rules) loads once when Hermes starts, so after a backend edit reload it without quitting the app:
+
+```bash
+python3 scripts/reload-backend.py
+```
+
+It waits until no chat is working, then lets Hermes start a fresh backend. `--check` only reports, and `--now` skips the wait.

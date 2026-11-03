@@ -1395,31 +1395,24 @@ def _aai_main_provider(cfg):
 
 
 def _aai_runtime(cfg=None):
-    """Connection for replays, following the profile's main provider: Nous Portal through Hermes' own
-    Nous sign-in, otherwise OpenRouter. A replay has to resend the agent's own tool definitions (and on
-    OpenRouter pin providers through its routing), which Hermes' plugin LLM lane does not offer, so it
-    calls the provider directly with the credential Hermes holds, read through Hermes (never from files)."""
+    """Connection for replays: OpenRouter with the profile's key, read through Hermes' secret scope. A
+    replay has to resend the agent's own tool definitions (and pin providers through OpenRouter's routing),
+    which Hermes' plugin LLM lane does not offer. A Nous Portal sign-in may only be used through Hermes'
+    credentialed_provider_request, which does not take Nous yet, so a Nous profile is refused here
+    without its sign-in ever being read."""
     if cfg is None:
         try:
             cfg = _aai_load_cfg()
         except Exception:
             cfg = {}
     if _aai_main_provider(cfg) == "nous":
-        try:
-            with _aai_secret_scope():
-                from hermes_cli.runtime_provider import resolve_runtime_provider
-                rt = resolve_runtime_provider(requested="nous")
-        except Exception as exc:
-            raise RuntimeError("Replays on Nous Portal need you signed in to Nous in Hermes") from exc
-        if not (rt or {}).get("api_key") or not rt.get("base_url"):
-            raise RuntimeError("Replays on Nous Portal need you signed in to Nous in Hermes")
-        return {"api_key": rt["api_key"], "base_url": str(rt["base_url"]).rstrip("/"), "kind": "nous"}
+        raise RuntimeError("Replays need OpenRouter for now, since Hermes can't send them to Nous Portal for plugins yet")
     with _aai_secret_scope():
         from agent.secret_scope import get_secret
         key = get_secret("OPENROUTER_API_KEY")
     if not key:
         raise RuntimeError("Replays need an OpenRouter key (OPENROUTER_API_KEY) set up in Hermes")
-    return {"api_key": key, "base_url": "https://openrouter.ai/api/v1", "kind": "openrouter"}
+    return {"api_key": key, "base_url": "https://openrouter.ai/api/v1"}
 
 
 def _aai_http_error(exc):
@@ -1431,20 +1424,6 @@ def _aai_http_error(exc):
     except Exception:
         msg = ""
     return RuntimeError(msg[:300]) if msg else exc
-
-
-def _aai_nous_cost(model, usage):
-    """For a Nous Portal answer whose usage leaves out the cost: priced at the Portal's own list prices,
-    as Hermes reads them."""
-    try:
-        from hermes_cli.models_pricing import get_pricing_for_provider
-        p = (get_pricing_for_provider("nous") or {}).get(model) or {}
-        cached = int(((usage.get("prompt_tokens_details") or {}).get("cached_tokens")) or 0)
-        fresh = max(0, int(usage.get("prompt_tokens") or 0) - cached)
-        read = float(p.get("input_cache_read") or p.get("prompt") or 0)
-        return fresh * float(p.get("prompt") or 0) + cached * read + int(usage.get("completion_tokens") or 0) * float(p.get("completion") or 0)
-    except Exception:
-        return 0.0
 
 
 _AAI_LLM = {}
@@ -1479,32 +1458,19 @@ def _aai_helper(model, messages, tools=None, provider=None, max_tokens=1500, jso
 
 def _aai_call(model, messages, tools=None, provider=None, max_tokens=1500, json_mode=False, tool_choice="auto", reasoning=None):
     rp = _aai_runtime()
-    base, nous = rp["base_url"], rp.get("kind") == "nous"
-    body = {"model": model, "messages": messages, "max_tokens": max_tokens}
+    body = {"model": model, "messages": messages, "max_tokens": max_tokens, "usage": {"include": True}}
     if tools:
         body["tools"] = tools
         body["tool_choice"] = tool_choice
-    if nous:
-        if provider and provider.get("only"):
-            raise RuntimeError("Nous Portal picks the provider itself, so comparing providers needs OpenRouter")
-        if _routing_for("nous", provider):
-            body["provider"] = _routing_for("nous", provider)  # the privacy rules, all the Portal takes
-        try:
-            from agent.portal_tags import nous_portal_tags
-            body["tags"] = nous_portal_tags()  # the attribution Hermes sends with every Portal call
-        except Exception:
-            pass
-    else:
-        body["usage"] = {"include": True}
-        if provider:
-            body["provider"] = provider
+    if provider:
+        body["provider"] = provider
     if json_mode:
         body["response_format"] = {"type": "json_object"}
     if reasoning:
         body["reasoning"] = reasoning
-    req = _aai_urlreq.Request(base + "/chat/completions", data=_aai_json.dumps(body).encode(),
+    req = _aai_urlreq.Request(rp["base_url"] + "/chat/completions", data=_aai_json.dumps(body).encode(),
                               headers={"Authorization": "Bearer " + rp["api_key"], "Content-Type": "application/json",
-                                       **({} if nous else {"X-Title": "hermetic AAI"})})
+                                       "X-Title": "hermetic AAI"})
     t0 = time.time()
     import random as _rnd
     import urllib.error as _uerr
@@ -1527,7 +1493,7 @@ def _aai_call(model, messages, tools=None, provider=None, max_tokens=1500, json_
     usage = data.get("usage") or {}
     return {"content": msg.get("content") or "", "tool_calls": msg.get("tool_calls") or [], "finish": ch.get("finish_reason"),
             "provider": data.get("provider"), "id": data.get("id"), "secs": round(time.time() - t0, 2),
-            "cost": float(usage.get("cost") or 0) or (_aai_nous_cost(model, usage) if nous else 0.0),
+            "cost": float(usage.get("cost") or 0),
             "input": int(usage.get("prompt_tokens") or 0), "output": int(usage.get("completion_tokens") or 0)}
 
 

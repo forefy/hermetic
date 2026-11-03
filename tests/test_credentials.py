@@ -3,7 +3,6 @@
 Run with the Python that runs Hermes: python tests/test_credentials.py
 """
 import importlib.util
-import json
 import sys
 import types
 from pathlib import Path
@@ -106,88 +105,48 @@ def test_replay_without_key_says_so():
         scope["key"] = "sk-or-test"
 
 
-class _Resp:
-    def __init__(self, body):
-        self.body = body
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *a):
-        return False
-
-    def read(self):
-        return json.dumps(self.body).encode()
-
-
-def _on_nous(fn):
-    """Run fn with the profile's main model on Nous Portal, Hermes' Nous sign-in, prices and tags stubbed."""
-    sent = []
-    saved = {k: sys.modules.get(k) for k in ("hermes_cli.runtime_provider", "agent.portal_tags", "hermes_cli.models_pricing")}
+def test_replays_on_a_nous_profile_ask_for_openrouter_without_reading_the_sign_in():
+    read, sent = [], []
+    saved = sys.modules.get("hermes_cli.runtime_provider")
     load, urlopen = api._aai_load_cfg, api._aai_urlreq.urlopen
     sys.modules["hermes_cli.runtime_provider"] = types.SimpleNamespace(
-        resolve_runtime_provider=lambda requested=None, **k: {"api_key": "nous-jwt", "base_url": "https://inference-api.nousresearch.com/v1/"} if requested == "nous" else {})
-    sys.modules["agent.portal_tags"] = types.SimpleNamespace(nous_portal_tags=lambda: ["product=hermes-agent"])
-    sys.modules["hermes_cli.models_pricing"] = types.SimpleNamespace(
-        get_pricing_for_provider=lambda p: {"x/m": {"prompt": "0.000001", "completion": "0.000004", "input_cache_read": "0.0000001"}} if p == "nous" else {})
+        resolve_runtime_provider=lambda **k: read.append(k) or {"api_key": "nous-jwt", "base_url": "https://inference-api.nousresearch.com/v1"})
     api._aai_load_cfg = lambda: {"model": {"provider": "nous", "default": "x/m"}}
-    api._aai_urlreq.urlopen = lambda req, timeout=0: (sent.append(req), _Resp({
-        "id": "gen-1", "choices": [{"message": {"content": "hi"}, "finish_reason": "stop"}],
-        "usage": {"prompt_tokens": 1000, "completion_tokens": 100, "prompt_tokens_details": {"cached_tokens": 400}}}))[1]
+    api._aai_urlreq.urlopen = lambda req, timeout=0: sent.append(req)
     try:
-        return fn(sent)
+        for call in (lambda: api._aai_runtime(), lambda: api._aai_call("x/m", MSGS), lambda: api._aai_call("x/m", MSGS, provider={"only": ["a"]})):
+            try:
+                call()
+                raise AssertionError("expected an error")
+            except RuntimeError as exc:
+                assert "OpenRouter" in str(exc)
+        assert read == [] and sent == [], "the Nous sign-in is never read and nothing is sent"
     finally:
         api._aai_load_cfg, api._aai_urlreq.urlopen = load, urlopen
-        for k, v in saved.items():
-            if v is None:
-                sys.modules.pop(k, None)
-            else:
-                sys.modules[k] = v
-
-
-def test_replays_on_a_nous_profile_go_to_nous_portal():
-    def check(sent):
-        rt = api._aai_runtime()
-        assert rt == {"api_key": "nous-jwt", "base_url": "https://inference-api.nousresearch.com/v1", "kind": "nous"}
-        out = api._aai_call("x/m", MSGS, provider={"data_collection": "deny", "zdr": True, "sort": "latency", "ignore": ["a"]})
-        req = sent[-1]
-        body = json.loads(req.data)
-        assert req.full_url == "https://inference-api.nousresearch.com/v1/chat/completions"
-        assert req.get_header("Authorization") == "Bearer nous-jwt" and not req.get_header("X-title")
-        assert body["provider"] == {"data_collection": "deny", "zdr": True}, "only the privacy rules, the Portal refuses the rest"
-        assert "usage" not in body, "OpenRouter's own fields stay off Nous calls"
-        api._aai_call("x/m", MSGS, provider={"sort": "price"})
-        assert "provider" not in json.loads(sent[-1].data), "no provider object when there are no privacy rules"
-        assert body["tags"] == ["product=hermes-agent"]
-        assert abs(out["cost"] - (600e-6 + 400e-7 + 100 * 4e-6)) < 1e-12, "priced at the Portal's list, cache reads at the cache price"
-    _on_nous(check)
-
-
-def test_comparing_providers_on_nous_says_why_not():
-    def check(sent):
-        try:
-            api._aai_call("x/m", MSGS, provider={"only": ["deepinfra"]})
-            raise AssertionError("expected an error")
-        except RuntimeError as exc:
-            assert "OpenRouter" in str(exc) and not sent
-    _on_nous(check)
+        if saved is None:
+            sys.modules.pop("hermes_cli.runtime_provider", None)
+        else:
+            sys.modules["hermes_cli.runtime_provider"] = saved
 
 
 def test_a_refused_replay_says_what_the_provider_said():
     import io
     import urllib.error
+    body = b'{"error":{"message":"Model x/m requires available credits.","code":402}}'
 
-    def check(sent):
-        body = b'{"status":404,"message":"Model x/m requires available credits.","code":"insufficient_credits_for_paid_model"}'
-        def refuse(req, timeout=0):
-            raise urllib.error.HTTPError(req.full_url, 404, "Not Found", {}, io.BytesIO(body))
-        api._aai_urlreq.urlopen = refuse
-        try:
-            api._aai_call("x/m", MSGS)
-            raise AssertionError("expected an error")
-        except RuntimeError as exc:
-            assert str(exc) == "Model x/m requires available credits."
-    _on_nous(check)
+    def refuse(req, timeout=0):
+        raise urllib.error.HTTPError(req.full_url, 402, "Payment Required", {}, io.BytesIO(body))
+    load, urlopen = api._aai_load_cfg, api._aai_urlreq.urlopen
+    api._aai_load_cfg = lambda: {"model": {"provider": "openrouter", "default": "x/m"}}
+    api._aai_urlreq.urlopen = refuse
+    try:
+        api._aai_call("x/m", MSGS)
+        raise AssertionError("expected an error")
+    except RuntimeError as exc:
+        assert str(exc) == "Model x/m requires available credits."
+    finally:
+        api._aai_load_cfg, api._aai_urlreq.urlopen = load, urlopen
+
 
 def test_nous_spend_cap_becomes_a_limit_window():
     info = lambda **a: types.SimpleNamespace(paid_service_access_info=types.SimpleNamespace(**a))

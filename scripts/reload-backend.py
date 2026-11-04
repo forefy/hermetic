@@ -1,21 +1,28 @@
 #!/usr/bin/env python3
-"""Load backend changes (routes, hooks, guard rules) into a running Hermes Desktop without quitting it.
+"""Load backend changes (routes, hooks, guard rules) into a running Hermes without quitting the app.
 
-Waits until no chat is working, in every profile, then ends the app's backend process. The app's
-supervisor starts a new one at once, which imports the plugin code fresh; chats reconnect on their own.
+Hermes 0.22 and later serve the desktop app from the gateway service. This asks Hermes to restart it with
+`hermes gateway restart`, which refuses while a turn, scheduled job or background task is live, and
+retries until Hermes is quiet. It also waits for any open guard question, which a restart would drop.
+
+Older Hermes Desktop runs plugins inside its own backend. There this waits until no chat is working, in
+every profile, then ends the backend, and the app starts a new one. Chats reconnect on their own either way.
+
 The popover half (desktop/plugin.js) hot-reloads by itself and never needs this.
 
-  python3 scripts/reload-backend.py           wait for a quiet moment (up to 15 minutes), then reload
-  python3 scripts/reload-backend.py --check   only say whether Hermes is busy and which backends run
-  python3 scripts/reload-backend.py --now     reload without waiting
+  python3 scripts/reload-backend.py           reload at the next quiet moment (waits up to 15 minutes)
+  python3 scripts/reload-backend.py --check   only say what would be restarted and what it waits for
+  python3 scripts/reload-backend.py --now     reload without waiting, interrupting live work
 
-A chat counts as working when its activity or its latest message is under QUIET seconds old, when its
-latest message still waits for an answer (yours, a tool result, or a reply that calls tools) and is under
-OPEN seconds old, or when a backend still runs a tool command.
+On older Hermes a chat counts as working when its activity or its latest message is under QUIET seconds
+old, when its latest message still waits for an answer (yours, a tool result, or a reply that calls tools)
+and is under OPEN seconds old, or when the backend still runs a tool command.
 """
 import argparse
 import glob
+import json
 import os
+import shutil
 import signal
 import sqlite3
 import subprocess
@@ -37,7 +44,7 @@ def processes():
 
 
 def backends(rows):
-    """The desktop app's backend processes: Python children running `serve --host`."""
+    """An older desktop app's backend processes: Python children running `serve --host`."""
     return [pid for pid, _ppid, cmd in rows if "python" in cmd and " serve --host" in cmd]
 
 
@@ -46,10 +53,31 @@ def running_tools(rows, pids):
     return [cmd for _pid, ppid, cmd in rows if ppid in pids and "hermes_kernel_runner" not in cmd]
 
 
+def homes(home):
+    return [home] + sorted(glob.glob(os.path.join(home, "profiles", "*")))
+
+
+def open_questions(home):
+    """Guard questions still waiting for an answer, in every profile."""
+    out, now = [], time.time()
+    for h in homes(home):
+        for f in glob.glob(os.path.join(h, "hermetic", "hdr", "asks", "*.json")):
+            if f.endswith((".answer.json", ".outcome.json")):
+                continue
+            try:
+                with open(f, encoding="utf-8") as fh:
+                    a = json.load(fh)
+            except (OSError, ValueError):
+                continue
+            if float(a.get("until") or 0) > now and not os.path.exists(f[:-5] + ".answer.json"):
+                out.append(f"guard question about {a.get('path')}")
+    return out
+
+
 def working_chats(home):
-    dbs = [os.path.join(home, "state.db")] + glob.glob(os.path.join(home, "profiles", "*", "state.db"))
     busy, now = [], time.time()
-    for path in dbs:
+    for h in homes(home):
+        path = os.path.join(h, "state.db")
         if not os.path.exists(path):
             continue
         try:
@@ -72,33 +100,53 @@ def working_chats(home):
     return busy
 
 
+def hermes_cli(home):
+    found = shutil.which("hermes")
+    local = os.path.join(home, "hermes-agent", ".hermes", "bin", "hermes")
+    return found or (local if os.path.exists(local) else None)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--check", action="store_true", help="only report, change nothing")
-    ap.add_argument("--now", action="store_true", help="reload without waiting for a quiet moment")
-    ap.add_argument("--wait", type=int, default=900, help="seconds to wait for a quiet moment (default 900)")
+    ap.add_argument("--now", action="store_true", help="reload without waiting, interrupting live work")
+    ap.add_argument("--wait", type=int, default=900, help="seconds to wait at most (default 900)")
     args = ap.parse_args()
     home = os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes")
+    old = backends(processes())
+    cli = None if old else hermes_cli(home)
+    if not old and not cli:
+        sys.exit("No Hermes desktop backend is running and the hermes command was not found.")
+    what = "the desktop backend" if old else "the Hermes gateway"
 
     deadline, said = time.time() + args.wait, None
     while True:
         rows = processes()
-        pids = backends(rows)
-        if not pids:
-            sys.exit("No Hermes Desktop backend is running.")
-        busy = working_chats(home) + [f"tool command: {c[:80]}" for c in running_tools(rows, set(pids))]
+        busy = open_questions(home)
+        if old:
+            pids = backends(rows)
+            if not pids:
+                sys.exit("The desktop backend is gone, nothing to reload.")
+            busy += working_chats(home) + [f"tool command: {c[:80]}" for c in running_tools(rows, set(pids))]
         if args.check:
-            print(f"backends: {', '.join(map(str, pids))}")
-            print("busy: " + "; ".join(busy) if busy else "idle")
+            print(f"restarts {what}" + (f" ({', '.join(map(str, pids))})" if old else ""))
+            print("waiting for: " + "; ".join(busy) if busy else "nothing to wait for" + ("" if old else " here, Hermes checks for live work itself"))
             return
         if not busy or args.now:
-            break
+            if old:
+                break
+            run = subprocess.run([cli, "gateway", "restart"] + (["--yes"] if args.now else []),
+                                 stdin=subprocess.DEVNULL, capture_output=True, text=True)
+            if run.returncode == 0:
+                print("Hermes restarted its gateway, which now runs the current plugin code")
+                return
+            busy = [(run.stdout + run.stderr).strip().splitlines()[-1][:160] if (run.stdout + run.stderr).strip() else "Hermes refused"]
         if time.time() > deadline:
             sys.exit("Still busy after waiting, nothing restarted: " + "; ".join(busy))
         if busy != said:
             print("waiting for: " + "; ".join(busy), flush=True)
             said = busy
-        time.sleep(10)
+        time.sleep(15)
 
     for pid in pids:
         os.kill(pid, signal.SIGTERM)

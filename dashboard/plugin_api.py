@@ -2814,6 +2814,44 @@ _HDR_OUTCOME_SHOW_S, _HDR_OUTCOME_KEEP_S = 120, 600  # a question that ran out i
 _HDR_ASKS_HOLD_S = 25  # the longest the popover's request for questions is held, inside the desktop's 30s request limit
 
 
+def _hdr_job_name(profile, text):
+    """The scheduled job whose prompt (or else its one skill) starts this session's first message."""
+    try:
+        raw = _aai_json.loads((_profile_home(profile)[1] / "cron" / "jobs.json").read_text())
+    except Exception:
+        return ""
+    jobs = raw.get("jobs", raw) if isinstance(raw, dict) else raw
+    jobs = [j for j in (jobs.values() if isinstance(jobs, dict) else jobs or []) if isinstance(j, dict) and j.get("name")]
+    by_prompt = [j for j in jobs if str(j.get("prompt") or "").strip()[:80] and str(j["prompt"]).strip()[:80] in text]
+    by_skill = [j for j in jobs if j.get("skill") and f'"{j["skill"]}" skill' in text]
+    pick = by_prompt[:1] or (by_skill if len(by_skill) == 1 else [])
+    return str(pick[0]["name"]) if pick else ""
+
+
+def _hdr_session_label(profile, sid):
+    """(label, kind) for the chat or scheduled job a guard question came from. Hermes names a scheduled job's
+    session when it finishes and a new chat after its first answer, so until then the label is the job's name,
+    the parent of a subagent, or the chat's first words."""
+    if not sid:
+        return "", "chat"
+    db = _open_sessions_db(profile)
+    try:
+        s = db.get_session(sid) or {}
+        job = s.get("source") == "cron"
+        if s.get("title"):
+            return str(s["title"]), "job" if job else "chat"
+        first = next((str(m.get("content") or "") for m in _db_messages(db, sid) if m.get("role") == "user"), "")
+        if job:
+            return _hdr_job_name(profile, first) or "A scheduled job", "job"
+        if s.get("parent_session_id"):
+            parent = (db.get_session(s["parent_session_id"]) or {}).get("title")
+            return (f"Subagent of {parent}" if parent else "A subagent"), "chat"
+        words = " ".join(_aai_real_request(first).split())
+        return (words[:60] + ("…" if len(words) > 60 else "") if words else ("A new chat" if s else "")), "chat"
+    finally:
+        db.close()
+
+
 @router.get("/hdr/guard/asks")
 async def hdr_guard_asks(profile: Optional[str] = None, wait: float = Query(0, ge=0, le=_HDR_ASKS_HOLD_S), have: str = ""):
     """Questions waiting for an answer, oldest first, with the chat they came from, and the ones that ran out
@@ -2822,13 +2860,9 @@ async def hdr_guard_asks(profile: Optional[str] = None, wait: float = Query(0, g
     also tells the guard someone is at Hermes."""
     def _chat(a):
         try:
-            db = _open_sessions_db(a.get("profile"))
-            try:
-                return (db.get_session(a.get("session_id")) or {}).get("title") or ""
-            finally:
-                db.close()
+            return _hdr_session_label(a.get("profile"), a.get("session_id"))
         except Exception:
-            return ""
+            return "", "chat"
 
     def _scan(d):
         now, out, ran_out = time.time(), [], []
@@ -2863,8 +2897,11 @@ async def hdr_guard_asks(profile: Optional[str] = None, wait: float = Query(0, g
             if key != have or time.time() - start + 0.5 > wait:
                 break
             time.sleep(0.5)
-        return {"asks": [dict(a, chat=_chat(a)) for a in sorted(out, key=lambda a: a["ts"])],
-                "ran_out": [dict(a, chat=_chat(a)) for a in sorted(ran_out, key=lambda a: a["ts"])], "key": key}
+        def _with_chat(a):
+            label, kind = _chat(a)
+            return dict(a, chat=label, chat_kind=kind)
+        return {"asks": [_with_chat(a) for a in sorted(out, key=lambda a: a["ts"])],
+                "ran_out": [_with_chat(a) for a in sorted(ran_out, key=lambda a: a["ts"])], "key": key}
     return await asyncio.to_thread(_run)
 
 

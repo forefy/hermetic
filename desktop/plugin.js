@@ -3283,7 +3283,9 @@ const AskCard = ({ ask, more, onAnswered }) => {
     } catch (e) { setErr((e && e.message) || 'Could not answer') } finally { setBusy(false) }
   }
   const scopes = [{ id: 'file', label: 'This file' }, { id: 'folder', label: ask.folder || 'Its folder' }, { id: 'kind', label: ask.kind === 'startup' ? 'All startup items' : 'All key reads' }]
-  const remembers = [{ id: 'once', label: 'Once' }].concat(ask.session_id ? [{ id: 'chat', label: 'This chat' }] : [], [{ id: 'always', label: 'Always' }])
+  // a scheduled job gets a new session every run, so "this chat" there means this run only
+  const isJob = ask.chat_kind === 'job'
+  const remembers = [{ id: 'once', label: 'Once' }].concat(ask.session_id ? [{ id: 'chat', label: isJob ? 'This run' : 'This chat' }] : [], [{ id: 'always', label: 'Always' }])
   const kv = (k, v) => [el('span', { key: k + 'k', style: { color: C.dim } }, k), el('span', { key: k + 'v', style: { color: C.sub, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, v)]
   return el('div', { style: { padding: 16, width: 380, maxWidth: '100%', boxSizing: 'border-box', fontSize: 12, color: C.text } },
     el('div', { style: { display: 'flex', gap: 10, alignItems: 'center' } },
@@ -3292,7 +3294,7 @@ const AskCard = ({ ask, more, onAnswered }) => {
         el('div', { style: { fontSize: 12.5, fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, 'The agent wants to ' + (ask.op === 'read' ? 'read ' : ask.op === 'write' ? 'write ' : 'use ') + ask.path),
         el('div', { style: { fontSize: 10.5, color: C.dim } }, 'Hermes doesn’t check this itself'))),
     el('div', { style: { display: 'grid', gridTemplateColumns: '62px minmax(0,1fr)', gap: '2px 8px', marginTop: 10, fontSize: 11 } },
-      ...kv('tool', ask.tool), ...kv('chat', ask.chat || '-'), ...kv('profile', ask.profile || 'default'), ...kv('why', ask.why)),
+      ...kv('tool', ask.tool), ...kv(isJob ? 'job' : 'chat', ask.chat || '-'), ...kv('profile', ask.profile || 'default'), ...kv('why', ask.why)),
     el('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginTop: 10, fontSize: 10.5, color: C.dim } }, 'Rule for', el(SegmentedControl, { value: scope, onChange: setScope, options: scopes })),
     el('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginTop: 6, fontSize: 10.5, color: C.dim } }, 'Remember', el(SegmentedControl, { value: remember, onChange: setRemember, options: remembers })),
     el('div', { style: { display: 'flex', alignItems: 'center', gap: 8, marginTop: 12 } },

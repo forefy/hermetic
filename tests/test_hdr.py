@@ -129,6 +129,37 @@ def test_snippet_shows_the_line_that_named_the_place():
     assert api._hdr_snippet("terminal", {"command": 'echo hi\ncat ~/".ssh"/id_rsa'}, "~/.ssh/id_rsa") == 'cat ~/".ssh"/id_rsa'
 
 
+def test_a_guard_question_names_its_job_or_chat_before_hermes_titles_it():
+    import json
+    home = Path(tempfile.mkdtemp(prefix="hermetic-test-"))
+    atexit.register(shutil.rmtree, home, True)
+    (home / "cron").mkdir()
+    (home / "cron" / "jobs.json").write_text(json.dumps({"jobs": [
+        {"id": "a", "name": "Endpoint threat hunt", "skill": "endpoint-threat-hunt", "prompt": "Scheduled endpoint threat hunt."}]}))
+    sessions = {"job": {"source": "cron"}, "done": {"source": "cron", "title": "Hunt, Nov 03"}, "chat": {"source": "desktop"},
+                "sub": {"parent_session_id": "p"}, "p": {"title": "Fix the build"}}
+    msgs = {"job": [{"role": "user", "content": '[IMPORTANT: The user has invoked the "endpoint-threat-hunt" skill.]\nScheduled endpoint threat hunt.'}],
+            "chat": [{"role": "user", "content": "[The user attached an image]  please   check the deploy logs for errors"}]}
+
+    class DB:
+        def get_session(self, sid):
+            return sessions.get(sid)
+
+        def close(self):
+            pass
+    saved = api._open_sessions_db, api._profile_home, api._db_messages
+    api._open_sessions_db, api._profile_home = (lambda profile: DB()), (lambda profile: ("default", home))
+    api._db_messages = lambda db, sid, **k: msgs.get(sid, [])
+    try:
+        assert api._hdr_session_label(None, "job") == ("Endpoint threat hunt", "job"), "a running job, named once it ends"
+        assert api._hdr_session_label(None, "done") == ("Hunt, Nov 03", "job")
+        assert api._hdr_session_label(None, "chat") == ("please check the deploy logs for errors", "chat"), "a new chat by its first words"
+        assert api._hdr_session_label(None, "sub") == ("Subagent of Fix the build", "chat")
+        assert api._hdr_session_label(None, "gone") == ("", "chat") and api._hdr_session_label(None, "") == ("", "chat")
+    finally:
+        api._open_sessions_db, api._profile_home, api._db_messages = saved
+
+
 def test_other_homes_and_spellings_are_the_same_place():
     assert api._hdr_sensitive("/home/ubuntu/.ssh/id_rsa")[0] == "SSH keys"
     assert api._hdr_sensitive("/root/.aws/credentials")[0] == "cloud keys"

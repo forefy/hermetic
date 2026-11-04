@@ -1405,7 +1405,9 @@ function useMeterData() {
           routing.rows.map(r => r.model).concat(sessionsResult.sessions.slice().sort((a, b) => b.cost - a.cost).slice(0, 3).map(x => x.model)).filter(Boolean)
         )
       )
-      const [cheapest, endpoints] = orAny ? await Promise.all([loadCheapestEndpoint(topModel), loadEndpoints(routeModels)]) : [null, {}]
+      const [cheapest, endpoints, quality] = orAny
+        ? await Promise.all([loadCheapestEndpoint(topModel), loadEndpoints(routeModels), orProfile ? loadQuality(profile) : null])
+        : [null, {}, null]
       {
         const local = sget('billed', null) || {}
         let changed = false
@@ -1431,7 +1433,7 @@ function useMeterData() {
         loading: false,
         error: null,
         cheapest,
-        data: { ...analytics, sessions: sessionsResult.sessions.filter(x => inScope.has(x.profile)), sessionsComplete: sessionsResult.complete, routing, endpoints, aux, health,
+        data: { ...analytics, sessions: sessionsResult.sessions.filter(x => inScope.has(x.profile)), sessionsComplete: sessionsResult.complete, routing, endpoints, aux, health, quality,
           orDaily: orAnalytics ? orAnalytics.daily : null, providerName: providerLabel(yaml), nousBilled },
         scope,
         profileCount: profiles.length,
@@ -2071,6 +2073,46 @@ function buildYamlChange(yaml, change) {
     if (!block.length) return { yaml: lines.join('\n'), diff }
     diff.push({ from: null, to: ['provider_routing:'].concat(block).join('\n') })
     lines.push('', 'provider_routing:', ...block)
+    return { yaml: lines.join('\n'), diff }
+  }
+  if (change.kind === 'ignore_provider') {
+    // one provider added to provider_routing.ignore (every model), the list created when missing
+    const indent = l => l.search(/\S/)
+    const unq = x => x.trim().replace(/^["']|["']$/g, '')
+    const i = lines.findIndex(l => /^provider_routing:\s*(#.*)?$/.test(l))
+    if (i < 0) {
+      const block = ['provider_routing:', '  ignore:', '    - ' + change.slug]
+      lines.push('', ...block)
+      diff.push({ from: null, to: block.join('\n') })
+      return { yaml: lines.join('\n'), diff }
+    }
+    const blockEnd = () => {
+      let e = i + 1
+      for (; e < lines.length; e++) if (lines[e].trim() && !/^\s*#/.test(lines[e]) && indent(lines[e]) === 0) break
+      while (e > i + 1 && !lines[e - 1].trim()) e--
+      return e
+    }
+    const end = blockEnd()
+    const before = lines.slice(i, end).join('\n')
+    const at = lines.slice(i + 1, end).findIndex(l => /^ {2}ignore:/.test(l))
+    if (at < 0) lines.splice(end, 0, '  ignore:', '    - ' + change.slug)
+    else {
+      const k = i + 1 + at
+      const inline = lines[k].match(/^ {2}ignore:\s*\[(.*)\]\s*(#.*)?$/)
+      if (inline) {
+        const items = inline[1].split(',').map(x => x.trim()).filter(Boolean)
+        if (items.some(x => unq(x) === change.slug)) return null
+        lines[k] = '  ignore: [' + items.concat([change.slug]).join(', ') + ']'
+      } else {
+        let j = k + 1
+        while (j < lines.length && /^\s*-\s/.test(lines[j]) && indent(lines[j]) >= 2) {
+          if (unq(lines[j].replace(/^\s*-\s*/, '')) === change.slug) return null
+          j++
+        }
+        lines.splice(j, 0, ' '.repeat(j > k + 1 ? indent(lines[k + 1]) : 4) + '- ' + change.slug)
+      }
+    }
+    diff.push({ from: before, to: lines.slice(i, blockEnd()).join('\n') })
     return { yaml: lines.join('\n'), diff }
   }
   if (change.kind === 'aux') {
@@ -3532,6 +3574,7 @@ const Body = ({ meter, prices, threshold, retries, yaml, profile, profileLabel, 
   const pending = improvements.filter(i => !applied(i))
   pending.sort((a, b) => b.save - a.save)
   const topImprove = pending[0]
+  const worseProvider = orProfile ? qualityWorst(meter.quality, qualityDays(period), yaml) : null
   let verdictTone = 'ok'
   let verdict
   if (!backendPatched && !account) {
@@ -3545,6 +3588,9 @@ const Body = ({ meter, prices, threshold, retries, yaml, profile, profileLabel, 
   } else if (m.bloatOver) {
     verdictTone = 'warn'
     verdict = trunc(m.bloat.title, 28) + ' is past the compaction threshold'
+  } else if (worseProvider) {
+    verdictTone = 'warn'
+    verdict = worseProvider.provider + ' answered worse on ' + shortModel(worseProvider.model)
   } else if (topImprove && topImprove.save >= 1) {
     verdict = 'Nothing burning. One fix worth ' + fmtUsd(topImprove.save, { approx: topImprove.approx }) + ' this period'
   } else {
@@ -3774,6 +3820,7 @@ const Body = ({ meter, prices, threshold, retries, yaml, profile, profileLabel, 
       profileLabel,
       onApplied: refresh
     }),
+    orProfile ? el(QualitySection, { quality: meter.quality, period, defaultModel, yaml, profile, onApplied: refresh }) : null,
     pending.length ? el(Improve, { items: pending, yaml, profile, onApplied: refresh }) : null,
     foot
   )
@@ -4216,6 +4263,282 @@ async function freshConfig(profile) {
   const text = r && r.yaml
   if (!text || typeof text !== 'string') throw new Error('could not re-read the config, nothing written')
   return text
+}
+
+// ---- quality by provider -----------------------------------------------------------------------
+// Whether one provider's copy of a model answers worse than the others, judged by the replies you pushed
+// back on (the backend matches each reply to the call that produced it), with what each endpoint declares,
+// the changes seen and the opt-in daily check. Day rows: [calls, replies, pushed back, output tokens,
+// seconds, thinking tokens, cut off, empty].
+
+async function loadQuality(profile) {
+  try {
+    const r = await api(profileReq(profile, { path: OWN + '/quality' }))
+    return r && Array.isArray(r.models) ? r : null
+  } catch {
+    return null
+  }
+}
+
+const Q_FEW = 10 // replies a provider needs over the period before its pushback rate counts
+const Q_FEW_DAY = 3 // and a day, before its box is coloured
+const Q_TOP = 4 // providers shown before the rest fold into one row
+
+// the period's days, oldest first, one box each
+const qualityDays = period => lastNDays(period === '30d' ? 30 : period === 'today' ? 1 : 7)
+
+// one-sided Fisher exact test: the chance of a or more pushbacks in n1 replies if both groups shared one rate
+function fisherGreater(a, n1, b, n2) {
+  const lf = x => { let s = 0; for (let i = 2; i <= x; i++) s += Math.log(i); return s }
+  const lc = (n, k) => (k < 0 || k > n ? -Infinity : lf(n) - lf(k) - lf(n - k))
+  const k = a + b
+  let p = 0
+  for (let x = a; x <= Math.min(k, n1); x++) p += Math.exp(lc(k, x) + lc(n1 + n2 - k, n1 - x) - lc(n1 + n2, n1))
+  return Math.min(1, p)
+}
+
+// one model over the period's days: per provider its boxes, totals and whether it answers worse than the rest
+// a provider's usual thinking per call and output speed: its median over the days with 5 or more calls
+function qualityBase(dayMap) {
+  const rows = Object.values(dayMap || {}).filter(r => num(r[0]) >= 5)
+  const mid = xs => { const v = xs.filter(x => x != null && isFinite(x)).sort((a, b) => a - b); return v.length ? v[Math.floor(v.length / 2)] : null }
+  return { think: mid(rows.map(r => num(r[5]) / num(r[0]))), speed: mid(rows.map(r => (num(r[4]) > 0 ? num(r[3]) / num(r[4]) : null))) }
+}
+
+// one day's level, 0 fine to 3 bad, from the worst of its signals that have enough data, with what fired;
+// level null when none has: [calls, replies, pushed back, output tokens, seconds, thinking tokens, cut off, empty]
+function qualityDay(r, base) {
+  const [calls, replies, push, out, secs, think, cut, empty] = r.map(num)
+  const sig = []
+  if (replies >= Q_FEW_DAY) {
+    const x = push / replies
+    sig.push([x >= 0.15 ? 3 : x >= 0.09 ? 2 : x >= 0.03 ? 1 : 0, 'you pushed back on ' + push + ' of ' + replies + ' replies'])
+  }
+  if (calls >= 5) {
+    const c = cut / calls, e = empty / calls
+    sig.push([c >= 0.1 ? 3 : c >= 0.04 ? 2 : 0, cut + ' of ' + calls + ' answers cut off'])
+    sig.push([e >= 0.05 ? 3 : e >= 0.02 ? 2 : 0, empty + (empty === 1 ? ' empty reply' : ' empty replies')])
+    if (base && base.think > 50) {
+      const t = think / calls / base.think
+      sig.push([t < 0.25 ? 3 : t < 0.5 ? 2 : 0, 'thinking at ' + Math.round(t * 100) + '% of its usual'])
+    }
+    if (base && base.speed && secs > 0) {
+      const v = out / secs / base.speed
+      sig.push([v > 1.8 || v < 0.55 ? 2 : 0, v > 1 ? v.toFixed(1) + '× its usual speed' : 'at ' + Math.round(v * 100) + '% of its usual speed'])
+    }
+  }
+  if (!sig.length) return { level: null, why: [] }
+  return { level: Math.max(...sig.map(x => x[0])), why: sig.filter(x => x[0] >= 2).map(x => x[1]) }
+}
+
+// one model over the period's days: per provider its boxes, totals and the ways it answers worse than the rest
+function qualityModel(entry, days) {
+  const inPeriod = new Set(days)
+  const zero = [0, 0, 0, 0, 0, 0, 0, 0]
+  const provs = ((entry && entry.providers) || []).map(p => {
+    const per = days.map(d => (p.days && p.days[d]) || zero)
+    const t = per.reduce((s, r) => s.map((v, i) => v + num(r[i])), zero)
+    const base = qualityBase(p.days)
+    return {
+      name: p.name, quant: p.quant, tag: p.tag, check: p.check, version: p.version, per, base, levels: per.map(r => qualityDay(r, base)),
+      events: (p.events || []).filter(e => inPeriod.has(e.day)),
+      calls: t[0], replies: t[1], push: t[2], rate: t[1] ? t[2] / t[1] : null, cuts: t[6], empties: t[7],
+      speed: t[4] > 0 ? t[3] / t[4] : null, thinking: t[0] ? t[5] / t[0] : null, cut: t[0] ? t[6] / t[0] : null, empty: t[7]
+    }
+  }).filter(p => p.calls > 0)
+  const pct = x => fmtPct(x * 100)
+  for (const p of provs) {
+    const rest = k => provs.reduce((s, o) => s + (o === p ? 0 : o[k]), 0)
+    const or = rest('replies'), op = rest('push'), oc = rest('calls'), ocut = rest('cuts'), oe = rest('empties')
+    p.otherRate = or ? op / or : null
+    p.why = []
+    if (p.replies >= Q_FEW && or >= Q_FEW && p.rate - op / or >= 0.05 && fisherGreater(p.push, p.replies, op, or) < 0.05)
+      p.why.push('you pushed back on ' + pct(p.rate) + ' of its replies, ' + pct(op / or) + ' elsewhere')
+    if (p.calls >= 30 && oc >= 30 && p.cuts / p.calls - ocut / oc >= 0.03 && fisherGreater(p.cuts, p.calls, ocut, oc) < 0.05)
+      p.why.push(pct(p.cuts / p.calls) + ' of its answers were cut off, ' + pct(ocut / oc) + ' elsewhere')
+    if (p.calls >= 30 && oc >= 30 && p.empties / p.calls - oe / oc >= 0.02 && fisherGreater(p.empties, p.calls, oe, oc) < 0.05)
+      p.why.push(pct(p.empties / p.calls) + ' of its replies were empty, ' + pct(oe / oc) + ' elsewhere')
+    p.worse = p.why.length > 0
+  }
+  const flagged = p => (p.worse || p.events.length ? 1 : 0)
+  provs.sort((a, b) => flagged(b) - flagged(a) || b.calls - a.calls)
+  return { model: entry.model, calls: provs.reduce((s, p) => s + p.calls, 0), providers: provs }
+}
+
+// the provider slug OpenRouter's ignore list takes: the endpoint tag's first part ("deepinfra/fp4")
+const qualitySlug = p => (p.tag || '').split('/')[0] || p.name.toLowerCase().replace(/\s+/g, '-')
+
+// whether config.yaml already skips this provider (for every model, as the Providers section's rules do)
+const qualitySkipped = (yaml, p) => !!yaml && buildYamlChange(yaml, { kind: 'ignore_provider', slug: qualitySlug(p) }) === null
+
+// the first provider answering worse on any model this period and not skipped yet, for the status line
+function qualityWorst(quality, days, yaml) {
+  for (const m of (quality && quality.models) || []) {
+    const w = qualityModel(m, days).providers.find(p => p.worse && !qualitySkipped(yaml, p))
+    if (w) return { model: m.model, provider: w.name }
+  }
+  return null
+}
+
+const Q_COLOURS = ['rgba(111,191,142,.55)', 'rgba(154,160,173,.35)', 'rgba(201,150,63,.75)', 'rgba(224,108,117,.85)']
+const qualityBox = (r, d, maxCalls) => ({
+  background: d.level == null ? 'rgba(154,160,173,.22)' : Q_COLOURS[d.level],
+  opacity: Math.max(0.4, Math.min(1, (num(r[0]) / Math.max(1, maxCalls)) * 1.5))
+})
+
+const QualitySection = ({ quality, period, defaultModel, yaml, profile, onApplied }) => {
+  const [picked, setPicked] = useState(() => sget('quality:model', null))
+  const [open, setOpen] = useState(null)
+  const [day, setDay] = useState(null)
+  const [unfold, setUnfold] = useState(false)
+  const [skip, setSkip] = useState(false)
+  const [busy, setBusy] = useState(false)
+  const [err, setErr] = useState(null)
+  const days = qualityDays(period)
+  const models = ((quality && quality.models) || []).map(m => qualityModel(m, days)).filter(m => m.calls > 0).sort((a, b) => b.calls - a.calls)
+  if (!models.length) return null
+  const cur = models.find(m => m.model === picked) || models.find(m => m.model === defaultModel) || models[0]
+  const provs = cur.providers
+  const shown = unfold ? provs : provs.slice(0, Q_TOP)
+  const rest = unfold ? [] : provs.slice(Q_TOP)
+  const worst = provs.find(p => p.worse && !qualitySkipped(yaml, p))
+  const skippedNow = provs.filter(p => p.worse && qualitySkipped(yaml, p))
+  const n = days.length
+  const boxW = n > 7 ? 7 : 18
+  const maxCalls = Math.max(1, ...provs.map(p => Math.max(...p.per.map(r => r[0]))))
+  const pickRow = (name, i) => { setOpen(name); setDay(i) }
+  const box = (p, r, i, fold) => {
+    const ev = !fold && p.events.find(e => e.day === days[i])
+    const lv = p.levels[i]
+    const tip = p.name + ', ' + dayLabel(days[i]) + ': ' + (r[0] ? r[0] + ' calls, ' + (lv.why.length ? lv.why.join(', ') : lv.level == null ? 'too few to tell' : 'nothing unusual') : 'no calls') + (ev ? '. ' + ev.what : '')
+    return el(Tip, { key: p.name + i, label: tip },
+      el('span', {
+        onClick: r[0] ? () => (fold ? setUnfold(true) : pickRow(p.name, i)) : undefined,
+        style: Object.assign({ display: 'block', height: n > 7 ? 'auto' : 16, aspectRatio: n > 7 ? '1 / 1' : undefined, borderRadius: n > 7 ? 2 : 3, position: 'relative', cursor: r[0] ? 'pointer' : 'default', boxSizing: 'border-box',
+          outline: open === p.name && day === i ? '1px solid ' + C.text : 'none', outlineOffset: 1 },
+          r[0] ? qualityBox(r, lv, maxCalls) : { background: 'rgba(255,255,255,.04)' })
+      }, ev ? el('span', { style: { position: 'absolute', top: -3, right: -3, width: 6, height: 6, transform: 'rotate(45deg)', background: C.text } }) : null))
+  }
+  const foldRow = rest.length
+    ? { name: rest.length + ' more providers', per: days.map((_, i) => rest.reduce((s, p) => s.map((v, j) => v + num(p.per[i][j])), [0, 0, 0, 0, 0, 0, 0, 0])) }
+    : null
+  if (foldRow) Object.assign(foldRow, { calls: rest.reduce((s, p) => s + p.calls, 0), replies: rest.reduce((s, p) => s + p.replies, 0), push: rest.reduce((s, p) => s + p.push, 0) })
+  if (foldRow) foldRow.rate = foldRow.replies ? foldRow.push / foldRow.replies : null
+  if (foldRow) { const b = qualityBase(Object.assign({}, foldRow.per)); foldRow.levels = foldRow.per.map(r => qualityDay(r, b)) }
+  const gridRows = shown.concat(foldRow ? [foldRow] : [])
+  const grid = el('div', { style: { display: 'grid', gridTemplateColumns: n > 7 ? 'minmax(0,92px) repeat(' + n + ', minmax(0,1fr))' : 'minmax(0,1fr) repeat(' + n + ', ' + boxW + 'px)', gap: n > 7 ? '5px 2px' : '4px 3px', alignItems: 'center' } },
+    el('span'),
+    days.map((d, i) => el('span', { key: 'd' + i, style: { fontSize: 9.5, color: C.dim, textAlign: 'center', overflow: 'visible', whiteSpace: 'nowrap' } },
+      n > 7 ? (i % 7 === (n - 1) % 7 ? String(new Date(d + 'T12:00:00').getDate()) : '') : i === n - 1 ? 'Today' : String(new Date(d + 'T12:00:00').getDate()))),
+    gridRows.flatMap(p => [
+      el('span', {
+        key: p.name + 'l',
+        onClick: () => (p === foldRow ? setUnfold(true) : (setOpen(open === p.name ? null : p.name), setDay(null))),
+        className: 'hover:text-(--ui-text-primary)',
+        style: { fontSize: 11, color: C.sub, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', paddingRight: 6, cursor: 'pointer' }
+      }, p === foldRow ? rest.length + ' more' : p.name + (p.quant ? ' ' + p.quant : '')),
+      ...p.per.map((r, i) => box(p, r, i, p === foldRow))
+    ]))
+  const swatch = bg => el('span', { style: { width: 12, height: 8, borderRadius: 2, background: bg, display: 'inline-block' } })
+  const scale = el('div', { style: { display: 'flex', alignItems: 'center', gap: 5, color: C.dim, fontSize: 10, margin: '6px 0 8px' } },
+    'fine', ...Q_COLOURS.map((c, i) => el('span', { key: i }, swatch(c))), 'worse',
+    el(InfoDot, { tip: 'Each box is its worst sign that day: your pushback, answers cut off, empty replies, less thinking than its usual, or a speed jump' }))
+  const cols = 'minmax(0,1fr) 44px 54px 46px'
+  const push = p => p.replies < Q_FEW
+    ? el(Tip, { label: 'Too few of your replies to tell' }, el('span', { style: { color: C.dim, cursor: 'help' } }, 'few'))
+    : el('span', { style: { color: p.worse ? C.warn : C.text } }, fmtPct(p.rate * 100))
+  const kv = (k, v, tip) => [el('span', { key: k + 'k', style: { color: C.dim } }, tip ? el(Tip, { label: tip }, el('span', { style: { cursor: 'help' } }, k)) : k), el('span', { key: k + 'v', style: { textAlign: 'right', color: C.text } }, v)]
+  const details = p => {
+    const c = p.check
+    const dr = day != null && open === p.name ? p.per[day] : null
+    return el('div', { style: { gridColumn: '1 / -1', padding: '6px 0 2px', fontSize: 11, color: C.sub } },
+      dr ? el('div', { style: { color: C.text, marginBottom: 6 } }, dayLabel(days[day]) + ': ' + dr[0] + ' calls, ' + (p.levels[day].why.length ? p.levels[day].why.join(', ') : p.levels[day].level == null ? 'too few to tell' : 'nothing unusual')) : null,
+      p.events.map((e, i) => el('div', { key: i, style: { color: C.warn, marginBottom: 4 } }, dayLabel(e.day) + ': ' + e.what)),
+      el('div', { style: { display: 'grid', gridTemplateColumns: 'minmax(0,1fr) auto', gap: '3px 12px' } },
+        ...kv('Precision', p.quant || 'not declared', 'What the provider declares to OpenRouter'),
+        ...kv('Thinking per call', p.thinking ? Math.round(p.thinking) + ' tokens' : 'none'),
+        ...kv('Cut off mid-answer', p.cut ? (p.cut * 100).toFixed(1) + '%' : 'none'),
+        ...(p.empty ? kv('Empty replies', String(p.empty)) : []),
+        ...(p.version ? kv('Model version', p.version, 'The exact model OpenRouter reports behind this provider') : []),
+        ...(c && !c.error && c.prompt_tokens ? kv('Check prompt tokens', String(c.prompt_tokens), 'A change means a different tokenizer or template behind the same name') : []),
+        ...(c ? kv('Daily check', c.error ? 'failed' : c.sure != null ? (c.sure * 100).toFixed(1) + '% sure of the answer' : 'answered "' + c.answer + '"', c.error || 'How sure the model is of the known answer to a fixed prompt') : [])),
+      !c && !(quality.check && quality.check.enabled) ? el('div', { style: { color: C.dim, marginTop: 6 } }, 'The daily check adds how sure it is and its tokenizer') : null)
+  }
+  const row = p => el('div', { key: p.name, style: { display: 'grid', gridTemplateColumns: cols, gap: 8, alignItems: 'center', padding: '8px 0', borderTop: '1px solid ' + C.stroke, cursor: 'pointer' },
+    onClick: e => { if (!e.target.closest('[data-details]')) { setOpen(open === p.name ? null : p.name); setDay(null) } } },
+    el('div', { style: { minWidth: 0 } },
+      el('div', { style: { display: 'flex', alignItems: 'center', gap: 6, color: C.text } }, p.name,
+        p.worse ? el(Tip, { label: (p.why.join(', and ') + ', a gap beyond chance').replace(/^./, c => c.toUpperCase()) },
+          el('span', { style: { fontSize: 10, padding: '0 6px', borderRadius: 9, border: '1px solid ' + C.warn, color: C.warn, cursor: 'help' } }, 'worse')) : null),
+      el('div', { style: { fontSize: 11, color: C.dim } }, p.quant || 'precision not declared')),
+    el('span', { style: { textAlign: 'right', fontVariantNumeric: 'tabular-nums', color: C.text } }, p.calls),
+    el('span', { style: { textAlign: 'right', fontVariantNumeric: 'tabular-nums' } }, push(p)),
+    el(Tip, { label: 'Output tokens per second, counting the wait for the first token' }, el('span', { style: { textAlign: 'right', fontVariantNumeric: 'tabular-nums', color: C.text } }, p.speed ? Math.round(p.speed) + '/s' : '-')),
+    open === p.name ? el('div', { 'data-details': 1, style: { gridColumn: '1 / -1', cursor: 'text', userSelect: 'text', WebkitUserSelect: 'text' } }, details(p)) : null)
+  const skipChange = worst ? { kind: 'ignore_provider', slug: qualitySlug(worst) } : null
+  const preview = skip && skipChange ? buildYamlChange(yaml, skipChange) : null
+  const applySkip = async () => {
+    setBusy(true)
+    setErr(null)
+    try {
+      const latest = await freshConfig(profile)
+      const change = buildYamlChange(latest, skipChange)
+      if (change) await writeConfig(profile, '/config/raw', { yaml_text: change.yaml })
+      setSkip(false)
+      onApplied()
+    } catch (e) {
+      setErr((e && e.message) || 'write failed')
+    } finally {
+      setBusy(false)
+    }
+  }
+  const setCheck = async on => {
+    try {
+      await api(profileReq(profile, { path: OWN + '/quality/check', method: 'POST', body: { enabled: on } }))
+    } catch { /* the next load shows the real state */ }
+    onApplied()
+  }
+  const btn = (label, onClick, disabled) => el('button', { type: 'button', disabled, onClick,
+    className: 'rounded-[4px] px-2 py-1 text-[11px] text-(--ui-text-secondary) hover:bg-(--chrome-action-hover) hover:text-(--ui-text-primary)',
+    style: { border: '1px solid ' + C.stroke, background: 'transparent', cursor: disabled ? 'default' : 'pointer', whiteSpace: 'nowrap', flex: 'none' } }, label)
+  return el(Section, {
+    id: 'quality', title: 'Quality by provider',
+    right: worst ? el('span', { style: { display: 'inline-flex', alignItems: 'center', gap: 6 } }, el(Dot, { tone: 'warn' }), 'worse on ' + shortModel(cur.model)) : el('span', { style: { color: C.dim } }, 'steady')
+  },
+  el('div', { style: { display: 'flex', justifyContent: 'flex-end', marginBottom: 10, fontSize: 11 } },
+    el('select', {
+      value: cur.model,
+      onChange: e => { setPicked(e.target.value); sset('quality:model', e.target.value); setOpen(null); setDay(null); setUnfold(false); setSkip(false) },
+      style: { font: 'inherit', fontSize: 11, color: C.text, background: 'var(--ui-bg-tertiary)', border: '1px solid ' + C.stroke, borderRadius: 5, padding: '2px 6px', maxWidth: 220, colorScheme: 'dark' }
+    }, models.map(m => el('option', { key: m.model, value: m.model }, shortModel(m.model))))),
+  grid,
+  scale,
+  el('div', { style: { display: 'grid', gridTemplateColumns: cols, gap: 8, fontSize: 10, color: C.dim, padding: '4px 0' } },
+    el('span', null, 'Provider'), el('span', { style: { textAlign: 'right' } }, 'Calls'), el('span', { style: { textAlign: 'right' } }, 'Pushback'), el('span', { style: { textAlign: 'right' } }, 'Speed')),
+  shown.map(row),
+  foldRow ? el('div', { key: 'fold', onClick: () => setUnfold(true), style: { display: 'grid', gridTemplateColumns: cols, gap: 8, alignItems: 'center', padding: '8px 0', borderTop: '1px solid ' + C.stroke, cursor: 'pointer' } },
+    el('div', { style: { minWidth: 0 } },
+      el('div', { style: { color: C.sub } }, foldRow.name),
+      el('div', { style: { fontSize: 11, color: C.dim, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' } }, rest.map(p => p.name).join(', '))),
+    el('span', { style: { textAlign: 'right', fontVariantNumeric: 'tabular-nums', color: C.text } }, foldRow.calls),
+    el('span', { style: { textAlign: 'right', fontVariantNumeric: 'tabular-nums' } }, push(foldRow)),
+    el('span', { style: { textAlign: 'right', color: C.dim } }, '-')) : null,
+  unfold && provs.length > Q_TOP ? el('div', { onClick: () => setUnfold(false), style: { padding: '8px 0', borderTop: '1px solid ' + C.stroke, fontSize: 11, color: C.sub, cursor: 'pointer' } }, 'Show fewer') : null,
+  worst ? el('div', { style: { display: 'flex', alignItems: 'center', gap: 8, marginTop: 10 } },
+    btn(skip ? 'Cancel' : 'Skip ' + worst.name, () => setSkip(!skip)),
+    el('span', { style: { fontSize: 11, color: C.dim } }, 'Your agent stops using it for every model, open chats included')) : null,
+  preview ? el('div', { style: { marginTop: 8, background: 'var(--ui-bg-tertiary)', borderRadius: 6, padding: '8px 10px', fontSize: 11 } },
+    preview.diff.map((d, i) => el('div', { key: i, style: { fontFamily: 'var(--font-mono, ui-monospace, monospace)', whiteSpace: 'pre-wrap' } },
+      d.from != null ? el('div', { style: { color: C.bad } }, d.from.split('\n').map(l => '- ' + l).join('\n')) : null,
+      el('div', { style: { color: C.ok } }, d.to.split('\n').map(l => '+ ' + l).join('\n')))),
+    el('div', { style: { display: 'flex', gap: 8, marginTop: 8, alignItems: 'center' } },
+      btn(busy ? 'Saving' : 'Apply to config.yaml', applySkip, busy),
+      err ? el('span', { style: { color: C.bad } }, err) : null)) : null,
+  skippedNow.length ? el('div', { style: { marginTop: 10, fontSize: 11, color: C.dim } }, skippedNow.map(p => p.name).join(', ') + ' skipped for every model in config.yaml') : null,
+  el('label', { style: { display: 'flex', gap: 8, alignItems: 'center', marginTop: 12, fontSize: 11.5, color: C.text, cursor: 'pointer' } },
+    el('input', { type: 'checkbox', checked: !!(quality.check && quality.check.enabled), onChange: e => setCheck(e.target.checked) }),
+    'Check each provider daily with a fixed prompt',
+    el(InfoDot, { tip: 'Once a day a tiny fixed prompt goes to each provider your models used this week, about $0.01 a month. It catches a provider changing the model behind the same name.' })))
 }
 
 const RoutingSection = ({ policyOn = true, providerName, rows, since, recording, reachable, endpoints, prices, days, yaml, aux, health, profile, profileLabel, onApplied }) => {

@@ -16,7 +16,7 @@ import time
 from itertools import zip_longest
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-from urllib.parse import urlparse
+from urllib.parse import quote as _quote, urlparse
 
 from fastapi import APIRouter, Body, Query
 
@@ -3302,3 +3302,387 @@ async def hdr(days: int = Query(7, ge=1, le=90), profile: Optional[str] = None):
         return await asyncio.to_thread(_run)
     except Exception as exc:
         return {"error": f"{type(exc).__name__}: {exc}"[:240]}
+
+
+# ==== Quality by provider: is one provider's copy of a model worse, or changed behind the same name =====
+# Free signals come from what hermetic already records: every OpenRouter call (routing.jsonl: provider,
+# tokens, finish, duration) and the replies you pushed back on (AAI's pushback finder), each reply matched
+# to the call that produced it. Changes come from OpenRouter's public endpoint list, saved once a day per
+# model, and, only when you turn it on, a daily check: one tiny fixed prompt to each provider you use.
+
+_Q_DAYS = 30
+_Q_CHECK_PROMPT = "Reply with exactly one word: ok"
+_Q_CHECK_EVERY_S = 20 * 3600
+_Q_RUNNING = set()
+
+
+def _q_dir(home):
+    d = _data_dir(home) / "quality"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _q_settings(home):
+    try:
+        s = _aai_json.loads((_q_dir(home) / "settings.json").read_text(encoding="utf-8"))
+        return s if isinstance(s, dict) else {}
+    except Exception:
+        return {}
+
+
+def _q_save_settings(home, s):
+    (_q_dir(home) / "settings.json").write_text(_aai_json.dumps(s), encoding="utf-8")
+
+
+def _q_day(ts):
+    return time.strftime("%Y-%m-%d", time.localtime(float(ts)))
+
+
+def _q_calls(home, since):
+    """OpenRouter calls since ``since``, oldest first."""
+    path = _data_dir(home) / "routing.jsonl"
+    rows = []
+    try:
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                try:
+                    r = _aai_json.loads(line)
+                except ValueError:
+                    continue
+                if float(r.get("ts") or 0) >= since and r.get("model"):
+                    rows.append(r)
+    except OSError:
+        return []
+    rows.sort(key=lambda r: float(r["ts"]))
+    return rows
+
+
+def _q_replies(profile, since):
+    """(session id, reply time, pushed back) for every turn's final reply since ``since``."""
+    db = _open_sessions_db(profile)
+    try:
+        store = _sessions_store(profile)
+        return [(str(x["row"]["id"]), float(x["ts"]), bool(x["frustrated"]))
+                for x in _aai_replies(db, store, _db_sessions(db, since), since)]
+    finally:
+        db.close()
+
+
+def _q_attribute(calls, replies, slack=5.0):
+    """Each reply's call: the session's last call that ended by the time the reply was saved."""
+    import bisect
+    by_session = {}
+    for r in calls:
+        by_session.setdefault(str(r.get("session") or ""), []).append(r)
+    out = []
+    for sid, ts, pushed in replies:
+        rows = by_session.get(sid)
+        if not rows:
+            continue
+        i = bisect.bisect_right([float(r["ts"]) for r in rows], ts + slack) - 1
+        if i >= 0:
+            out.append((rows[i], ts, pushed))
+    return out
+
+
+def _q_endpoints(home, models, fetch=None):
+    """OpenRouter's public endpoint list per model, saved once a day: {model: {provider: [endpoint, ...]}}
+    for the latest day, plus every change between saved days as (day, model, provider, what)."""
+    path = _q_dir(home) / "endpoints.jsonl"
+    rows = _aai_read(path)
+    today = _q_day(time.time())
+    have = {(r.get("model"), r.get("day")) for r in rows}
+
+    def _get(model):
+        try:
+            if fetch:
+                return model, fetch(model)
+            url = "https://openrouter.ai/api/v1/models/" + _quote(model, safe="/:") + "/endpoints"
+            with _aai_urlreq.urlopen(_aai_urlreq.Request(url, headers={"User-Agent": "hermetic"}), timeout=8) as r:
+                return model, _aai_json.loads(r.read().decode())
+        except Exception:
+            return model, None
+    missing = [m for m in models if (m, today) not in have]
+    with _AaiPool(max_workers=6) as pool:
+        fetched = list(pool.map(_get, missing)) if missing else []
+    for model, data in fetched:
+        eps = ((data or {}).get("data") or {}).get("endpoints") or [] if isinstance(data, dict) else []
+        for e in eps:
+            if not isinstance(e, dict) or not e.get("provider_name"):
+                continue
+            row = {"day": today, "model": model, "provider": e["provider_name"], "tag": e.get("tag") or "",
+                   "quant": e.get("quantization") if e.get("quantization") not in (None, "unknown") else None,
+                   "ctx": e.get("context_length"), "max_out": e.get("max_completion_tokens"),
+                   "logprobs": "logprobs" in (e.get("supported_parameters") or [])}
+            _aai_append(path, row)
+            rows.append(row)
+    latest, by_key, events = {}, {}, []
+    for r in sorted(rows, key=lambda r: r.get("day") or ""):
+        if r.get("model") not in models:
+            continue
+        by_key.setdefault((r["model"], r.get("tag") or r["provider"]), []).append(r)
+    for (model, _tag), hist in by_key.items():
+        last = hist[-1]
+        latest.setdefault(model, {}).setdefault(last["provider"], []).append(last)
+        for a, b in zip(hist, hist[1:]):
+            if a["day"] == b["day"]:
+                continue
+            if a.get("quant") != b.get("quant") and b.get("quant"):
+                events.append((b["day"], model, b["provider"], f"Precision changed from {a.get('quant') or 'not declared'} to {b['quant']}"))
+            if a.get("ctx") and b.get("ctx") and b["ctx"] < a["ctx"]:
+                events.append((b["day"], model, b["provider"], f"Context window cut from {a['ctx']:,} to {b['ctx']:,} tokens"))
+            if a.get("max_out") and b.get("max_out") and b["max_out"] < a["max_out"]:
+                events.append((b["day"], model, b["provider"], f"Longest answer cut from {a['max_out']:,} to {b['max_out']:,} tokens"))
+            if a.get("logprobs") and not b.get("logprobs"):
+                events.append((b["day"], model, b["provider"], "Stopped offering logprobs"))
+    return latest, events
+
+
+def _q_check_events(checks):
+    """Changes seen by the daily check, per model and provider, as (day, model, provider, what)."""
+    events, by_key = [], {}
+    for c in sorted(checks, key=lambda c: c.get("ts") or 0):
+        if not c.get("error"):
+            by_key.setdefault((c.get("model"), c.get("provider")), []).append(c)
+    for (model, prov), hist in by_key.items():
+        for a, b in zip(hist, hist[1:]):
+            if a.get("prompt_tokens") and b.get("prompt_tokens") and a["prompt_tokens"] != b["prompt_tokens"]:
+                events.append((b["day"], model, prov, f"Counts the check prompt as {b['prompt_tokens']} tokens, it was {a['prompt_tokens']}, so the tokenizer or template changed"))
+            if a.get("sure") is not None and b.get("sure") is not None and a["sure"] >= 0.9 and b["sure"] < a["sure"] - 0.02:
+                events.append((b["day"], model, prov, f"Less sure of the check answer, {b['sure'] * 100:.1f}% where it was {a['sure'] * 100:.1f}%"))
+    return events
+
+
+_Q_GEN_TRIED = {}  # generation id -> when its record was last missing, so it is retried after 10 minutes
+
+
+def _q_lookup_versions(home, calls, lookup=None, limit=20):
+    """The exact model version behind each provider, per day of the last week, from the generation record
+    of that day's newest call (its id is saved with each call). OpenRouter's lookup costs nothing."""
+    path = _q_dir(home) / "versions.jsonl"
+    have = {(r.get("model"), r.get("provider"), r.get("day")) for r in _aai_read(path)}
+    week = {_q_day(time.time() - i * 86400) for i in range(7)}
+    newest = {}
+    for r in calls:
+        day = _q_day(r["ts"])
+        if r.get("gen") and day in week:
+            newest[(r["model"], r.get("upstream") or "", day)] = r["gen"]
+    now = time.time()
+    todo = sorted(((k, g) for k, g in newest.items() if k not in have and now - _Q_GEN_TRIED.get(g, 0) > 600),
+                  key=lambda kg: kg[0][2], reverse=True)[:limit]
+    if not todo:
+        return 0
+    if lookup is None:
+        try:
+            rt = _aai_runtime(_aai_load_cfg())
+        except Exception:
+            return 0  # a Nous profile, or no OpenRouter key
+
+        def lookup(gid):
+            req = _aai_urlreq.Request(rt["base_url"] + "/generation?id=" + _quote(gid, safe=""), headers={"Authorization": "Bearer " + rt["api_key"]})
+            with _aai_urlreq.urlopen(req, timeout=5) as resp:
+                return _aai_json.loads(resp.read().decode())
+
+    def one(item):
+        (model, prov, day), gid = item
+        try:
+            g = (lookup(gid) or {}).get("data") or {}
+        except Exception:
+            _Q_GEN_TRIED[gid] = time.time()  # not stored yet, or gone: tried again in 10 minutes
+            return None
+        resp = (g.get("provider_responses") or [{}])[-1]
+        version = resp.get("model_permaslug") or g.get("model")
+        return {"day": day, "model": model, "provider": prov, "version": version, "endpoint": resp.get("endpoint_id")} if version else None
+    with _AaiPool(max_workers=4) as pool:
+        rows = [r for r in pool.map(one, todo) if r]
+    for r in rows:
+        _aai_append(path, r)
+    return len(rows)
+
+
+def _q_version_events(versions):
+    """A provider's model version changing from one day to the next, as (day, model, provider, what)."""
+    events, by_key = [], {}
+    for r in sorted(versions, key=lambda r: r.get("day") or ""):
+        by_key.setdefault((r.get("model"), r.get("provider")), []).append(r)
+    for (model, prov), hist in by_key.items():
+        for a, b in zip(hist, hist[1:]):
+            if a.get("version") and b.get("version") and a["version"] != b["version"]:
+                events.append((b["day"], model, prov, f"Model version changed from {a['version']} to {b['version']}"))
+    return events
+
+
+@router.get("/quality")
+async def quality(profile: Optional[str] = None):
+    """Per model and provider, the last 30 days by day: calls, replies, replies you pushed back on, output
+    tokens, seconds, thinking tokens, cut-off answers and empty replies, with what each endpoint declares,
+    the changes seen and the daily check's latest result. The popover picks the period and judges."""
+    def _run():
+        _name, home = _profile_home(profile)
+        since = time.mktime(time.strptime(_q_day(time.time() - (_Q_DAYS - 1) * 86400), "%Y-%m-%d"))
+        calls = _q_calls(home, since)
+        try:
+            replies = _q_replies(profile, since)
+        except Exception:
+            replies = []
+        models = {}
+        for r in calls:
+            p = models.setdefault(r["model"], {}).setdefault(r.get("upstream") or "unknown", {})
+            d = p.setdefault(_q_day(r["ts"]), [0, 0, 0, 0, 0.0, 0, 0, 0])
+            d[0] += 1
+            if int(r.get("output") or 0) > 0 and float(r.get("secs") or 0) > 0:
+                d[3] += int(r["output"])
+                d[4] += float(r["secs"])
+            d[5] += int(r.get("reasoning") or 0)
+            d[6] += 1 if r.get("finish") == "length" else 0
+            d[7] += 1 if r.get("empty") else 0
+        for row, ts, pushed in _q_attribute(calls, replies):
+            d = models[row["model"]][row.get("upstream") or "unknown"].setdefault(_q_day(ts), [0, 0, 0, 0, 0.0, 0, 0, 0])
+            d[1] += 1
+            d[2] += 1 if pushed else 0
+        settings = _q_settings(home)
+        checks = _aai_read(_q_dir(home) / "checks.jsonl")
+        try:
+            endpoints, events = _q_endpoints(home, list(models))
+        except Exception:
+            endpoints, events = {}, []
+        try:
+            _q_lookup_versions(home, calls)
+        except Exception:
+            pass
+        versions = _aai_read(_q_dir(home) / "versions.jsonl")
+        events += _q_check_events(checks) + _q_version_events(versions)
+        latest = {}
+        for c in checks:
+            latest[(c.get("model"), c.get("provider"))] = c
+        version = {}
+        for v in sorted(versions, key=lambda v: v.get("day") or ""):
+            version[(v.get("model"), v.get("provider"))] = v.get("version")
+        out = []
+        for model, provs in models.items():
+            plist = []
+            for prov, days in provs.items():
+                eps = (endpoints.get(model) or {}).get(prov) or []
+                check = latest.get((model, prov))
+                plist.append({"name": prov, "days": {k: [round(x, 2) if isinstance(x, float) else x for x in v] for k, v in days.items()},
+                              "quant": ", ".join(sorted({e["quant"] for e in eps if e.get("quant")})) or None,
+                              "tag": (eps[0].get("tag") or "") if eps else "",
+                              "version": version.get((model, prov)) or (check or {}).get("version"),
+                              "events": [{"day": d, "what": w} for d, m, p, w in events if m == model and p == prov],
+                              "check": {k: check.get(k) for k in ("ts", "answer", "sure", "prompt_tokens", "version", "error")} if check else None})
+            out.append({"model": model, "providers": plist})
+        out.sort(key=lambda m: -sum(sum(d[0] for d in p["days"].values()) for p in m["providers"]))
+        if settings.get("check") and time.time() - float(settings.get("last") or 0) > _Q_CHECK_EVERY_S:
+            _q_start_checks(profile)
+        return {"models": out, "check": {"enabled": bool(settings.get("check")), "last": settings.get("last")},
+                "first_day": _q_day(since)}
+
+    return await asyncio.to_thread(_run)
+
+
+@router.post("/quality/check")
+async def quality_check(payload: Dict[str, Any] = Body(default={}), profile: Optional[str] = None):
+    """Turn the daily check on or off. Turning it on runs it now when the last run is a day old."""
+    def _run():
+        _name, home = _profile_home(profile)
+        s = _q_settings(home)
+        s["check"] = bool((payload or {}).get("enabled"))
+        _q_save_settings(home, s)
+        if s["check"] and time.time() - float(s.get("last") or 0) > _Q_CHECK_EVERY_S:
+            _q_start_checks(profile)
+        return {"ok": True, "enabled": s["check"]}
+
+    return await asyncio.to_thread(_run)
+
+
+def _q_start_checks(profile):
+    _name, home = _profile_home(profile)
+    key = str(home)
+    if key in _Q_RUNNING:
+        return
+    _Q_RUNNING.add(key)
+
+    def run():
+        try:
+            _q_run_checks(profile, home)
+        finally:
+            _Q_RUNNING.discard(key)
+    _aai_spawn(run)
+
+
+def _q_targets(home):
+    """The providers worth checking: per model used 20 times in the last week (at most 3 models), each
+    provider that served it 5 times (at most 6), with the endpoint tag to pin it."""
+    calls = _q_calls(home, time.time() - 7 * 86400)
+    count = {}
+    for r in calls:
+        m = count.setdefault(r["model"], {})
+        m[r.get("upstream") or ""] = m.get(r.get("upstream") or "", 0) + 1
+    models = sorted((m for m in count if sum(count[m].values()) >= 20), key=lambda m: -sum(count[m].values()))[:3]
+    endpoints, _events = _q_endpoints(home, models)
+    out = []
+    for m in models:
+        provs = sorted((p for p, n in count[m].items() if p and n >= 5), key=lambda p: -count[m][p])[:6]
+        for p in provs:
+            eps = (endpoints.get(m) or {}).get(p) or []
+            if eps and eps[0].get("tag"):
+                out.append((m, p, eps[0]["tag"], bool(eps[0].get("logprobs"))))
+    return out
+
+
+def _q_check_one(rt, privacy, model, tag, logprobs, post=None, lookup=None):
+    """One check call pinned to one endpoint: the answer, how sure the model was of it (when the endpoint
+    gives logprobs), the prompt's native token count and, from OpenRouter's generation record, the version."""
+    body = {"model": model, "messages": [{"role": "user", "content": _Q_CHECK_PROMPT}], "max_tokens": 64,
+            "usage": {"include": True}, "provider": dict(privacy, order=[tag], allow_fallbacks=False)}
+    if logprobs:
+        body.update(logprobs=True, top_logprobs=2)
+    headers = {"Authorization": "Bearer " + rt["api_key"], "Content-Type": "application/json", "X-Title": "hermetic quality check"}
+
+    def _post(url, data=None):
+        req = _aai_urlreq.Request(url, data=_aai_json.dumps(data).encode() if data is not None else None, headers=headers)
+        with _aai_urlreq.urlopen(req, timeout=60) as r:
+            return _aai_json.loads(r.read().decode())
+    post = post or (lambda b: _post(rt["base_url"] + "/chat/completions", b))
+    lookup = lookup or (lambda gid: _post(rt["base_url"] + "/generation?id=" + _quote(gid, safe="")))
+    try:
+        data = post(body)
+    except Exception as exc:
+        err = _aai_http_error(exc) if hasattr(exc, "read") else exc
+        return {"error": str(err)[:200]}
+    ch = (data.get("choices") or [{}])[0]
+    answer = str((ch.get("message") or {}).get("content") or "").strip()
+    sure = None
+    for t in ((ch.get("logprobs") or {}).get("content") or []):
+        if str(t.get("token") or "").strip().lower() == "ok" and t.get("logprob") is not None:
+            sure = round(math.exp(float(t["logprob"])), 5)  # the last "ok" is the answer, after any thinking
+    usage = data.get("usage") or {}
+    out = {"answer": answer[:40], "sure": sure, "prompt_tokens": usage.get("prompt_tokens"),
+           "cost": float(usage.get("cost") or 0), "served": data.get("provider"), "version": None}
+    gid = data.get("id")
+    for _ in range(6 if gid else 0):
+        time.sleep(4)
+        try:
+            g = (lookup(gid) or {}).get("data") or {}
+        except Exception:
+            continue
+        resp = (g.get("provider_responses") or [{}])[-1]
+        out["version"] = resp.get("model_permaslug") or g.get("model")
+        out["endpoint"] = resp.get("endpoint_id")
+        break
+    return out
+
+
+def _q_run_checks(profile, home):
+    s = _q_settings(home)
+    s["last"] = time.time()
+    _q_save_settings(home, s)
+    try:
+        cfg = _aai_load_cfg()
+        rt = _aai_runtime(cfg)
+    except Exception:
+        return  # a Nous profile, or no OpenRouter key: nothing to check with
+    privacy = {k: v for k, v in _routing_object(cfg).items() if k in ("data_collection", "zdr")}
+    for model, prov, tag, logprobs in _q_targets(home):
+        res = _q_check_one(rt, privacy, model, tag, logprobs)
+        _aai_append(_q_dir(home) / "checks.jsonl", dict(res, ts=time.time(), day=_q_day(time.time()), model=model, provider=prov, tag=tag))

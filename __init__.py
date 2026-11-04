@@ -171,6 +171,9 @@ def _on_post_api_request(**kw) -> None:
         if rid:
             with _MW_LOCK:
                 row["mw"] = 1 if _MW_SEEN.pop(rid, None) else 0
+                gen = (_EXEC.get(rid) or {}).get("gen")
+            if gen:
+                row["gen"] = gen  # OpenRouter's generation id: Costs looks up the exact model version from it
         _note_reply(kw, row, rid)
         path = _routing_path()
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -508,6 +511,27 @@ def _extra_for_model(model):
     return clean_extra(merged)
 
 
+def _live_ignore(model, request):
+    """provider_routing.ignore as config.yaml has it now, added to what the request already skips. Hermes
+    reads the flat list only when it builds a chat's agent, so a provider skipped mid-chat would keep
+    serving open chats. A model's own ignore list wins, as in Hermes. None when nothing is to add."""
+    from hermes_cli.config import load_config_readonly
+    pr = (load_config_readonly() or {}).get("provider_routing")
+    if not isinstance(pr, dict) or not isinstance(pr.get("ignore"), list):
+        return None
+    try:
+        from hermes_constants import resolve_per_model_provider_routing
+        if "ignore" in (resolve_per_model_provider_routing(model or "", pr.get("models")) or {}):
+            return None
+    except Exception:
+        pass
+    want = [str(x).strip() for x in pr["ignore"] if str(x).strip()]
+    have = (((request or {}).get("extra_body") or {}).get("provider") or {}).get("ignore") if isinstance(request, dict) else None
+    have = [str(x) for x in have] if isinstance(have, list) else []
+    add = [x for x in want if x not in have]
+    return have + add if add else None
+
+
 def merge_into_request(request, extra):
     """Return a copy of ``request`` with ``extra`` set on ``extra_body.provider``, or None if unchanged."""
     if not extra or not isinstance(request, dict):
@@ -614,6 +638,9 @@ def _on_llm_request(**kw):
         request = kw.get("request")
         model = kw.get("model") or (request.get("model") if isinstance(request, dict) else "")
         extra = _extra_for_model(model)
+        ignore = _live_ignore(model, request)
+        if ignore:
+            extra["ignore"] = ignore
         new = merge_into_request(request, extra)
         if new is None:
             return None

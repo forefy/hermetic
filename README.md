@@ -50,6 +50,7 @@ Deep and analytical cost tracking especially when using multi-provider routing (
 - Pricing drift: what you were billed compared with list prices, on OpenRouter and, call by call, on Nous Portal.
 - OpenRouter spend limits and workspace budgets, and Nous Portal spend caps, with warnings when close to hit limits
 - **Providers** (OpenRouter): which providers actually served your calls, where they are based, and your routing rules, with an extra verbose policy editor for them.
+- **Quality by provider** (OpenRouter): whether one provider's copy of a model answers worse than the others, judged by the replies you pushed back on. A box per day gives the quick look, with each provider's declared precision and when it changes, and one click skips a provider for that model. An optional daily check catches a model changed behind the same name.
 - **Improvement suggestions**: one-click config fixes, for example routing to the cheapest provider, running background tasks on a cheaper model, turning fallback on when calls fail on rate limits, or turning on Hermes' proactive prune of old tool output when, at the prices your chats were actually served, the re-sends it saves outweigh the full-price re-send each prune causes. Every fix shows the exact `config.yaml` change before it writes anything, and writes on top of the config as it is at that moment.
 
 <p align="center">
@@ -105,6 +106,8 @@ When using a model provider (e.g. openrouter which this plugin supports best) he
 - max price
 - minimum throughput and maximum latency
 
+It also adds your `ignore` list as `config.yaml` has it now, to what Hermes already skips. Hermes reads that list only when a chat starts, so a provider you skip, from Costs or the rules editor, stops serving open chats at their next call.
+
 On Nous Portal it adds only your data collection and zero data retention rules, the two provider fields the Portal accepts, and the Portal refuses a model with no endpoint that meets them.
 
 The `llm_execution` middleware only reads the generation id and finish reason off the result, or on Nous Portal the cost it billed.
@@ -119,14 +122,15 @@ A `pre_tool_call` hook checks each tool call against HDR's rules (`hdr_rules.py`
 
 ### Plugin-initiated model calls
 
-On AAI, only when you press replay, compare, draft or judge, or when you turn on automatic tests.
+On AAI, only when you press replay, compare, draft or judge, or when you turn on automatic tests. On Costs, only when you turn on the daily check.
 - Fix drafts, the judge and rubric drafts use Hermes' plugin model access (`ctx.llm`) on your main model. To let the judge use a different model, allow it in `config.yaml` under `plugins.entries.hermetic.llm` (`allow_model_override: true` and `allowed_models`).
 - Replays go to OpenRouter with the `OPENROUTER_API_KEY` Hermes holds for the profile, read through Hermes' secret scope and following your routing rules. On a Nous Portal profile they need OpenRouter for now, until Hermes lets plugins use the Nous sign-in. They appear in your spend like any other call. A replay costs about $0.01 per test; automatic tests stop at $0.50 a day.
+- The daily check sends one tiny fixed prompt ("Reply with exactly one word: ok") once a day to each provider that served your models this week, pinned to it through OpenRouter with the same key and your privacy rules, about $0.01 a month. It records the answer, how sure the model was and the prompt's token count.
 - No API key ever reaches the popover - we're proud of this achievement as hermetic itself is a security-awareness tool, so we always try to act like one.
 
 ### Plugin-initiated network calls
 
-Network calls are only done to supported providers (e.g. OpenRouter) to get latest price information, usage limits etc. no API keys sent through those calls, and only few requests a day are sent for different model informatics. The one exception is OpenRouter's workspace and guardrail budgets, which Hermes does not report, so hermetic reads them with the profile's OpenRouter key, sent only to openrouter.ai.
+Network calls are only done to supported providers (e.g. OpenRouter) to get latest price information, usage limits etc. no API keys sent through those calls, and only few requests a day are sent for different model informatics. The one exception is OpenRouter's workspace and guardrail budgets, which Hermes does not report, so hermetic reads them with the profile's OpenRouter key, sent only to openrouter.ai. Once a day it also reads OpenRouter's public endpoint list (no key) for the models you use, to show each provider's declared precision and when it changes, and, with the same key, the generation record of one of your recent calls per provider, for the exact model version behind it. These lookups cost nothing.
 
 
 ### Disk reads
@@ -152,13 +156,14 @@ We gave hermetic just enough power to provide extended security, while limiting 
 - the guard's level and your guard rules
 - places you mark as expected (`hermetic/hdr/expected.json`)
 - test results.
-- Everything Hermetic records stays in `$HERMES_HOME/hermetic/` (ratings, tests, replay results, saved skill versions, routing history).
+- Everything Hermetic records stays in `$HERMES_HOME/hermetic/` (ratings, tests, replay results, saved skill versions, routing history with each call's OpenRouter generation id, endpoint list snapshots, model versions and daily check results).
 
 
 ### What can run in the background
 
 - A thread checks every 5 minutes for skill changes made by the background review, and acts only if you turned automatic tests on. A short-lived thread stores the billed-spend snapshot.
 - At most once a minute, a short-lived thread checks that background tasks given your routing rules still match the main provider.
+- When the daily check is on, opening Costs starts a short-lived thread for it if the last run is a day old.
 
 
 ### Plugin updates

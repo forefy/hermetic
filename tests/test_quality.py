@@ -163,6 +163,34 @@ def test_turning_the_check_on_runs_it_once_a_day():
 
 
 
+def test_another_profile_is_checked_with_its_own_key_and_privacy_rules():
+    other = HOME / "profiles" / "other"
+    other.mkdir(parents=True, exist_ok=True)
+    (other / "config.yaml").write_text("provider_routing:\n  data_collection: deny\n", encoding="utf-8")
+    seen = {}
+
+    def runtime(cfg=None, home=None):
+        seen["home"] = home
+        return {"api_key": "k", "base_url": "https://openrouter.ai/api/v1"}
+
+    def no_key(cfg=None, home=None):
+        seen["lookup_home"] = home
+        raise RuntimeError("no key")
+
+    saved = api._aai_runtime, api._q_targets, api._q_check_one
+    api._aai_runtime, api._q_targets = runtime, lambda home: [("x/m", "P", "p/fp8", False)]
+    api._q_check_one = lambda rt, privacy, *a: seen.update(privacy=privacy) or {"answer": "ok"}
+    try:
+        api._q_run_checks("other", other)
+        assert seen["privacy"] == {"data_collection": "deny"}, seen
+        assert seen["home"] == other, "the check spends that profile's key"
+        api._aai_runtime = no_key
+        api._q_lookup_versions(other, [dict(call(NOW, "s", "P"), gen="gen-1")], profile="other")
+        assert seen["lookup_home"] == other, "a generation is only readable with the key that made it"
+    finally:
+        api._aai_runtime, api._q_targets, api._q_check_one = saved
+
+
 def test_a_skipped_provider_leaves_open_chats_at_their_next_call():
     import types
     spec2 = importlib.util.spec_from_file_location("hermetic_init_q2", HERE.parent / "__init__.py")

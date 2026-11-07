@@ -4297,7 +4297,6 @@ function fisherGreater(a, n1, b, n2) {
   return Math.min(1, p)
 }
 
-// one model over the period's days: per provider its boxes, totals and whether it answers worse than the rest
 // a provider's usual thinking per call and output speed: its median over the days with 5 or more calls
 function qualityBase(dayMap) {
   const rows = Object.values(dayMap || {}).filter(r => num(r[0]) >= 5)
@@ -4538,7 +4537,7 @@ const QualitySection = ({ quality, period, defaultModel, yaml, profile, onApplie
   el('label', { style: { display: 'flex', gap: 8, alignItems: 'center', marginTop: 12, fontSize: 11.5, color: C.text, cursor: 'pointer' } },
     el('input', { type: 'checkbox', checked: !!(quality.check && quality.check.enabled), onChange: e => setCheck(e.target.checked) }),
     'Check each provider daily with a fixed prompt',
-    el(InfoDot, { tip: 'Once a day a tiny fixed prompt goes to each provider your models used this week, about $0.01 a month. It catches a provider changing the model behind the same name.' })))
+    el(InfoDot, { tip: 'Once a day a tiny fixed prompt goes to each provider your models used this week, a few cents a month. It catches a provider changing the model behind the same name.' })))
 }
 
 const RoutingSection = ({ policyOn = true, providerName, rows, since, recording, reachable, endpoints, prices, days, yaml, aux, health, profile, profileLabel, onApplied }) => {

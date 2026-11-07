@@ -1365,14 +1365,17 @@ def _aai_tool_defs():
 
 class _aai_secret_scope:
     """Binds this profile's secret scope, so Hermes credential reads work in multi-profile mode
-    (where unscoped reads fail closed)."""
+    (where unscoped reads fail closed). ``home`` picks another profile's secrets."""
+
+    def __init__(self, home=None):
+        self.home = home
 
     def __enter__(self):
         self.tok = None
         try:
             from hermes_constants import get_hermes_home
             from agent.secret_scope import build_profile_secret_scope, set_secret_scope
-            home = Path(get_hermes_home())
+            home = Path(self.home or get_hermes_home())
             self.tok = set_secret_scope(build_profile_secret_scope(home), profile_home=str(home))
         except Exception:
             self.tok = None
@@ -1394,7 +1397,7 @@ def _aai_main_provider(cfg):
     return "nous" if prov == "nous" or "nousresearch.com" in base else "openrouter"
 
 
-def _aai_runtime(cfg=None):
+def _aai_runtime(cfg=None, home=None):
     """Connection for replays: OpenRouter with the profile's key, read through Hermes' secret scope. A
     replay has to resend the agent's own tool definitions (and pin providers through OpenRouter's routing),
     which Hermes' plugin LLM lane does not offer. A Nous Portal sign-in may only be used through Hermes'
@@ -1407,7 +1410,7 @@ def _aai_runtime(cfg=None):
             cfg = {}
     if _aai_main_provider(cfg) == "nous":
         raise RuntimeError("Replays need OpenRouter for now, since Hermes can't send them to Nous Portal for plugins yet")
-    with _aai_secret_scope():
+    with _aai_secret_scope(home):
         from agent.secret_scope import get_secret
         key = get_secret("OPENROUTER_API_KEY")
     if not key:
@@ -3338,6 +3341,11 @@ def _q_day(ts):
     return time.strftime("%Y-%m-%d", time.localtime(float(ts)))
 
 
+def _q_cfg(profile, home):
+    """The config of the profile being looked at, since _aai_load_cfg reads this process' own."""
+    return _aai_load_cfg() if not profile or profile in ("default", "current") else _hdr_yaml(home / "config.yaml")
+
+
 def _q_calls(home, since):
     """OpenRouter calls since ``since``, oldest first."""
     path = _data_dir(home) / "routing.jsonl"
@@ -3456,7 +3464,7 @@ def _q_check_events(checks):
 _Q_GEN_TRIED = {}  # generation id -> when its record was last missing, so it is retried after 10 minutes
 
 
-def _q_lookup_versions(home, calls, lookup=None, limit=20):
+def _q_lookup_versions(home, calls, lookup=None, limit=20, profile=None):
     """The exact model version behind each provider, per day of the last week, from the generation record
     of that day's newest call (its id is saved with each call). OpenRouter's lookup costs nothing."""
     path = _q_dir(home) / "versions.jsonl"
@@ -3474,7 +3482,7 @@ def _q_lookup_versions(home, calls, lookup=None, limit=20):
         return 0
     if lookup is None:
         try:
-            rt = _aai_runtime(_aai_load_cfg())
+            rt = _aai_runtime(_q_cfg(profile, home), home)
         except Exception:
             return 0  # a Nous profile, or no OpenRouter key
 
@@ -3547,7 +3555,7 @@ async def quality(profile: Optional[str] = None):
         except Exception:
             endpoints, events = {}, []
         try:
-            _q_lookup_versions(home, calls)
+            _q_lookup_versions(home, calls, profile=profile)
         except Exception:
             pass
         versions = _aai_read(_q_dir(home) / "versions.jsonl")
@@ -3678,8 +3686,8 @@ def _q_run_checks(profile, home):
     s["last"] = time.time()
     _q_save_settings(home, s)
     try:
-        cfg = _aai_load_cfg()
-        rt = _aai_runtime(cfg)
+        cfg = _q_cfg(profile, home)
+        rt = _aai_runtime(cfg, home)
     except Exception:
         return  # a Nous profile, or no OpenRouter key: nothing to check with
     privacy = {k: v for k, v in _routing_object(cfg).items() if k in ("data_collection", "zdr")}

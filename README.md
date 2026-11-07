@@ -125,7 +125,7 @@ A `pre_tool_call` hook checks each tool call against HDR's rules (`hdr_rules.py`
 On AAI, only when you press replay, compare, draft or judge, or when you turn on automatic tests. On Costs, only when you turn on the daily check.
 - Fix drafts, the judge and rubric drafts use Hermes' plugin model access (`ctx.llm`) on your main model. To let the judge use a different model, allow it in `config.yaml` under `plugins.entries.hermetic.llm` (`allow_model_override: true` and `allowed_models`).
 - Replays go to OpenRouter with the `OPENROUTER_API_KEY` Hermes holds for the profile, read through Hermes' secret scope and following your routing rules. On a Nous Portal profile they need OpenRouter for now, until Hermes lets plugins use the Nous sign-in. They appear in your spend like any other call. A replay costs about $0.01 per test; automatic tests stop at $0.50 a day.
-- The daily check sends one tiny fixed prompt ("Reply with exactly one word: ok") once a day to each provider that served your models this week, pinned to it through OpenRouter with the same key and your privacy rules, about $0.01 a month. It records the answer, how sure the model was and the prompt's token count.
+- The daily check sends one tiny fixed prompt ("Reply with exactly one word: ok") once a day to each provider that served your models this week, pinned to it through OpenRouter with the same key and your privacy rules, a few cents a month. It records the answer, how sure the model was and the prompt's token count.
 - No API key ever reaches the popover - we're proud of this achievement as hermetic itself is a security-awareness tool, so we always try to act like one.
 
 ### Plugin-initiated network calls

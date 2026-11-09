@@ -2361,18 +2361,70 @@ const aSummary = summary =>
       aTd(s.errors, s.errors ? C.bad : C.dim),
       aTd('$' + s.cost.toFixed(3)))))
 
-// Open the chat that holds a reply in a new tab (the supported host call; Hermes has no
-// jump-to-message API, so the person scrolls to it).
-async function aaiOpenAt(profile, sessionId) {
+// Opening a chat moves focus to it, which would close the popover: it stays until a rating is saved
+// or the person closes it.
+const popPin = { on: false }
+
+// The scroll area of the chat that shows a session: its own tab, or the main chat when that has focus.
+const aaiChatView = sessionId => {
+  const tab = document.querySelector('[data-session-anchor="session-tile:' + CSS.escape(sessionId) + '"]')
+  const surface = tab || (host.state.focusedStoredSessionId.get() === sessionId ? document.querySelector('[data-session-anchor="workspace"]') : null)
+  return surface ? surface.querySelector('[data-slot="aui_thread-viewport"]') : null
+}
+
+// Scroll an open chat to one of your prompts, given its stored id. Hermes has no jump call for
+// plugins, so this sends the chat the request its own timeline sends, which also loads the page
+// around an old prompt. When any part of that is missing the chat stays where it opened.
+// A newer jump ends the one before it, so two never pull the same chat.
+let aaiJump = null
+async function aaiShowPrompt(sessionId, row) {
+  if (aaiJump) aaiJump.abort()
+  const stop = aaiJump = new AbortController()
+  let view = null, taken = false, finish
+  const shown = new Promise(done => { finish = done })
+  // the chat reads the signal as it takes the request, which tells a chat that listens from one still mounting
+  const detail = { id: 'history:' + row, rowId: row, complete: finish, get signal() { taken = true; return stop.signal } }
+  for (let i = 0; i < 40 && !taken && !stop.signal.aborted; i++) {
+    view = aaiChatView(sessionId)
+    if (view) view.dispatchEvent(new CustomEvent('hermes:timeline-reveal', { detail }))
+    if (!taken) await new Promise(next => setTimeout(next, 100))
+  }
+  if (!taken) return
+  const timer = setTimeout(() => { stop.abort(); finish(false) }, 15000)
+  const id = await shown
+  clearTimeout(timer)
+  const prompt = id && view.querySelector('[data-message-id="' + CSS.escape(id) + '"]')
+  if (!prompt) return
+  const turn = prompt.closest('[data-slot="aui_turn-pair"]') || prompt
+  // Turns the chat has not drawn yet stand in at a guessed height and move the prompt as they draw, so
+  // it is put back at the top until it holds still. The person moving the chat ends that at once.
+  for (const name of ['wheel', 'touchstart', 'pointerdown', 'keydown']) view.addEventListener(name, () => stop.abort(), { signal: stop.signal, passive: true })
+  let still = performance.now()
+  const end = still + 3000
+  while (!stop.signal.aborted && turn.isConnected && performance.now() < end && performance.now() - still < 300) {
+    const was = view.scrollTop
+    const off = turn.getBoundingClientRect().top - view.getBoundingClientRect().top - 8
+    if (Math.abs(off) > 1) view.scrollTop = was + off
+    if (view.scrollTop !== was) still = performance.now()
+    await new Promise(next => requestAnimationFrame(next))
+  }
+  stop.abort()
+}
+
+// Open the chat that holds a reply in a new tab, at the prompt the reply answered when that is known.
+async function aaiOpenAt(profile, sessionId, userId) {
+  popPin.on = true
   try {
-    await host.openSession(sessionId, { profile: profile && profile !== 'default' ? profile : undefined, awaitHydration: true, intent: 'tab' })
-    return true
+    await host.openSession(sessionId, { profile: profile && profile !== 'default' ? profile : undefined, awaitHydration: true, expectHistory: true, intent: 'tab' })
   } catch {
+    popPin.on = false
     return false
   }
+  if (Number.isSafeInteger(userId) && userId > 0) await aaiShowPrompt(sessionId, userId).catch(() => {})
+  return true
 }
-const AaiOpenLink = ({ profile, sessionId, userTs, label }) =>
-  sessionId ? el(ALink, { onClick: () => aaiOpenAt(profile, sessionId) }, label || 'open in chat') : null
+const AaiOpenLink = ({ profile, sessionId, userId, label }) =>
+  sessionId ? el(ALink, { onClick: () => aaiOpenAt(profile, sessionId, userId) }, label || 'open in chat') : null
 
 // One case opened: its reproduction record and drafted variations
 const AaiCaseRecord = ({ profile, id, onChanged }) => {
@@ -2399,7 +2451,7 @@ const AaiCaseRecord = ({ profile, id, onChanged }) => {
   return el(
     'div',
     { style: { background: 'var(--ui-bg-tertiary)', borderRadius: 6, padding: '7px 9px', margin: '4px 0 6px' } },
-    el('div', { style: { marginBottom: 4 } }, el(AaiOpenLink, { profile, sessionId: rec.session_id, userTs: rec.user_ts, label: 'open the chat' })),
+    el('div', { style: { marginBottom: 4 } }, el(AaiOpenLink, { profile, sessionId: rec.session_id, userId: rec.user_id, label: 'open the chat' })),
     line('replays', rec.case && rec.case.mode === 'reply' ? 'the reply you corrected, with the same tool results' : 'the first step after the request'),
     line('request', rec.request),
     line('reply', rec.reply),
@@ -2651,7 +2703,7 @@ const RateItem = ({ profile, item, onDone }) => {
   return el('div', { style: { paddingTop: 8 } },
     el('div', { style: { display: 'flex', alignItems: 'center', gap: 8 } },
       el('span', { style: { flex: 1, minWidth: 0, fontSize: 12, color: C.text, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, item.title),
-      el(AaiOpenLink, { profile, sessionId: item.session_id, userTs: item.user_ts })),
+      el(AaiOpenLink, { profile, sessionId: item.session_id, userId: item.user_id })),
     el('div', { style: { fontSize: 11, color: C.sub, marginTop: 3, lineHeight: 1.45, display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden' } }, item.preview),
     item.followup ? el('div', { style: { fontSize: 11, color: item.frustrated ? C.warn : C.dim, marginTop: 3, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, 'You said next: ' + item.followup) : null,
     el('div', { style: { display: 'flex', alignItems: 'center', gap: 8, marginTop: 6 } },
@@ -2672,7 +2724,7 @@ const RateTask = ({ profile, ratings, onChanged }) => {
   const [n, setN] = useState({ total: ratings.total || 0, low: ratings.low || 0 })
   useEffect(() => { aaiGet(profile, '/rate-queue?n=5').then(r => setQueue((r && r.items) || [])).catch(() => setQueue([])) }, [profile])
   if (queue == null) return el(TaskCard, { id: 'aai-t-rate', title: 'Rate replies' }, aSmall('Loading…'))
-  const done = s => { setN(x => ({ total: x.total + 1, low: x.low + (s <= 2 ? 1 : 0) })); setQueue(q => q.slice(1)); if (onChanged) onChanged() }
+  const done = s => { popPin.on = false; setN(x => ({ total: x.total + 1, low: x.low + (s <= 2 ? 1 : 0) })); setQueue(q => q.slice(1)); if (onChanged) onChanged() }
   const good = Math.min(100, ((n.total - n.low) / 20) * 100), low = Math.min(100, (n.low / 20) * 100)
   return el(TaskCard, { id: 'aai-t-rate', title: 'Rate replies', tip: 'Your stars teach the judge what good looks like. Replies you pushed back on come first, taking turns with ones you moved on from, so it learns from both. After 20 ratings, 5 of them low, it can be checked against you.', count: queue.length ? queue.length + ' left' : 'all rated', done: !queue.length },
     queue.slice(0, 1).map(it => el(RateItem, { key: it.message_id, profile, item: it, onDone: done })),
@@ -2701,7 +2753,7 @@ const InboxTask = ({ profile, items, onChanged }) => {
     left.slice(0, 4).map((it, i) =>
       el('div', { key: it.correction_id, style: { padding: '9px 0', borderTop: i ? '1px solid ' + C.stroke : 'none' } },
         el('div', { style: { fontSize: 12, color: C.text, lineHeight: 1.45 } }, '“' + it.text + '”'),
-        el('div', { style: { display: 'flex', gap: 10, alignItems: 'center', marginTop: 4, fontSize: 11, color: C.dim } }, it.skill || 'no skill loaded', el('span', null, ago(it.ts)), el(AaiOpenLink, { profile, sessionId: it.session_id, userTs: it.user_ts })),
+        el('div', { style: { display: 'flex', gap: 10, alignItems: 'center', marginTop: 4, fontSize: 11, color: C.dim } }, it.skill || 'no skill loaded', el('span', null, ago(it.ts)), el(AaiOpenLink, { profile, sessionId: it.session_id, userId: it.user_id })),
         Row(el(BigBtn, { onClick: () => act(it, true), disabled: busy === it.correction_id }, 'Keep as test'), el(BigBtn, { ghost: true, onClick: () => act(it, false), disabled: busy === it.correction_id }, 'Dismiss')))))
 }
 
@@ -5405,11 +5457,12 @@ const Chip = () => {
   const ctxPct = ctxSrc && typeof ctxSrc.context_percent === 'number' && ctxSrc.context_percent > 0 ? ctxSrc.context_percent : null
   const [open, setOpen] = useState(false)
   const asksWaiting = useRef(0) // a guard question stays on screen until it is answered or runs out
+  useEffect(() => { popPin.on = false }, [open])
   // Radix closes the popover on clicks inside the app's page. Clicks into an embedded view (the
   // browser pane) or another app never reach that page, so also close when focus leaves for one.
   useEffect(() => {
     if (!open) return
-    const close = () => { if (!asksWaiting.current) setOpen(false) }
+    const close = () => { if (!asksWaiting.current && !popPin.on) setOpen(false) }
     const onFocusIn = e => { if (e.target && /^(IFRAME|WEBVIEW)$/.test(e.target.tagName)) close() }
     window.addEventListener('blur', close)
     document.addEventListener('focusin', onFocusIn)
@@ -5508,7 +5561,7 @@ const Chip = () => {
     ),
     el(
       PopoverContent,
-      { align: 'end', sideOffset: 8, variant: 'menu', className: 'w-auto p-0 overflow-hidden' },
+      { align: 'end', sideOffset: 8, variant: 'menu', className: 'w-auto p-0 overflow-hidden', onInteractOutside: e => { if (popPin.on) e.preventDefault() } },
       asks.length
         ? el(AskCard, { key: asks[0].id, ask: asks[0], more: asks.length - 1, onAnswered: id => { asksWaiting.current = Math.max(0, asks.length - 1); setAsks(x => x.filter(a => a.id !== id)); if (asks.length <= 1) setOpen(false) } })
         : data

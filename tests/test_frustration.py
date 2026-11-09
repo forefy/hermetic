@@ -45,6 +45,9 @@ class FakeDb:
     def list_sessions_rich(self, **kw):
         return [ROW]
 
+    def get_session(self, session_id):
+        return dict(ROW, model="some/model")
+
     def close(self):
         pass
 
@@ -78,6 +81,7 @@ def test_corrections_include_compacted_ones():
     items = asyncio.run(api.aai_corrections(days=14, profile=None))["items"]
     assert [(x["message_id"], x["correction_id"]) for x in items] == [("2", "3")]
     assert items[0]["text"] == "wtf the chart is still broken??", "what Hermes added in front is left out"
+    assert items[0]["user_id"] == 1, "the chat opens at the prompt the reply answered"
 
 
 def test_rate_queue_puts_pushback_first_then_takes_turns():
@@ -88,10 +92,21 @@ def test_rate_queue_puts_pushback_first_then_takes_turns():
     assert items[0]["frustrated"] and items[0]["followup"] == "wtf the chart is still broken??"
     assert not items[1]["frustrated"] and items[1]["followup"] == "great, now add a legend"
     assert items[2]["followup"] is None, "scheduled job output and Hermes' own notes are not your answer"
+    assert [x["user_id"] for x in items] == [1, 3, 5], "each reply carries your prompt, never a note Hermes sent in your place"
     api._data_dir(home).mkdir(parents=True, exist_ok=True)
     (api._data_dir(home) / "ratings.jsonl").write_text(json.dumps({"message_id": "2", "score": 1}) + "\n")
     items = asyncio.run(api.aai_rate_queue(n=5, profile=None))["items"]
     assert [x["message_id"] for x in items] == ["4", "8"], "a rated reply leaves the queue"
+
+
+def test_case_record_opens_at_your_prompt():
+    home = _tmp()
+    use_fake(home)
+    api._aai_load_cfg = lambda: {}
+    api._data_dir(home).mkdir(parents=True, exist_ok=True)
+    (api._data_dir(home) / "cases.jsonl").write_text(json.dumps({"id": "c1", "message_id": "8", "session_id": "s1", "ts": NOW}) + "\n")
+    rec = asyncio.run(api.aai_case_detail(id="c1", profile=None))
+    assert rec["ok"] and rec["user_id"] == 5, "your last prompt before the reply, not the scheduled job's output"
 
 
 if __name__ == "__main__":

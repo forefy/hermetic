@@ -1147,7 +1147,7 @@ async def aai_rate_queue(n: int = Query(5, ge=1, le=20), profile: Optional[str] 
         calm = [x for x in fresh if not x["frustrated"] and x["next"]]
         order = [x for pair in zip_longest(hot, calm) for x in pair if x] + [x for x in fresh if not x["next"]]
         return {"items": [{"message_id": str(x["mid"]), "session_id": x["row"]["id"], "title": x["row"].get("title") or "untitled",
-                           "ts": x["ts"], "preview": x["text"][:160], "user_ts": x["user_ts"], "frustrated": x["frustrated"],
+                           "ts": x["ts"], "preview": x["text"][:160], "user_id": x["user_id"], "frustrated": x["frustrated"],
                            "followup": _aai_said(x["next"][2])[:160] if x["next"] else None} for x in order[:n]]}
 
     return await asyncio.to_thread(_run)
@@ -2324,22 +2324,23 @@ def _aai_frustrated(text):
 
 
 def _aai_replies(db, store, rows, since):
-    """Each turn's final reply after ``since``, with your next message (id, ts, text) or None and whether it
-    showed you were unhappy. Read from the conversation as shown, so compacted turns count too."""
+    """Each turn's final reply after ``since``, with the id of the prompt it answered (where the chat opens
+    to), your next message (id, ts, text) or None and whether it showed you were unhappy. Read from the
+    conversation as shown, so compacted turns count too."""
     out = []
     for r in rows:
-        pending, skills, user_ts = None, [], None
+        pending, skills, user_id = None, [], None
         for mid, role, ts, text, loaded in _per_session(db, store, r, "shown_turns", _session_turns, shown=True):
             if role == "user":
                 if _AAI_HERMES_NOTE.match(text):
                     continue
                 if pending:
                     out.append(dict(pending, next=(mid, ts, text), frustrated=_aai_frustrated(text)))
-                pending, skills, user_ts = None, [], ts
+                pending, skills, user_id = None, [], mid
             else:
                 skills += [x for x in loaded if x not in skills]
                 if text and ts > since:
-                    pending = {"mid": mid, "row": r, "ts": ts, "text": text, "user_ts": user_ts, "skills": list(skills)}
+                    pending = {"mid": mid, "row": r, "ts": ts, "text": text, "user_id": user_id, "skills": list(skills)}
         if pending:
             out.append(dict(pending, next=None, frustrated=False))
     return out
@@ -2357,7 +2358,7 @@ async def aai_corrections(days: int = Query(14, ge=1, le=90), profile: Optional[
             db.close()
         out = [{"message_id": str(x["mid"]), "correction_id": str(x["next"][0]), "text": _aai_said(x["next"][2])[:240], "ts": x["next"][1],
                 "title": x["row"].get("title") or "untitled", "skill": x["skills"][0] if x["skills"] else None,
-                "session_id": x["row"]["id"], "user_ts": x["user_ts"]} for x in replies if x["frustrated"]]
+                "session_id": x["row"]["id"], "user_id": x["user_id"]} for x in replies if x["frustrated"]]
         _n, home = _profile_home(profile)
         gone = {r.get("correction_id") for r in _aai_read(_data_dir(home) / "dismissed.jsonl")}
         kept = {c.get("message_id") for c in _aai_cases(home)}
@@ -2524,12 +2525,12 @@ async def aai_case_detail(id: str = Query(...), profile: Optional[str] = None):
         runs = [r for r in _aai_read(_data_dir(home) / "runs.jsonl") if r.get("case_id") == id][-6:]
         db = _open_sessions_db(profile)
         try:
-            users = [m.get("timestamp") for m in _db_messages(db, turn["session_id"], shown=True) if m.get("role") == "user" and int(m.get("id") or 0) < int(case["message_id"])]
-            u = [users[-1]] if users else None
+            prompts = [mid for mid, role, _ts, text, _skills in _session_turns(_db_messages(db, turn["session_id"], shown=True))
+                       if role == "user" and int(mid or 0) < int(case["message_id"]) and not _AAI_HERMES_NOTE.match(text)]
         finally:
             db.close()
         return {"ok": True, "case": case, "model": turn["model"], "session": turn["title"], "skills": turn["skills"],
-                "session_id": turn["session_id"], "user_ts": u[0] if u else None,
+                "session_id": turn["session_id"], "user_id": prompts[-1] if prompts else None,
                 "request": (case.get("user_override") or turn["user"])[:600], "reply": turn["reply"][:600],
                 "messages": len(turn["messages"]), "routing": routing if routing is not None else _routing_object(_aai_load_cfg()), "runs": runs}
     try:

@@ -72,7 +72,9 @@ Evals, model-as-a-judge, and the missing layer for hermes auto-improve (randomly
 - **Cleanup**: archive skills that were never used, saving tokens on every call
 
 <p align="center">
-  <img src="docs/hermetic-aai-settings.png" alt="Changed skills and settings for automatic tests and the judge" width="400">
+  <img src="docs/hermetic-aai-fix.png" alt="A tried skill fix: each test and its rewordings on the current skill and on the fix" width="400">
+  &nbsp;
+  <img src="docs/hermetic-aai-settings.png" alt="Changed skills and settings for automatic tests, fixes and the judge" width="400">
 </p>
 
 ## HDR (harness detection and response)

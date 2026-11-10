@@ -55,11 +55,13 @@ def test_a_skill_name_cannot_walk_out():
         pass
 
 
-def test_ship_refuses_a_crafted_candidate():
+def test_ship_applies_only_a_fix_that_was_tried():
     import asyncio
+    ship = lambda body: asyncio.run(api.aai_ship(body))
+    assert ship({"skill": "notes", "candidate": "cand-0123456789"})["ok"] is False, "a candidate named in the request is not applied"
     walk = os.path.relpath(SECRET.parent, CAND.parent.parent)
-    r = asyncio.run(api.aai_ship({"skill": walk, "candidate": "cand-00000000aa"}))
-    assert r["ok"] is False
+    api._aai_append(api._data_dir(HOME) / "proposals.jsonl", {"id": "pcrafted", "skill": walk, "candidate": "cand-00000000aa", "base": "x"})
+    assert ship({"proposal": "pcrafted"})["ok"] is False, "a kept fix with a crafted skill name is refused"
     assert SKILL.read_text().endswith("Take notes.\n"), "the skill was left alone"
 
 

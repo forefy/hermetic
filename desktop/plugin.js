@@ -2310,7 +2310,7 @@ const ago = ts => {
 // ---- AAI phases 2 and 3: shared helpers ----
 // Model calls (replay, drafts, judge) can take minutes; the desktop bridge gives up after 30 s and
 // allows only a few requests at once. So they run as backend jobs and this polls until done.
-const AAI_LONG = ['/replay', '/draft', '/judge', '/variants']
+const AAI_LONG = ['/replay', '/propose', '/judge', '/variants']
 const aaiPost = async (profile, path, body) => {
   const req = b => api(profileReq(profile, { path: '/api/plugins/hermetic/aai' + path, method: 'POST', body: b }))
   const long = AAI_LONG.includes(path) || (path === '/rubric' && body && body.draft)
@@ -2490,7 +2490,7 @@ const AaiGate = ({ profile }) => {
   }
   useEffect(() => { load() }, [profile])
   if (!g || !settings) return aSmall('Loading…')
-  const setMode = async v => { setSettings(await aaiPost(profile, '/settings', { gate_mode: v })) }
+  const setMode = async v => { const r = await aaiPost(profile, '/settings', { gate_mode: v }); if (r) setSettings(s => Object.assign({}, s, r)) }
   const revert = async d => { await aaiPost(profile, '/revert', { skill: d.skill, sha: d.before_sha }); load() }
   const decisions = (g.decisions || []).slice().reverse()
   return el(
@@ -2509,69 +2509,6 @@ const AaiGate = ({ profile }) => {
             aTd(d.after != null ? d.after + '/' + d.cases : '–', d.verdict === 'worse' ? C.bad : undefined),
             aTd(d.action === 'asked' ? el(ALink, { onClick: () => revert(d) }, 'revert') : d.action === 'reverted' ? 'reverted' : d.verdict, d.verdict === 'worse' ? C.bad : C.dim))))
       : el('div', { style: { marginTop: 6 } }, aSmall(settings.gate_mode === 'off' ? 'Off. Turn it on to test changes from now on.' : 'No changes tested yet.'))
-  )
-}
-
-// Fix a skill: draft a candidate with Hermes, test it against the current version, ship or drop
-const AaiFix = ({ profile, skill, onDone, onStep }) => {
-  const [step, setStep] = useState('start')
-  useEffect(() => { if (onStep) onStep(step) }, [step])
-  const [draft, setDraft] = useState(null)
-  const [test, setTest] = useState(null)
-  const [error, setError] = useState(null)
-  const go = async (name, fn) => {
-    setError(null)
-    setStep(name + '…')
-    try {
-      await fn()
-    } catch (e) {
-      setError((e && e.message) || 'failed')
-      setStep('start')
-    }
-  }
-  const doDraft = () => go('draft', async () => {
-    const r = await aaiPost(profile, '/draft', { skill })
-    if (!r.ok) throw new Error(r.error)
-    setDraft(r)
-    setStep('drafted')
-  })
-  const doTest = () => go('test', async () => {
-    const r = await aaiPost(profile, '/replay', { skill, variants: [{ label: 'current', skill_name: skill, version: 'current' }, { label: 'candidate', skill_name: skill, version: draft.candidate }] })
-    if (!r.ok) throw new Error(r.error)
-    setTest(r)
-    setStep('tested')
-  })
-  const doShip = () => go('ship', async () => {
-    const r = await aaiPost(profile, '/ship', { skill, candidate: draft.candidate })
-    if (!r.ok) throw new Error(r.error)
-    setStep('shipped')
-    if (onDone) onDone()
-  })
-  const s = test ? Object.fromEntries(test.summary.map(x => [x.label, x])) : null
-  const better = s && s.candidate.passed >= s.current.passed
-  return el(
-    'div',
-    { style: { width: '100%' } },
-    step === 'start' ? el('div', { style: { display: 'flex', gap: 10, alignItems: 'center' } }, el(ABtn, { onClick: doDraft }, 'Draft a fix'), aSmall('Hermes writes a candidate; nothing goes live')) : null,
-    step.endsWith('…') ? aSmall(step === 'draft…' ? 'Hermes is drafting…' : step === 'test…' ? 'Replaying the cases on both versions…' : 'Shipping…') : null,
-    draft && step !== 'start'
-      ? el('div', { style: { marginTop: 6 } },
-          draft.diff.length
-            ? el('pre', { style: { fontSize: 10, lineHeight: '15px', background: 'var(--ui-bg-secondary, rgba(0,0,0,.2))', borderRadius: 6, padding: '6px 8px', maxHeight: 160, overflow: 'auto', whiteSpace: 'pre-wrap', margin: 0 } },
-                draft.diff.map((l, i) => el('div', { key: i, style: { color: l.startsWith('+') ? C.ok : l.startsWith('-') ? C.bad : C.dim } }, l)))
-            : aSmall('No changes proposed. The cases may need clearer notes.'),
-          aSmall('Draft cost $' + Number(draft.cost || 0).toFixed(3) + ', by ' + draft.model))
-      : null,
-    step === 'drafted' && draft.diff.length ? el('div', { style: { display: 'flex', gap: 10, marginTop: 8 } }, el(ABtn, { primary: true, onClick: doTest }, 'Test it'), el(ALink, { onClick: () => { setDraft(null); setStep('start') } }, 'drop')) : null,
-    test && (step === 'tested' || step === 'shipped') ? aSummary(test.summary) : null,
-    step === 'tested'
-      ? el('div', { style: { display: 'flex', gap: 10, alignItems: 'center', marginTop: 8 } },
-          el(ABtn, { primary: better, onClick: doShip }, 'Ship candidate'),
-          el(ALink, { onClick: () => { setDraft(null); setTest(null); setStep('start') } }, 'keep current'),
-          aSmall(aNoise(s.candidate, s.current) && s.candidate.passed !== s.current.passed ? 'too few cases to tell' : better ? 'passes at least as many cases' : 'passes fewer cases than current'))
-      : null,
-    step === 'shipped' ? el('div', { style: { fontSize: 11, color: C.ok, marginTop: 6 } }, 'Live. The earlier version is saved and can be restored.') : null,
-    error ? el('div', { style: { fontSize: 10.5, color: C.bad, marginTop: 6 } }, error) : null
   )
 }
 
@@ -2634,7 +2571,13 @@ const AaiSettings = ({ profile, ratings }) => {
   const [res, setRes] = useState(null)
   useEffect(() => { aaiGet(profile, '/settings').then(setSt).catch(() => setSt({})) }, [profile])
   if (!st) return aSmall('Loading…')
+  // the answer to a save carries the stored values only, so it is laid over what is already shown
+  const set = async body => {
+    try { const r = await aaiPost(profile, '/settings', body); if (r) setSt(s => Object.assign({}, s, r)) } catch {}
+  }
   const on = st.judge_checks === 'on'
+  const auto = st.auto_propose === 'on'
+  const label = { display: 'flex', gap: 8, alignItems: 'center', fontSize: 11.5, color: C.text, cursor: 'pointer' }
   const ready = ratings.total >= 20 && ratings.low >= 5
   const check = async () => {
     setBusy(true)
@@ -2648,8 +2591,16 @@ const AaiSettings = ({ profile, ratings }) => {
   return el('div', null,
     el(AaiGate, { profile }),
     el('div', { style: { borderTop: '1px solid ' + C.stroke, marginTop: 12, paddingTop: 10 } },
-      el('label', { style: { display: 'flex', gap: 8, alignItems: 'center', fontSize: 11.5, color: C.text, cursor: 'pointer' } },
-        el('input', { type: 'checkbox', checked: on, onChange: async () => setSt(await aaiPost(profile, '/settings', { judge_checks: on ? 'off' : 'on' })) }),
+      el('div', { style: { display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap', fontSize: 11.5, color: C.text } },
+        'A replay reads',
+        el(SegmentedControl, { value: st.replay_window === 'full' ? 'full' : 'small', onChange: v => set({ replay_window: v }), options: [{ id: 'small', label: 'last turns' }, { id: 'full', label: 'whole chat' }] }),
+        el(InfoDot, { tip: 'The last turns keep a replay short and cheap. The whole chat sends everything again and can repeat old tool calls.' })),
+      el('label', { style: Object.assign({ marginTop: 10 }, label) },
+        el('input', { type: 'checkbox', checked: auto, onChange: () => set({ auto_propose: auto ? 'off' : 'on' }) }),
+        'Try fixes on its own', el(InfoDot, { tip: 'When a skill has 3 tests not passing, Hermes drafts a fix and tries it within the daily budget. It never applies one.' }))),
+    el('div', { style: { borderTop: '1px solid ' + C.stroke, marginTop: 12, paddingTop: 10 } },
+      el('label', { style: label },
+        el('input', { type: 'checkbox', checked: on, onChange: () => set({ judge_checks: on ? 'off' : 'on' }) }),
         'Grade replays with a judge model', el(InfoDot, { tip: 'A model reads each replayed reply and says pass or fail. The first time a skill is graded, its rubric is written from the skill itself. About $0.0001 per test.' })),
       st.judge_runs_on
         ? el('div', { style: { display: 'flex', gap: 6, alignItems: 'center', marginTop: 6, fontSize: 11, color: st.judge_same_family ? C.warn : C.dim } },
@@ -2676,85 +2627,278 @@ const BigBtn = ({ children, onClick, ghost, disabled }) =>
   el('button', { type: 'button', onClick, disabled, style: { border: ghost ? '1px solid ' + C.stroke : 'none', borderRadius: 8, padding: '7px 14px', font: 'inherit', fontSize: 12, cursor: disabled ? 'default' : 'pointer', background: ghost ? 'transparent' : V7.accent, color: ghost ? C.sub : '#fff', fontWeight: ghost ? 400 : 500, opacity: disabled ? 0.45 : 1, whiteSpace: 'nowrap' } }, children)
 const Row = (...kids) => el('div', { style: { display: 'flex', gap: 8, alignItems: 'center', marginTop: 10, flexWrap: 'wrap' } }, ...kids)
 const PickChip = ({ on, onClick, children }) =>
-  el('span', { onClick, style: { fontSize: 11, color: on ? C.text : C.sub, border: '1px solid ' + (on ? V7.accent : C.stroke), background: on ? 'rgba(107,132,230,.15)' : 'transparent', borderRadius: 14, padding: '4px 10px', cursor: 'pointer', userSelect: 'none' } }, children)
+  el('button', { type: 'button', 'aria-pressed': !!on, onClick, style: { font: 'inherit', fontSize: 11, color: on ? C.text : C.sub, border: '1px solid ' + (on ? V7.accent : C.faint), background: on ? 'rgba(107,132,230,.15)' : 'transparent', borderRadius: 14, padding: '4px 10px', cursor: 'pointer', userSelect: 'none' } }, children)
+const aaiCalm = () => !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches)
+// true when the text does not fit its box, so a tooltip or a "more" link is only offered when something is hidden
+const useCut = (text, open) => {
+  const ref = useRef(null)
+  const [cut, setCut] = useState(false)
+  useEffect(() => {
+    const n = ref.current
+    if (n && !open) setCut(n.scrollHeight > n.clientHeight + 1 || n.scrollWidth > n.clientWidth + 1)
+  }, [text, open])
+  return [ref, cut]
+}
+const Clamped = ({ text, lines = 1, style }) => {
+  const [ref, cut] = useCut(text)
+  const clamp = lines > 1 ? { display: '-webkit-box', WebkitLineClamp: lines, WebkitBoxOrient: 'vertical', overflow: 'hidden' } : { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }
+  const node = el('div', { ref, style: Object.assign({}, clamp, style) }, text)
+  return cut ? el(Tip, { label: text }, node) : node
+}
 const STAR_WORDS = ['', 'bad', 'poor', 'okay', 'good', 'great']
 const REASONS = ['wrong facts', 'missed the point', 'too long', 'wrong tool', 'unsafe']
 
-// one reply to rate: stars light up under the pointer; 3 or fewer asks why and can keep it as a test
-const RateItem = ({ profile, item, onDone }) => {
+// one reply to rate: what you asked, the reply and what you said next; 3 stars or less asks why and adds a test
+const RateItem = ({ profile, item, onSaved, onSkip }) => {
   const [hot, setHot] = useState(0)
   const [score, setScore] = useState(0)
   const [reasons, setReasons] = useState([])
   const [note, setNote] = useState('')
-  const [keep, setKeep] = useState(true)
+  const [test, setTest] = useState(true)
   const [busy, setBusy] = useState(false)
-  const submit = async n => {
+  const [error, setError] = useState('')
+  const [more, setMore] = useState(false)
+  const since = useRef(Date.now())
+  const lock = useRef(false)
+  const formRef = useRef(null)
+  const starsRef = useRef(null)
+  const lastLow = useRef(0)
+  const wasLow = useRef(false)
+  const [prevRef, prevCut] = useCut(item.preview, more)
+  const low = score > 0 && score <= 3
+  if (low) lastLow.current = score
+  const pushback = item.frustrated && item.followup ? item.followup : ''
+  const canTest = reasons.length > 0 || !!note.trim() || !!pushback
+  const calm = aaiCalm()
+  const reset = () => { setHot(0); setScore(0); setReasons([]); setNote(''); setTest(true); setError(''); setMore(false) }
+  useEffect(() => { reset(); since.current = Date.now() }, [item.message_id])
+  useEffect(() => {
+    const form = formRef.current
+    if (!form) return
+    form.inert = !low
+    if (!low && !wasLow.current) return
+    wasLow.current = low
+    // once the form has opened or closed, the whole card comes into view when it fits, and otherwise the form with Done does
+    const wrap = form.parentElement
+    const show = () => {
+      const card = form.closest('[id]') || form
+      let box = card.parentElement
+      while (box && !/auto|scroll/.test(getComputedStyle(box).overflowY)) box = box.parentElement
+      const node = low && box && card.offsetHeight > box.clientHeight ? form : card
+      node.scrollIntoView({ block: 'nearest', behavior: aaiCalm() ? 'auto' : 'smooth' })
+    }
+    const t = setTimeout(show, aaiCalm() ? 0 : 400)
+    const end = e => { if (e.target === wrap) { clearTimeout(t); show() } }
+    wrap.addEventListener('transitionend', end)
+    return () => { clearTimeout(t); wrap.removeEventListener('transitionend', end) }
+  }, [low])
+  const save = async n => {
+    if (!n || lock.current) return
+    lock.current = true
     setBusy(true)
-    try {
-      await aaiPost(profile, '/rate', { message_id: item.message_id, session_id: item.session_id, score: n, reasons, note })
-      if (n <= 3 && keep) await aaiPost(profile, '/cases', { message_id: item.message_id, mode: 'reply', note: [reasons.join(', '), note].filter(Boolean).join('. '), title: [reasons.join(', '), note].filter(Boolean).join('. ') || undefined })
-      onDone(n)
-    } finally {
-      setBusy(false)
+    setError('')
+    const form = n <= 3
+    const body = { message_id: item.message_id, session_id: item.session_id, score: n, reasons: form ? reasons : [], note: form ? note.trim() : '', test: form && test && canTest }
+    if (pushback) body.followup = pushback
+    let res = null
+    try { res = await aaiPost(profile, '/rate', body) } catch {}
+    lock.current = false
+    setBusy(false)
+    if (!res || !res.ok) {
+      setError((res && res.error) || 'Could not save the rating.')
+      if (!form) setScore(0)
+      return
     }
+    const inForm = formRef.current && formRef.current.contains(document.activeElement)
+    since.current = Date.now()
+    reset()
+    onSaved(item, n, res)
+    const star = inForm && starsRef.current && starsRef.current.querySelector('button')
+    if (star) star.focus()
   }
-  const pick = n => { setScore(n); if (n >= 4) submit(n) }
+  // a second click that lands right after a save belongs to the reply that was just rated, not to the next one
+  const pick = n => {
+    if (lock.current || Date.now() - since.current < 350) return
+    setError('')
+    setScore(n)
+    if (n >= 4) save(n)
+  }
+  const skip = () => { if (lock.current) return; reset(); onSkip(item) }
+  const starKey = (e, n) => {
+    const d = e.key === 'ArrowRight' || e.key === 'ArrowUp' ? 1 : e.key === 'ArrowLeft' || e.key === 'ArrowDown' ? -1 : 0
+    if (!d) return
+    e.preventDefault()
+    const to = Math.min(5, Math.max(1, n + d))
+    setHot(to)
+    const b = starsRef.current && starsRef.current.querySelectorAll('button')[to - 1]
+    if (b) b.focus()
+  }
   const shown = hot || score
+  const preview = item.preview || ''
+  const dimLine = { fontSize: 10.5, color: C.dim }
   return el('div', { style: { paddingTop: 8 } },
-    el('div', { style: { display: 'flex', alignItems: 'center', gap: 8 } },
-      el('span', { style: { flex: 1, minWidth: 0, fontSize: 12, color: C.text, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, item.title),
-      el(AaiOpenLink, { profile, sessionId: item.session_id, userId: item.user_id })),
-    el('div', { style: { fontSize: 11, color: C.sub, marginTop: 3, lineHeight: 1.45, display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden' } }, item.preview),
-    item.followup ? el('div', { style: { fontSize: 11, color: item.frustrated ? C.warn : C.dim, marginTop: 3, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, 'You said next: ' + item.followup) : null,
-    el('div', { style: { display: 'flex', alignItems: 'center', gap: 8, marginTop: 6 } },
-      el('span', { onMouseLeave: () => setHot(0), style: { display: 'inline-flex', gap: 2 } },
-        [1, 2, 3, 4, 5].map(n => el('span', { key: n, onMouseEnter: () => setHot(n), onClick: () => !busy && pick(n), style: { fontSize: 20, lineHeight: '20px', cursor: 'pointer', color: n <= shown ? C.warn : C.faint, transform: hot === n ? 'scale(1.12)' : 'none', transition: 'color 80ms, transform 80ms' } }, '★'))),
-      el('span', { style: { fontSize: 11, color: C.dim } }, STAR_WORDS[shown] || '')),
-    score && score <= 3
-      ? el('div', { style: { marginTop: 8 } },
-          el('div', { style: { display: 'flex', gap: 6, flexWrap: 'wrap' } }, REASONS.map(r => el(PickChip, { key: r, on: reasons.includes(r), onClick: () => setReasons(x => (x.includes(r) ? x.filter(y => y !== r) : x.concat([r]))) }, r))),
-          el('input', { value: note, onChange: e => setNote(e.target.value), placeholder: 'Anything else? (optional)', style: { width: '100%', marginTop: 7, boxSizing: 'border-box', background: 'transparent', border: '1px solid ' + C.stroke, borderRadius: 7, color: C.text, font: 'inherit', fontSize: 11.5, padding: '6px 8px' } }),
-          Row(el('label', { style: { fontSize: 11, color: C.sub, display: 'flex', gap: 6, alignItems: 'center', cursor: 'pointer' } }, el('input', { type: 'checkbox', checked: keep, onChange: () => setKeep(!keep) }), 'keep as a test'),
-            el('span', { style: { flex: 1 } }), el(BigBtn, { onClick: () => submit(score), disabled: busy }, busy ? 'Saving…' : 'Done')))
-      : null)
+    el('div', { style: { minHeight: 96 } },
+      el('div', { style: Object.assign({ display: 'flex', alignItems: 'center', gap: 10 }, dimLine) },
+        el(Clamped, { text: item.title && item.title !== 'untitled' ? item.title : 'Untitled chat', style: { minWidth: 0 } }),
+        el('span', { style: { flex: 'none' } }, ago(item.ts)),
+        el('span', { style: { flex: 1 } }),
+        el('span', { style: { flex: 'none' } }, el(AaiOpenLink, { profile, sessionId: item.session_id, userId: item.user_id }))),
+      item.request ? el(Clamped, { text: 'You asked: ' + item.request, lines: 2, style: { fontSize: 12, color: C.text, lineHeight: 1.45, marginTop: 5, overflowWrap: 'anywhere' } }) : null,
+      el('div', { style: { borderLeft: '2px solid ' + C.stroke, paddingLeft: 8, marginTop: 6 } },
+        el('div', { ref: prevRef, style: Object.assign({ fontSize: 11.5, color: C.sub, lineHeight: 1.45, overflowWrap: 'anywhere' }, more ? null : { display: '-webkit-box', WebkitLineClamp: 3, WebkitBoxOrient: 'vertical', overflow: 'hidden' }) }, preview + (item.cut ? '…' : '')),
+        prevCut || more ? el(ALink, { onClick: () => setMore(!more) }, more ? 'less' : 'more') : null,
+        preview.length < 40 ? el('div', { style: Object.assign({ marginTop: 2 }, dimLine) }, 'The chat shows what Hermes did before this short reply.') : null),
+      item.followup ? el(Clamped, { text: 'You said next: ' + item.followup, style: { fontSize: 11, color: item.frustrated ? C.warn : C.dim, marginTop: 6 } }) : null),
+    el('div', { style: { display: 'flex', alignItems: 'center', gap: 8, marginTop: 8 } },
+      el('span', { ref: starsRef, role: 'group', 'aria-label': 'Rate this reply', onMouseLeave: () => setHot(0), style: { display: 'inline-flex', gap: 2 } },
+        [1, 2, 3, 4, 5].map(n => el('button', {
+          key: n, type: 'button', 'aria-label': n + (n === 1 ? ' star, ' : ' stars, ') + STAR_WORDS[n], 'aria-pressed': score === n, tabIndex: n === (hot || score || 1) ? 0 : -1,
+          onMouseEnter: () => setHot(n), onBlur: e => { if (!starsRef.current || !starsRef.current.contains(e.relatedTarget)) setHot(0) }, onKeyDown: e => starKey(e, n), onClick: () => pick(n),
+          style: { font: 'inherit', fontSize: 20, lineHeight: '20px', padding: 0, border: 'none', borderRadius: 4, background: 'transparent', cursor: 'pointer', color: n <= shown ? C.warn : C.faint, transform: hot === n ? 'scale(1.12)' : 'none', transition: calm ? 'none' : 'color 80ms, transform 80ms' }
+        }, '★'))),
+      el('span', { style: { fontSize: 11, color: C.dim } }, busy && score >= 4 ? 'Saving…' : STAR_WORDS[shown] || ''),
+      el('span', { style: { flex: 1 } }),
+      el(ALink, { onClick: skip }, 'Skip')),
+    error ? el('div', { role: 'alert', style: { fontSize: 11, color: C.bad, marginTop: 6 } }, error) : null,
+    el('div', { style: { display: 'grid', gridTemplateRows: low ? '1fr' : '0fr', transition: calm ? 'none' : 'grid-template-rows 180ms ease' } },
+      el('div', { ref: formRef, 'aria-hidden': !low, style: { overflow: 'hidden', minHeight: 0, padding: '0 2px 2px', margin: '0 -2px' } },
+        el('div', { style: { fontSize: 11, color: C.sub, marginTop: 10 } }, lastLow.current === 3 ? 'What could be better?' : 'What went wrong?'),
+        el('div', { style: { display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 6 } }, REASONS.map(r => el(PickChip, { key: r, on: reasons.includes(r), onClick: () => setReasons(x => (x.includes(r) ? x.filter(y => y !== r) : x.concat([r]))) }, r))),
+        el('input', { value: note, 'aria-label': 'Note', onChange: e => setNote(e.target.value), onKeyDown: e => { if (e.key === 'Enter' && !e.nativeEvent.isComposing) save(score) }, placeholder: 'Add a note', style: { width: '100%', marginTop: 7, boxSizing: 'border-box', background: 'transparent', border: '1px solid ' + C.faint, borderRadius: 7, color: C.text, font: 'inherit', fontSize: 11.5, padding: '6px 8px' } }),
+        Row(
+          el(Tip, { label: canTest ? 'The reply is asked again later and checked against what you said.' : 'Pick a reason or write a note, so a replay has something to check against.' },
+            el('label', { style: { fontSize: 11, color: C.sub, display: 'flex', gap: 6, alignItems: 'center', cursor: canTest ? 'pointer' : 'default', opacity: canTest ? 1 : 0.55 } },
+              el('input', { type: 'checkbox', checked: test && canTest, disabled: !canTest, onChange: () => setTest(!test) }), 'Add as test')),
+          el('span', { style: { flex: 1 } }),
+          el(ALink, { onClick: reset }, 'Cancel'),
+          el(BigBtn, { onClick: () => save(score), disabled: busy }, busy ? 'Saving…' : 'Done')))))
 }
 
-const RateTask = ({ profile, ratings, onChanged }) => {
+// replies set aside with Skip, by profile: left out of the queue until Hermes restarts or one is asked for by name
+const aaiSkipped = new Map()
+const aaiSkips = profile => {
+  const k = profile || ''
+  if (!aaiSkipped.has(k)) aaiSkipped.set(k, new Set())
+  return aaiSkipped.get(k)
+}
+// the last "rate this one first" request that was served, so reopening the card does not bring a skipped reply back
+let aaiFirstUsed = 0
+const RateMeter = ({ n, goal, word, color, flex }) =>
+  el('div', { style: { flex, minWidth: 0 } },
+    el('div', { style: { height: 6, background: 'var(--ui-bg-secondary, rgba(0,0,0,.25))', borderRadius: 3, overflow: 'hidden' } },
+      el('i', { style: { display: 'block', height: '100%', width: Math.min(100, (n / goal) * 100) + '%', background: n >= goal ? C.ok : color } })),
+    el('div', { style: { fontSize: 10.5, color: C.dim, marginTop: 4, whiteSpace: 'nowrap' } }, n >= goal ? n + ' ' + word : n + ' of ' + goal + ' ' + word))
+
+// the rating card: one reply at a time, counts come from the server so they never drift
+const RateTask = ({ profile, ratings, first, onRated, onUndone }) => {
   const [queue, setQueue] = useState(null)
-  const [n, setN] = useState({ total: ratings.total || 0, low: ratings.low || 0 })
-  useEffect(() => { aaiGet(profile, '/rate-queue?n=5').then(r => setQueue((r && r.items) || [])).catch(() => setQueue([])) }, [profile])
-  if (queue == null) return el(TaskCard, { id: 'aai-t-rate', title: 'Rate replies' }, aSmall('Loading…'))
-  const done = s => { popPin.on = false; setN(x => ({ total: x.total + 1, low: x.low + (s <= 2 ? 1 : 0) })); setQueue(q => q.slice(1)); if (onChanged) onChanged() }
-  const good = Math.min(100, ((n.total - n.low) / 20) * 100), low = Math.min(100, (n.low / 20) * 100)
-  return el(TaskCard, { id: 'aai-t-rate', title: 'Rate replies', tip: 'Your stars teach the judge what good looks like. Replies you pushed back on come first, taking turns with ones you moved on from, so it learns from both. After 20 ratings, 5 of them low, it can be checked against you.', count: queue.length ? queue.length + ' left' : 'all rated', done: !queue.length },
-    queue.slice(0, 1).map(it => el(RateItem, { key: it.message_id, profile, item: it, onDone: done })),
-    el('div', { style: { height: 8, background: 'var(--ui-bg-secondary, rgba(0,0,0,.25))', borderRadius: 4, overflow: 'hidden', display: 'flex', marginTop: 8 } },
-      el('i', { style: { display: 'block', width: good + '%', background: C.ok } }), el('i', { style: { display: 'block', width: low + '%', background: C.bad } })),
-    el('div', { style: { display: 'flex', justifyContent: 'space-between', fontSize: 10.5, color: C.dim, marginTop: 4 } }, el('span', null, n.total + ' of 20 ratings, ' + n.low + ' of 5 low'), el('span', null, 'judge trusted at 20')))
+  const [left, setLeft] = useState(0)
+  const [loading, setLoading] = useState(true)
+  const [saved, setSaved] = useState(null)
+  const [undoing, setUndoing] = useState(false)
+  const [undoErr, setUndoErr] = useState('')
+  const [skips, setSkips] = useState(0)
+  const done = useRef(new Set())
+  const req = useRef(0)
+  const queueRef = useRef(null)
+  const prof = useRef(profile)
+  const put = q => { queueRef.current = q; setQueue(q) }
+  const load = async firstId => {
+    const my = ++req.current
+    setLoading(true)
+    const skip = [...aaiSkips(profile)].filter(id => id !== firstId)
+    let r = null
+    try { r = await aaiGet(profile, '/rate-queue?n=5' + (firstId ? '&first=' + encodeURIComponent(firstId) : '') + (skip.length ? '&skip=' + encodeURIComponent(skip.join(',')) : '')) } catch {}
+    if (my !== req.current) return
+    setLoading(false)
+    if (!r) { if (!queueRef.current) put([]); return }
+    const items = (r.items || []).filter(it => !done.current.has(it.message_id))
+    const cur = !firstId && queueRef.current && queueRef.current[0]
+    put(cur ? [cur].concat(items.filter(it => it.message_id !== cur.message_id)) : items)
+    setLeft(r.left || 0)
+  }
+  useEffect(() => {
+    if (prof.current !== profile) { prof.current = profile; done.current = new Set(); put(null); setSaved(null); setUndoErr('') }
+    const id = first && first.tick !== aaiFirstUsed ? first.id : null
+    if (id) { aaiFirstUsed = first.tick; done.current.delete(id); aaiSkips(profile).delete(id) }
+    setSkips(aaiSkips(profile).size)
+    load(id)
+  }, [profile, first && first.tick])
+  const advance = item => {
+    const q = (queueRef.current || []).filter(it => it.message_id !== item.message_id)
+    put(q)
+    setLeft(n => Math.max(0, n - 1))
+    if (q.length < 2) load()
+  }
+  const rated = (item, score, res) => {
+    popPin.on = false
+    done.current.add(item.message_id)
+    setSaved({ item, res })
+    setUndoErr('')
+    advance(item)
+    onRated(item, score, res)
+  }
+  const skipped = item => {
+    popPin.on = false
+    aaiSkips(profile).add(item.message_id)
+    setSkips(aaiSkips(profile).size)
+    advance(item)
+  }
+  const undo = async () => {
+    if (!saved || undoing) return
+    setUndoing(true)
+    setUndoErr('')
+    const { item, res } = saved
+    let r = null
+    try { r = await aaiPost(profile, '/rate', { message_id: item.message_id, undo: true, case_id: res.case_new ? res.case_id : undefined }) } catch {}
+    setUndoing(false)
+    if (!r || !r.ok) { setUndoErr('Could not undo.'); return }
+    done.current.delete(item.message_id)
+    setSaved(null)
+    put([item].concat((queueRef.current || []).filter(it => it.message_id !== item.message_id)))
+    setLeft(n => n + 1)
+    onUndone(item, r)
+  }
+  const unskip = () => { aaiSkips(profile).clear(); setSkips(0); load() }
+  const item = queue && queue[0]
+  const empty = !item && !loading
+  const count = el('span', { style: { display: 'inline-flex', gap: 8, alignItems: 'center' } },
+    saved ? el('span', { role: 'status', style: { color: C.ok } }, saved.res.case_new ? 'Saved with a test' : 'Saved') : null,
+    saved ? el(ALink, { onClick: undo }, undoing ? 'Undoing…' : 'Undo') : null,
+    left ? el('span', null, left + ' left') : empty ? el('span', null, 'none left') : null)
+  return el(TaskCard, { id: 'aai-t-rate', title: 'Rate replies', tip: 'Your stars teach the judge what good looks like. Replies you pushed back on come first, taking turns with ones you moved on from, so it learns from both.', count, done: empty && !skips && !saved },
+    item
+      ? el(RateItem, { profile, item, onSaved: rated, onSkip: skipped })
+      : loading
+        ? el('div', { style: { minHeight: 132, paddingTop: 8 } }, aSmall('Loading…'))
+        : el('div', { style: { display: 'flex', gap: 10, alignItems: 'center', paddingTop: 8 } }, aSmall('No replies left to rate.'), skips ? el(ALink, { onClick: unskip }, 'Show ' + skips + ' skipped') : null),
+    undoErr ? el('div', { role: 'alert', style: { fontSize: 11, color: C.bad, marginTop: 6 } }, undoErr) : null,
+    el(Tip, { label: 'Low means 1 or 2 stars. At 20 ratings with 5 low, the judge can be checked against you in Settings.' },
+      el('div', { style: { display: 'flex', gap: 12, marginTop: 10 } },
+        el(RateMeter, { n: ratings.total || 0, goal: 20, word: 'ratings', color: V7.accent, flex: 2 }),
+        el(RateMeter, { n: ratings.low || 0, goal: 5, word: 'low', color: C.warn, flex: 1 }))))
 }
 
-// corrections inbox: each one is kept as a test or dismissed, then leaves the list
-const InboxTask = ({ profile, items, onChanged }) => {
-  const [gone, setGone] = useState(() => new Set())
+// corrections inbox: each one is rated in the card above, which adds it as a test, or dismissed
+const InboxTask = ({ profile, items, onRate, onGone }) => {
   const [busy, setBusy] = useState(null)
-  const left = items.filter(it => !gone.has(it.correction_id))
-  const act = async (it, keep) => {
+  const [err, setErr] = useState(null)
+  const dismiss = async it => {
     setBusy(it.correction_id)
-    try {
-      if (keep) await aaiPost(profile, '/cases', { message_id: it.message_id, note: it.text, title: it.text, mode: 'reply', skill: it.skill || undefined })
-      else await aaiPost(profile, '/corrections/dismiss', { correction_id: it.correction_id })
-      setGone(prev => new Set(prev).add(it.correction_id))
-      if (keep && onChanged) onChanged()
-    } finally {
-      setBusy(null)
-    }
+    setErr(null)
+    let r = null
+    try { r = await aaiPost(profile, '/corrections/dismiss', { correction_id: it.correction_id }) } catch {}
+    setBusy(null)
+    if (!r || !r.ok) { setErr(it.correction_id); return }
+    onGone(it)
   }
-  return el(TaskCard, { id: 'aai-t-inbox', title: 'Times you corrected Hermes', tip: 'Found by wording such as “no”, “you forgot”, “again”. Keeping one makes it a test: the reply is asked again and checked against what you said.', count: left.length ? left.length + ' new' : 'none left', done: !left.length },
-    left.slice(0, 4).map((it, i) =>
+  return el(TaskCard, { id: 'aai-t-inbox', title: 'Times you corrected Hermes', tip: 'Found by wording such as “no”, “you forgot”, “again”. Rate the reply it answers to add it as a test, or dismiss it.', count: items.length ? items.length + ' new' : 'none left', done: !items.length },
+    items.slice(0, 4).map((it, i) =>
       el('div', { key: it.correction_id, style: { padding: '9px 0', borderTop: i ? '1px solid ' + C.stroke : 'none' } },
-        el('div', { style: { fontSize: 12, color: C.text, lineHeight: 1.45 } }, '“' + it.text + '”'),
+        el(Clamped, { text: '“' + it.text + '”', lines: 3, style: { fontSize: 12, color: C.text, lineHeight: 1.45, overflowWrap: 'anywhere' } }),
         el('div', { style: { display: 'flex', gap: 10, alignItems: 'center', marginTop: 4, fontSize: 11, color: C.dim } }, it.skill || 'no skill loaded', el('span', null, ago(it.ts)), el(AaiOpenLink, { profile, sessionId: it.session_id, userId: it.user_id })),
-        Row(el(BigBtn, { onClick: () => act(it, true), disabled: busy === it.correction_id }, 'Keep as test'), el(BigBtn, { ghost: true, onClick: () => act(it, false), disabled: busy === it.correction_id }, 'Dismiss')))))
+        Row(el(BigBtn, { onClick: () => onRate(it) }, 'Rate'), el(BigBtn, { ghost: true, onClick: () => dismiss(it), disabled: busy === it.correction_id }, 'Dismiss')),
+        err === it.correction_id ? el('div', { role: 'alert', style: { fontSize: 11, color: C.bad, marginTop: 6 } }, 'Could not dismiss.') : null)))
 }
 
 // unused skills as pills: click one to keep it, the rest are archived together
@@ -2779,15 +2923,81 @@ const ArchiveTask = ({ profile, unused, onDone }) => {
     Row(el(BigBtn, { onClick: run, disabled: busy || !go.length }, busy ? 'Archiving…' : 'Archive ' + go.length), el('span', { style: { fontSize: 11, color: C.dim } }, 'saves about ' + fmtTok(tokens) + ' tokens per call')))
 }
 
-// a failing skill: draft, test, ship, shown as steps
-const FIX_AT = { start: 0, 'draft…': 0, drafted: 1, 'test…': 1, tested: 2, 'ship…': 2, shipped: 3 }
-const FixTask = ({ profile, skill, failing, onDone }) => {
-  const [step, setStep] = useState('start')
-  const at = FIX_AT[step] != null ? FIX_AT[step] : 0
-  return el(TaskCard, { id: 'aai-t-fix-' + skill, title: 'Fix ' + skill, tip: 'Hermes drafts a new version, it is tested on the same tests, and you decide. About $0.03.', count: failing + (failing === 1 ? ' test fails' : ' tests fail'), done: at === 3 },
-    el('div', { style: { display: 'flex', gap: 6, margin: '8px 0', fontSize: 11 } }, ['Draft', 'Test', 'Ship'].map((s, i) =>
-      el('span', { key: s, style: { flex: 1, textAlign: 'center', padding: '4px 0', borderRadius: 6, border: '1px solid ' + (i === at ? V7.accent : C.stroke), background: i === at ? 'rgba(107,132,230,.15)' : 'transparent', color: i < at ? C.ok : i === at ? C.text : C.dim } }, (i < at ? '✓ ' : i + 1 + '  ') + s))),
-    el(AaiFix, { profile, skill, onDone, onStep: setStep }))
+// a skill with tests that do not pass: Hermes drafts a fix and tries it beside the skill as it is, and you apply it
+const FixTask = ({ profile, skill, open, proposal, running, estimate, onPoll, onApplied }) => {
+  const [busy, setBusy] = useState(false)
+  const [acting, setActing] = useState(false)
+  const [err, setErr] = useState('')
+  const [applied, setApplied] = useState(false)
+  const [details, setDetails] = useState(false)
+  const pollRef = useRef(onPoll)
+  pollRef.current = onPoll
+  const waiting = busy || running
+  // a try started elsewhere (on its own, or before the popup was reopened) is watched until it lands
+  useEffect(() => {
+    if (!running || busy) return
+    const t = setInterval(() => pollRef.current(), 5000)
+    return () => clearInterval(t)
+  }, [running, busy])
+  const tryFix = async () => {
+    setBusy(true)
+    setErr('')
+    let r = null
+    try { r = await aaiPost(profile, '/propose', { skill }) } catch {}
+    const now = await pollRef.current()
+    setBusy(false)
+    if ((!r || !r.ok) && !(now && (now.running || []).includes(skill))) setErr((r && r.error) || 'Could not try a fix.')
+  }
+  const act = async (path, body, fallback) => {
+    setActing(true)
+    setErr('')
+    let r = null
+    try { r = await aaiPost(profile, path, body) } catch {}
+    setActing(false)
+    if (!r || !r.ok) setErr((r && r.error) || fallback)
+    return !!(r && r.ok)
+  }
+  const apply = async () => {
+    if (await act('/ship', { proposal: proposal.id }, 'Could not apply the fix.')) { setApplied(true); onApplied() } else pollRef.current()
+  }
+  const dismiss = async () => { await act('/proposals', { dismiss: proposal.id }, 'Could not dismiss the fix.'); pollRef.current() }
+  const line = (t, color) => el('div', { style: { fontSize: 11, color: color || C.dim, marginTop: 4 } }, t)
+  const cost = estimate ? aSmall('about $' + Number(estimate).toFixed(2)) : null
+  const mark = v => aTd(v == null ? '' : v ? 'pass' : 'fail', v ? C.ok : C.bad)
+  const ready = proposal && proposal.fix > proposal.current && !proposal.stale
+  let body
+  if (applied) body = line('Live. The earlier version is saved.', C.ok)
+  else if (waiting) body = el('div', { role: 'status', style: { fontSize: 11.5, color: C.sub, marginTop: 8 } }, 'Trying a fix, this takes a few minutes.')
+  else if (proposal)
+    body = el('div', null,
+      el('div', { style: { fontSize: 12, marginTop: 8 } },
+        el('span', { style: { color: C.text, fontWeight: 500 } }, 'Fix passes ' + proposal.fix + ' of ' + proposal.n),
+        el('span', { style: { color: C.sub } }, ', current passes ' + proposal.current + ' of ' + proposal.n)),
+      proposal.hint ? line('Scores are a hint until the judge is checked against your ratings.') : null,
+      proposal.stopped ? line('Stopped early at the daily budget.') : null,
+      proposal.stale ? line('The skill changed since this fix was written.', C.warn) : ready ? null : line('The fix did no better than the skill as it is.'),
+      Row(
+        ready ? el(BigBtn, { onClick: apply, disabled: acting }, 'Apply') : el(BigBtn, { onClick: tryFix, disabled: acting }, 'Try again'),
+        ready ? null : cost,
+        el(BigBtn, { ghost: true, onClick: dismiss, disabled: acting }, 'Dismiss'),
+        el('span', { style: { flex: 1 } }),
+        el(ALink, { onClick: () => setDetails(!details) }, details ? 'hide details' : 'details')),
+      details
+        ? el('div', { style: { marginTop: 4 } },
+            aTable(['tried on', 'current', 'fix'], (proposal.rows || []).map((r, i) =>
+              el('tr', { key: i },
+                el('td', { style: { textAlign: 'left', color: r.reworded ? C.dim : C.text, borderTop: '1px solid ' + C.stroke, padding: '4px 0 4px ' + (r.reworded ? 12 : 0) + 'px', whiteSpace: 'nowrap', maxWidth: 200, overflow: 'hidden', textOverflow: 'ellipsis' } }, el(Tip, { label: r.title }, el('span', null, r.title))),
+                mark(r.current), mark(r.fix)))),
+            line('Indented rows are rewordings of the test above.'),
+            el('pre', { style: { fontSize: 10, lineHeight: '15px', background: 'var(--ui-bg-secondary, rgba(0,0,0,.2))', borderRadius: 6, padding: '6px 8px', maxHeight: 160, overflow: 'auto', whiteSpace: 'pre-wrap', margin: '8px 0 0' } },
+              (proposal.diff || []).map((l, i) => el('div', { key: i, style: { color: l.startsWith('+') ? C.ok : l.startsWith('-') ? C.bad : C.dim } }, l))),
+            el('div', { style: { display: 'flex', gap: 10, marginTop: 6 } }, aSmall('Cost $' + Number(proposal.cost || 0).toFixed(2)), proposal.auto ? aSmall('tried on its own') : null, aSmall(ago(proposal.ts))))
+        : null)
+  else if (open) body = Row(el(BigBtn, { onClick: tryFix }, 'Try a fix'), cost)
+  else body = line('Its tests pass now.')
+  return el(TaskCard, { id: 'aai-t-fix-' + skill, title: 'Fix ' + skill, tip: 'Hermes drafts a fix and tries it on these tests and on rewordings of them, beside the skill as it is. Nothing is applied until you say so.', count: applied ? 'applied' : open ? open + (open === 1 ? ' test not passing' : ' tests not passing') : '', done: applied || (!open && !proposal && !waiting) },
+    body,
+    err ? el('div', { role: 'alert', style: { fontSize: 11, color: C.bad, marginTop: 6 } }, err) : null)
 }
 
 // changes the gate held back for you
@@ -2866,7 +3076,7 @@ const TestTiles = ({ profile, cases, onChanged, providers = [], altModel, auxOn,
   const [open, setOpen] = useState(null)
   const [busy, setBusy] = useState(false)
   const [res, setRes] = useState(null)
-  if (!cases.length) return aSmall('No tests yet. Keep a correction or a low-rated reply as a test.')
+  if (!cases.length) return aSmall('No tests yet. Rate a reply 3 stars or less to add one.')
   const replay = async () => {
     setBusy(true)
     try {
@@ -2938,18 +3148,27 @@ const AaiView2 = ({ profile, period, yaml, orProfile, auxOn, onChanged }) => {
   const [actionsTick, setActionsTick] = useState(0)
   const [flags, setFlags] = useState(seen.flags || [])
   const [verOpen, setVerOpen] = useState(null)
+  const [props, setProps] = useState(seen.props || null)
+  const [rateFirst, setRateFirst] = useState(null)
+  const dataRef = useRef(data)
+  dataRef.current = data
+  const corrRef = useRef(corr)
+  corrRef.current = corr
+  // cards that were shown stay until the view is left, so one does not vanish under the pointer when its work is done
+  const latch = useRef(null)
+  if (!latch.current || latch.current.profile !== profile) latch.current = { profile, inbox: false, fix: new Set() }
   const reload = () => setTick(t => t + 1)
   useEffect(() => {
     let live = true
     const c = viewCache.get(ck)
-    if (c) { setData(c.data); setCases(c.cases); setCorr(c.corr); setGate(c.gate); setFlags(c.flags) }
+    if (c) { setData(c.data); setCases(c.cases); setCorr(c.corr); setGate(c.gate); setFlags(c.flags); setProps(c.props || null) }
     Promise.all([api(profileReq(profile, { path: '/api/plugins/hermetic/aai?days=' + days })), aaiGet(profile, '/cases'),
-      aaiGet(profile, '/corrections?days=30'), aaiGet(profile, '/gate'), aaiGet(profile, '/flags?days=' + days)])
-      .then(([r, ca, co, ga, fl]) => {
+      aaiGet(profile, '/corrections?days=30'), aaiGet(profile, '/gate'), aaiGet(profile, '/flags?days=' + days), aaiGet(profile, '/proposals').catch(() => null)])
+      .then(([r, ca, co, ga, fl, pr]) => {
         if (!live) return
-        const got = { data: r, cases: (ca && ca.cases) || [], corr: (co && co.items) || [], gate: (ga && ga.decisions) || [], flags: (fl && fl.flags) || [] }
+        const got = { data: r, cases: (ca && ca.cases) || [], corr: (co && co.items) || [], gate: (ga && ga.decisions) || [], flags: (fl && fl.flags) || [], props: pr || null }
         viewCache.set(ck, got)
-        setData(got.data); setCases(got.cases); setCorr(got.corr); setGate(got.gate); setFlags(got.flags); setErr(null)
+        setData(got.data); setCases(got.cases); setCorr(got.corr); setGate(got.gate); setFlags(got.flags); setProps(got.props); setErr(null)
       })
       .catch(e => live && setErr(/404|Not Found|Headless backend/i.test(String(e && e.message)) ? 'Restart Hermes to load the AAI backend: Hermes menu, Quit and Keep Windows, then reopen.' : (e && e.message) || 'Backend plugin off, restart Hermes'))
     return () => { live = false }
@@ -2970,8 +3189,18 @@ const AaiView2 = ({ profile, period, yaml, orProfile, auxOn, onChanged }) => {
   const ratings = { total: r.total != null ? r.total : r.good + r.bad, low: r.low != null ? r.low : r.bad }
   const rateJob = ratings.total < 20 || ratings.low < 5
   const lastArchive = data.work.filter(w => w.job === 'archive' && !w.undo).slice(-1)[0]
-  const failing = {}
-  for (const c of cases) if (c.skill && c.last && c.last.ok && !c.last.passed) failing[c.skill] = (failing[c.skill] || 0) + 1
+  // a skill gets a fix card while one of its tests is not passing, a fix is being tried, or one waits for a decision
+  const openBy = {}
+  for (const c of cases) if (c.skill && !(c.last && c.last.ok && c.last.passed)) openBy[c.skill] = (openBy[c.skill] || 0) + 1
+  const propBy = {}
+  for (const p of (props && props.proposals) || []) propBy[p.skill] = p
+  const running = (props && props.running) || []
+  const shown = latch.current
+  for (const sk of Object.keys(openBy).concat(Object.keys(propBy), running)) shown.fix.add(sk)
+  // a card stays after its tests pass, and goes when an undo leaves the skill with no test at all
+  const tested = new Set(cases.map(c => c.skill))
+  const fixSkills = [...shown.fix].filter(sk => tested.has(sk) || propBy[sk] || running.includes(sk)).sort()
+  if (corr.length) shown.inbox = true
   const reverted = new Set(data.work.filter(w => w.job === 'revert').map(w => w.skill))
   const asked = gate.filter(d => d.action === 'asked' && !reverted.has(d.skill))
   const modelLine = yamlBlock(yaml, 'model').find(l => /^\s{2}default:/.test(l)) || ''
@@ -2985,16 +3214,38 @@ const AaiView2 = ({ profile, period, yaml, orProfile, auxOn, onChanged }) => {
   const todo = []
   if (rateJob) todo.push(['aai-t-rate', 'Rate replies', 'input'])
   if (corr.length) todo.push(['aai-t-inbox', corr.length + (corr.length === 1 ? ' correction' : ' corrections'), 'input'])
-  for (const sk of Object.keys(failing)) todo.push(['aai-t-fix-' + sk, 'Fix ' + sk, 'bad'])
+  for (const sk of fixSkills) if (openBy[sk] || propBy[sk]) todo.push(['aai-t-fix-' + sk, 'Fix ' + sk, 'bad'])
   if (asked.length) todo.push(['aai-t-gate', asked.length + ' worse ' + (asked.length === 1 ? 'change' : 'changes'), 'bad'])
   if (unused.length >= 3) todo.push(['aai-t-archive', 'Archive ' + unused.length + ' skills', 'decide'])
   const jump = id => {
     setActionsTick(t => t + 1)
     // Actions may be folded: wait for the card to render, then scroll to it
     let tries = 0
-    const go = () => { const n = document.getElementById(id); if (n) n.scrollIntoView({ behavior: 'smooth', block: 'start' }); else if (tries++ < 20) setTimeout(go, 50) }
+    const go = () => { const n = document.getElementById(id); if (n) n.scrollIntoView({ behavior: aaiCalm() ? 'auto' : 'smooth', block: 'start' }); else if (tries++ < 20) setTimeout(go, 50) }
     setTimeout(go, 30)
   }
+  // what a card changes is written to this view and to its cached copy, so reopening the popup shows the same thing
+  const patch = part => { const c = viewCache.get(ck); if (c) viewCache.set(ck, Object.assign({}, c, part)) }
+  const putRatings = rt => { if (!rt || !dataRef.current) return; const nd = Object.assign({}, dataRef.current, { ratings: rt }); dataRef.current = nd; setData(nd); patch({ data: nd }) }
+  const putCorr = list => { corrRef.current = list; setCorr(list); patch({ corr: list }) }
+  const fetchCases = () => aaiGet(profile, '/cases').then(ca => { if (ca && ca.cases) { setCases(ca.cases); patch({ cases: ca.cases }) } }).catch(() => {})
+  const poll = async () => {
+    let got = null
+    try { got = await aaiGet(profile, '/proposals') } catch {}
+    if (got) { setProps(got); patch({ props: got }) }
+    return got
+  }
+  const onRated = (item, score, res) => {
+    putRatings(res.ratings)
+    if (corrRef.current.some(c => c.message_id === item.message_id)) putCorr(corrRef.current.filter(c => c.message_id !== item.message_id))
+    if (res.case_new) fetchCases()
+  }
+  const onUndone = (item, res) => {
+    putRatings(res.ratings)
+    aaiGet(profile, '/corrections?days=30').then(co => { if (co && co.items) putCorr(co.items) }).catch(() => {})
+    fetchCases()
+  }
+  const rateThis = it => { setRateFirst({ id: it.message_id, tick: Date.now() }); jump('aai-t-rate') }
 
   const undoArchive = async () => {
     await api(profileReq(profile, { path: '/api/plugins/hermetic/aai/archive', method: 'POST', body: { skills: lastArchive.skills, undo: true } }))
@@ -3004,7 +3255,7 @@ const AaiView2 = ({ profile, period, yaml, orProfile, auxOn, onChanged }) => {
   const timeline = []
     .concat(data.events.map(e => ({ ts: e.ts, what: e.skill + ' ' + (e.action === 'create' ? 'created' : 'changed'), who: e.actor === 'agent' ? 'chat' : 'review', tip: e.actor === 'agent' ? 'changed in chat ' + (e.session || '') : 'changed by the background review' })))
     .concat(data.routing.filter(x => !x.first).map(x => ({ ts: x.ts, what: 'Routing rules changed', who: 'config', tip: JSON.stringify(x.routing) })))
-    .concat(data.work.map(w => ({ ts: w.ts, what: w.job === 'archive' ? (w.undo ? 'Unarchived ' : 'Archived ') + w.skills.length + ' skills' : w.job === 'fallback' ? 'Fallback turned on' : w.job === 'prefer' ? 'Routing: ' + w.detail + ' tried first' : w.job === 'ship' ? 'Shipped a new ' + (w.skill || 'skill') + ' version' : w.job === 'revert' ? 'Reverted ' + (w.skill || 'a skill') : w.job, who: 'hermetic', tip: w.skills ? w.skills.join(', ') : w.detail || '' })))
+    .concat(data.work.map(w => ({ ts: w.ts, what: w.job === 'archive' ? (w.undo ? 'Unarchived ' : 'Archived ') + w.skills.length + ' skills' : w.job === 'fallback' ? 'Fallback turned on' : w.job === 'prefer' ? 'Routing: ' + w.detail + ' tried first' : w.job === 'ship' ? 'Applied a fix to ' + (w.skill || 'a skill') : w.job === 'revert' ? 'Reverted ' + (w.skill || 'a skill') : w.job, who: 'hermetic', tip: w.skills ? w.skills.join(', ') : w.detail || '' })))
   const errDays = {}
   for (const e of limits) { const d = new Date(e.ts * 1000).toDateString(); errDays[d] = errDays[d] || { ts: e.ts, n: 0, p: {} }; errDays[d].n++; errDays[d].p[e.provider] = (errDays[d].p[e.provider] || 0) + 1 }
   for (const v of Object.values(errDays)) timeline.push({ ts: v.ts, what: v.n + ' rate limits', who: 'providers', tip: Object.entries(v.p).map(([k, n]) => k + ' ' + n).join(', ') })
@@ -3016,7 +3267,7 @@ const AaiView2 = ({ profile, period, yaml, orProfile, auxOn, onChanged }) => {
 
   const counts = { ok: 0, bad: 0, warn: 0, idle: 0 }
   for (const c of cases) counts[caseStatus(c.last)[2]]++
-  const testsRight = cases.length ? el('span', { style: { display: 'flex', gap: 8 } }, el('span', { style: { color: C.ok } }, counts.ok + ' pass'), counts.bad ? el('span', { style: { color: C.bad } }, counts.bad + ' fail') : null) : null
+  const testsRight = cases.length ? el('span', { style: { display: 'flex', gap: 8 } }, el('span', { style: { color: C.ok } }, counts.ok + ' pass'), counts.bad ? el('span', { style: { color: C.bad } }, counts.bad + ' fail') : null, counts.idle ? el('span', { style: { color: C.dim } }, counts.idle + ' not run') : null) : null
 
   return el('div', null,
     el('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0,1fr))', gap: 8, marginTop: 14 } },
@@ -3024,15 +3275,12 @@ const AaiView2 = ({ profile, period, yaml, orProfile, auxOn, onChanged }) => {
       el(Cell, { tone: limits.length >= 10 ? 'warn' : 'ok', label: 'Rate limits', value: String(limits.length), sub: sub(provList[0] ? provList[0][0] : ''), tip: provList.map(([k, n]) => k + ' ' + n).join(', ') || 'none recorded' }),
       el(Cell, { tone: null, label: 'Skills used', value: loadedNow + ' of ' + enabled, sub: '', tip: 'Enabled skills loaded at least once in this period' }),
       el(Cell, { tone: null, label: 'Always-on', value: fmtTok(alwaysOn), sub: sub('tokens per call'), tip: 'Every enabled skill description is sent with every call: about ' + fmtTok(alwaysOn * data.calls) + ' tokens over ' + data.calls + ' calls in this period' })),
-    todo.length
-      ? el(Section, { id: 'aai2-actions', title: 'Actions', right: el('span', { style: { display: 'flex', alignItems: 'center', gap: 5 } }, todo.map(([id, , kind]) => el('span', { key: id, style: { width: 6, height: 6, borderRadius: 3, background: kind === 'bad' ? C.bad : kind === 'decide' ? C.warn : V7.accent } })), el('span', { style: { marginLeft: 3 } }, String(todo.length))), openTick: actionsTick },
-        rateJob ? el(RateTask, { profile, ratings, onChanged: null }) : null,
-        corr.length ? el(InboxTask, { profile, items: corr, onChanged: reload }) : null,
-        Object.entries(failing).map(([sk, n]) => el(FixTask, { key: sk, profile, skill: sk, failing: n, onDone: reload })),
-        asked.length ? el(GateTask, { profile, asked, onDone: reload }) : null,
-        unused.length >= 3 ? el(ArchiveTask, { profile, unused, onDone: reload }) : null,
-        null)
-      : null,
+    el(Section, { id: 'aai2-actions', title: 'Actions', right: todo.length ? el('span', { style: { display: 'flex', alignItems: 'center', gap: 5 } }, todo.map(([id, , kind]) => el('span', { key: id, style: { width: 6, height: 6, borderRadius: 3, background: kind === 'bad' ? C.bad : kind === 'decide' ? C.warn : V7.accent } })), el('span', { style: { marginLeft: 3 } }, String(todo.length))) : null, openTick: actionsTick },
+      el(RateTask, { profile, ratings, first: rateFirst, onRated, onUndone }),
+      shown.inbox ? el(InboxTask, { profile, items: corr, onRate: rateThis, onGone: it => putCorr(corrRef.current.filter(c => c.correction_id !== it.correction_id)) }) : null,
+      fixSkills.map(sk => el(FixTask, { key: sk, profile, skill: sk, open: openBy[sk] || 0, proposal: propBy[sk] || null, running: running.includes(sk), estimate: props && props.estimate, onPoll: poll, onApplied: reload })),
+      asked.length ? el(GateTask, { profile, asked, onDone: reload }) : null,
+      unused.length >= 3 ? el(ArchiveTask, { profile, unused, onDone: reload }) : null),
 
     el(Section, { id: 'aai2-tiles', title: 'Tests', right: testsRight }, el(TestTiles, { profile, cases, onChanged: reload, providers: orProfile ? data.providers || [] : [], altModel, auxOn, onApplied: onChanged })),
     el(Section, { id: 'aai2-timeline', title: 'Timeline', right: timeline.length ? el('span', { style: { display: 'flex', gap: 8 } }, flags.length ? el('span', { style: { color: C.warn } }, flags.length + ' flagged') : null, String(timeline.length)) : null },

@@ -63,11 +63,11 @@ Deep and analytical cost tracking especially when using multi-provider routing (
 
 Evals, model-as-a-judge, and the missing layer for hermes auto-improve (randomly changing skills without proof they improved adds nothing)
 
-- **Ratings**: rate replies 1 to 5 stars, the ones you pushed back on first ("no, …", "wtf, still broken"), and keep any of those as a test
-- **Evals**: your saved tests replayed on your current routing, each coloured by its last result. From 5 tests on, compare your two most-used providers and a second model on the same tests
+- **Ratings**: rate replies 1 to 5 stars, the ones you pushed back on first ("no, …", "wtf, still broken"). A reply rated 3 or less becomes a test, checked against your reasons, your note or what you said next
+- **Evals**: your saved tests replayed on your current routing, each coloured by its last result. A replay reads the last few turns of the chat by default, which is cheaper and steadier than the whole chat. From 5 tests on, compare your two most-used providers and a second model on the same tests
 - **LLM as a judge**: grades replays with a rubric drafted from each skill. It has to earn trust against your ratings first (20 of them, 5 low) and fail most replies you corrected, and hermetic warns when it runs on your agent's own model family
 - **Proof for auto-improve**: skill changes from the background review are tested automatically (off, ask me, or revert), and a change that tests worse can be reverted. An untrusted judge never decides a revert
-- **Skill fixes**: for a skill whose tests fail, Hermes drafts a new version, it runs on the same tests, and you decide whether to ship it
+- **Skill fixes**: for a skill whose tests fail, a new version is drafted and tried beside the current one on those tests and on rewordings of them, each replayed best of 3. One card shows the result ("fix passes 7 of 9, current passes 3 of 9") and you decide whether to apply it. Once a skill has 3 failing tests this can run on its own (off by default), and it never applies a fix itself
 - **Timeline and versions**: every skill change, routing change and rate-limit day, with changes that added links, code blocks or script files flagged, and every saved skill version to compare
 - **Cleanup**: archive skills that were never used, saving tokens on every call
 
@@ -122,9 +122,9 @@ A `pre_tool_call` hook checks each tool call against HDR's rules (`hdr_rules.py`
 
 ### Plugin-initiated model calls
 
-On AAI, only when you press replay, compare, draft or judge, or when you turn on automatic tests. On Costs, only when you turn on the daily check.
-- Fix drafts, the judge and rubric drafts use Hermes' plugin model access (`ctx.llm`) on your main model. To let the judge use a different model, allow it in `config.yaml` under `plugins.entries.hermetic.llm` (`allow_model_override: true` and `allowed_models`).
-- Replays go to OpenRouter with the `OPENROUTER_API_KEY` Hermes holds for the profile, read through Hermes' secret scope and following your routing rules. On a Nous Portal profile they need OpenRouter for now, until Hermes lets plugins use the Nous sign-in. They appear in your spend like any other call. A replay costs about $0.01 per test; automatic tests stop at $0.50 a day.
+On AAI, only when you press replay, compare, judge or try a fix, or when you turn on automatic tests or automatic fix attempts. On Costs, only when you turn on the daily check.
+- Fix drafts, rewordings, the judge and rubric drafts use Hermes' plugin model access (`ctx.llm`) on your main model. To let the judge use a different model, allow it in `config.yaml` under `plugins.entries.hermetic.llm` (`allow_model_override: true` and `allowed_models`).
+- Replays go to OpenRouter with the `OPENROUTER_API_KEY` Hermes holds for the profile, read through Hermes' secret scope and following your routing rules. On a Nous Portal profile they need OpenRouter for now, until Hermes lets plugins use the Nous sign-in. They appear in your spend like any other call. A replay costs about $0.01 per test; automatic tests stop at $0.50 a day. Trying a fix takes one draft and 36 to 54 judged replays (3 tests and 2 rewordings of each, on both versions, 2 or 3 times), and the card shows the estimate before you press. Fix attempts made on its own share the $0.50 a day.
 - The daily check sends one tiny fixed prompt ("Reply with exactly one word: ok") once a day to each provider that served your models this week, pinned to it through OpenRouter with the same key and your privacy rules, a few cents a month. It records the answer, how sure the model was and the prompt's token count.
 - No API key ever reaches the popover - we're proud of this achievement as hermetic itself is a security-awareness tool, so we always try to act like one.
 
@@ -152,16 +152,16 @@ We gave hermetic just enough power to provide extended security, while limiting 
 - Routing rules and the fixes you apply (through Hermes' own config functions, shown before writing)
 - background tasks you chose to give your routing rules, kept in step when your main provider changes
 - archived skills
-- skill versions you ship or revert
+- skill fixes you apply and versions you revert
 - the guard's level and your guard rules
 - places you mark as expected (`hermetic/hdr/expected.json`)
 - test results.
-- Everything Hermetic records stays in `$HERMES_HOME/hermetic/` (ratings, tests, replay results, saved skill versions, routing history with each call's OpenRouter generation id, endpoint list snapshots, model versions and daily check results).
+- Everything Hermetic records stays in `$HERMES_HOME/hermetic/` (ratings, tests, replay results, tried fixes and their drafts, saved skill versions, routing history with each call's OpenRouter generation id, endpoint list snapshots, model versions and daily check results).
 
 
 ### What can run in the background
 
-- A thread checks every 5 minutes for skill changes made by the background review, and acts only if you turned automatic tests on. A short-lived thread stores the billed-spend snapshot.
+- A thread checks every 5 minutes for skill changes made by the background review, and acts only if you turned automatic tests on. The same thread tries a fix for a skill with 3 new failing tests, only if you turned that on. A short-lived thread stores the billed-spend snapshot.
 - At most once a minute, a short-lived thread checks that background tasks given your routing rules still match the main provider.
 - When the daily check is on, opening Costs starts a short-lived thread for it if the last run is a day old.
 

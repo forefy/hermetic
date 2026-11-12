@@ -235,7 +235,18 @@ async function loadAnalytics(profiles, days, prices) {
         }
         for (const d of (r && r.daily) || []) {
           const cur = daily.get(d.day) || { day: d.day, cost: 0, input: 0, output: 0, cache: 0, calls: 0, sessions: 0 }
-          const dayCost = blend ? costAt(blend, d.input_tokens, d.output_tokens, d.cache_read_tokens) : num(d.estimated_cost)
+          let dayCost = blend ? costAt(blend, d.input_tokens, d.output_tokens, d.cache_read_tokens) : num(d.estimated_cost)
+          // Sessions Hermes stored at $0 (subscription routes) still burned tokens: add their list-price
+          // equivalent for the day. The blend above already prices every token, so skip it then.
+          if (!blend) {
+            for (const [model, u] of Object.entries(d.unpriced || {})) {
+              const pr = priceOf(prices, model)
+              const extra = costAt(pr, u.input_tokens, u.output_tokens, u.cache_read_tokens)
+              if (extra == null) { unpriced = true; continue }
+              dayCost += extra
+              estimated.set(model, priceSource(prices, model))
+            }
+          }
           cur.cost += dayCost
           cur.input += num(d.input_tokens)
           cur.output += num(d.output_tokens)
@@ -295,6 +306,7 @@ const mapSessionRow = (s, profile) => ({
   active: !!s.is_active,
   provider: s.billing_provider || '',
   base: s.billing_base_url || '',
+  byDay: s.by_day || null,
   bulkResent: num(s.bulk_resent_tokens),
   bulky: num(s.bulk_tokens)
 })
@@ -914,7 +926,9 @@ const priceIdOf = (prices, model) => {
   }
   const tail = String(model).split('/').pop().toLowerCase()
   // Fireworks writes versions with a p for the dot: glm-5p3 is glm-5.3
-  return priceTail.get(tail) || priceTail.get(tail.replace(/(\d)p(\d)/g, '$1.$2')) || null
+  return priceTail.get(tail) || priceTail.get(tail.replace(/(\d)p(\d)/g, '$1.$2')) ||
+    // Claude subscription routes: "claude-sonnet-5-5[1m]" is claude-sonnet-5.5 (a dashed version, a context suffix)
+    priceTail.get(tail.replace(/\[[^\]]*\]$/, '').replace(/^(claude-[a-z]+)-(\d+)-(\d+)$/, '$1-$2.$3')) || null
 }
 // A model id that names the provider serving it (fireworks-ai/glm-5p3) is priced at that provider's own
 // OpenRouter endpoint: the model's list price is its cheapest provider's, often several times lower.
@@ -989,6 +1003,9 @@ const priceOf = (prices, model) => {
   const id = priceIdOf(prices, model)
   return id ? prices[id] : null
 }
+// Hermes stores one cost per session; the sessions route says what share of it fell on each local day.
+// A period counts only its own days of a long chat. Without that split (an older backend) the whole session counts.
+const periodShare = (s, days) => (s && s.byDay ? days.reduce((a, d) => a + num(s.byDay[d]), 0) : 1)
 const costAt = (p, input, output, cache) =>
   p ? (num(input) * p.in + num(output) * p.out + num(cache) * (p.cache != null ? p.cache : p.in)) / 1e6 : null
 
@@ -3774,7 +3791,8 @@ const Body = ({ meter, prices, threshold, retries, yaml, profile, profileLabel, 
   const rangeLabel = period === 'today' ? 'today' : windowStart ? dayLabel(windowStart) + ' – ' + dayLabel(lastDay) : dayLabel(m.days[0]) + ' – ' + dayLabel(lastDay)
   // chats billed through more than one provider: their list cost per provider
   const byProv = {}
-  for (const x of m.sessions) { const k = sessionProvider(x); if (k) byProv[k] = (byProv[k] || 0) + num(x.cost) }
+  const provDays = shown ? [shown] : m.days
+  for (const x of m.sessions) { const k = sessionProvider(x); if (k) byProv[k] = (byProv[k] || 0) + num(x.cost) * periodShare(x, provDays) }
   const provSplit = Object.entries(byProv).filter(([, v]) => v > 0).sort((a, b) => b[1] - a[1])
   const where = acct != null ? (nonOR > 0 || provSplit.length > 1 ? 'OpenRouter and others' : 'OpenRouter') : provSplit.length > 1 ? provSplit.length + ' providers' : scope === 'all' ? 'Hermes' : meter.providerName || 'Hermes'
   const headlineLabel = shown ? dayLabel(shown) + ' on Hermes' : rangeLabel + ' on ' + where

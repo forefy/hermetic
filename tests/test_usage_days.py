@@ -100,6 +100,41 @@ def test_sessions_wholly_before_the_period_are_left_out():
     assert r["daily"] == [] and r["by_model"] == []
 
 
+def test_zero_cost_sessions_report_their_tokens_per_model_and_day():
+    # a subscription session Hermes priced at $0 still has tokens: the desktop prices them at list price
+    free = session("sub", 5, replies(5, 0), cost=0.0, tokens=1000)
+    free["row"].update({"model": "gpt-5.5", "output_tokens": 200, "cache_read_tokens": 4000})
+    paid = session("paid", 0, replies(0), cost=3.0, tokens=500)
+    r = run(7, [free, paid])
+    by_day = {d["day"]: d for d in r["daily"]}
+    old, new = by_day[day_of(NOON - 5 * DAY)], by_day[today]
+    assert old["unpriced"] == {"gpt-5.5": {"input_tokens": 500, "output_tokens": 100, "cache_read_tokens": 2000}}, old.get("unpriced")
+    assert new["unpriced"] == {"gpt-5.5": {"input_tokens": 500, "output_tokens": 100, "cache_read_tokens": 2000}}
+    assert abs(new["estimated_cost"] - 3.0) < 1e-9, "a priced session never lands in the unpriced bucket"
+    assert "z-ai/glm-5.3" not in new["unpriced"]
+
+
+def test_sessions_route_says_which_share_of_a_session_fell_on_each_day():
+    # 4 replies: 2 five days ago, 1 three days ago, 1 today -> shares .5, .25, .25 (the same split /usage uses)
+    r = asyncio.run(_sessions_for([session("long", 5, replies(5, 5, 3, 0))]))
+    row = r["sessions"][0]
+    assert row["by_day"] == {day_of(NOON - 5 * DAY): 0.5, day_of(NOON - 3 * DAY): 0.25, today: 0.25}, row.get("by_day")
+    assert abs(sum(row["by_day"].values()) - 1.0) < 1e-9
+
+
+def test_sessions_route_session_without_replies_is_all_on_its_start_day():
+    r = asyncio.run(_sessions_for([session("quiet", 0, [{"role": "user", "timestamp": NOON}])]))
+    assert r["sessions"][0]["by_day"] == {today: 1.0}
+
+
+async def _sessions_for(sessions):
+    api._SESSION_CACHE.clear()
+    db = FakeDb(sessions)
+    api._open_sessions_db = lambda profile: db
+    api._sessions_store = lambda profile: "store"
+    return await api.sessions(days=30, profile=None)
+
+
 if __name__ == "__main__":
     failed = 0
     for name, fn in list(globals().items()):

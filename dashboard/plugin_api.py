@@ -439,6 +439,14 @@ async def usage(days: int = Query(30, ge=1, le=365), profile: Optional[str] = No
                     d["estimated_cost"] += float(r.get("estimated_cost_usd") or 0) * f
                     d["actual_cost"] += float(r.get("actual_cost_usd") or 0) * f
                     d["api_calls"] += round(int(r.get("api_call_count") or 0) * f)
+                    # Subscription routes (Codex, Claude) often store $0 despite real tokens. Hand the desktop
+                    # those tokens per model so it can price them at list price, only for sessions with no cost.
+                    if r.get("model") and not (float(r.get("estimated_cost_usd") or 0) or float(r.get("actual_cost_usd") or 0)):
+                        toks = {k: round(int(r.get(k) or 0) * f) for k in ("input_tokens", "output_tokens", "cache_read_tokens")}
+                        if any(toks.values()):
+                            u = d.setdefault("unpriced", {}).setdefault(r["model"], {"input_tokens": 0, "output_tokens": 0, "cache_read_tokens": 0})
+                            for k, v in toks.items():
+                                u[k] += v
                 # a session counts once: on the day it started, or on its first day in the period
                 daily[start_day if start_day in parts else min(parts)]["sessions"] += 1
                 share = sum(parts.values())
@@ -495,6 +503,12 @@ async def sessions(days: int = Query(30, ge=1, le=365), profile: Optional[str] =
                 row["last_activity_at"] = r.get("last_active") or r.get("last_activity_at") or r.get("started_at")
                 # old big tool output it kept re-sending, for the Costs fix that weighs Hermes' prune
                 row["bulk_resent_tokens"], row["bulk_tokens"] = _per_session(db, store, r, "bulk", _session_bulk)
+                # Hermes keeps one cost per session. This is the share of it that fell on each local day, the
+                # split /usage uses, so a period's total can count only its own part of a long chat.
+                spread = _per_session(db, store, r, "days", _session_days, every=True)
+                replies = sum(spread.values())
+                row["by_day"] = ({d: n / replies for d, n in spread.items()} if replies
+                                 else {time.strftime("%Y-%m-%d", time.localtime(float(r.get("started_at") or 0))): 1.0})
                 rows.append(row)
             rows.sort(key=lambda r: -(r["actual_cost_usd"] or r["estimated_cost_usd"] or 0))
             rows = rows[:1000]

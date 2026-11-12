@@ -24,8 +24,12 @@ const { priceIdOf, priceOf, loadVendorPrices, parseHopscotchPage, priceSource } 
     grabConst('priceOf')].join('\n') + '\nreturn { priceIdOf, priceOf, loadVendorPrices, parseHopscotchPage, priceSource }'
 )(ENDPOINTS, HOPSCOTCH)
 
-const prices = { 'z-ai/glm-5.3': {}, 'z-ai/glm-5.3:batch': {}, 'anthropic/claude-fable-5': {}, 'qwen/qwen3-235b-a22b': {} }
+const prices = { 'z-ai/glm-5.3': {}, 'z-ai/glm-5.3:batch': {}, 'anthropic/claude-fable-5': {}, 'qwen/qwen3-235b-a22b': {}, 'anthropic/claude-sonnet-5.5': {}, 'anthropic/claude-haiku-5.5': {} }
 const cases = [
+  // Claude subscription routes name models with dashes and a context suffix
+  ['Claude subscription id', 'claude-sonnet-5-5[1m]', 'anthropic/claude-sonnet-5.5'],
+  ['Claude dashed version', 'claude-haiku-5-5', 'anthropic/claude-haiku-5.5'],
+  ['a dashed id with no list price stays unknown', 'claude-opus-9-9[1m]', null],
   ['exact id', 'z-ai/glm-5.3', 'z-ai/glm-5.3'],
   ['other vendor prefix', 'fireworks-ai/glm-5.3', 'z-ai/glm-5.3'],
   // Fireworks writes the version dot as a p

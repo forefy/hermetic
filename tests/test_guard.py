@@ -7,13 +7,13 @@ import json
 import os
 import shutil
 import sys
-import tempfile
 import time
 from pathlib import Path
 
+from _home import throwaway_home
+
 HERE = Path(__file__).resolve().parent
-HOME = tempfile.mkdtemp(prefix="hermetic-guard-test-")
-os.environ["HERMES_HOME"] = HOME  # a throwaway profile, never the real one
+HOME = str(throwaway_home("hermetic-guard-test-"))  # a throwaway profile, never the real one
 
 spec = importlib.util.spec_from_file_location("hermetic_init", HERE.parent / "__init__.py")
 plugin = importlib.util.module_from_spec(spec)

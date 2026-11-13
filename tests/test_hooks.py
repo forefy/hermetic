@@ -5,16 +5,15 @@ Run inside Hermes' environment: bash ~/.hermes/hermes-agent/scripts/run-in-herme
 import asyncio
 import importlib.util
 import json
-import os
 import shutil
 import sys
-import tempfile
 import time
 from pathlib import Path
 
+from _home import throwaway_home
+
 HERE = Path(__file__).resolve().parent
-HOME = Path(tempfile.mkdtemp(prefix="hermetic-hooks-test-"))
-os.environ["HERMES_HOME"] = str(HOME)  # a throwaway home, never the real one
+HOME = throwaway_home("hermetic-hooks-test-")  # a throwaway home, never the real one
 
 spec = importlib.util.spec_from_file_location("plugin_api", HERE.parent / "dashboard" / "plugin_api.py")
 api = importlib.util.module_from_spec(spec)

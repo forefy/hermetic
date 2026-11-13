@@ -6,12 +6,12 @@ import importlib.util
 import os
 import shutil
 import sys
-import tempfile
 from pathlib import Path
 
+from _home import throwaway_home
+
 HERE = Path(__file__).resolve().parent
-HOME = Path(tempfile.mkdtemp(prefix="hermetic-paths-test-"))
-os.environ["HERMES_HOME"] = str(HOME)  # a throwaway profile, never the real one
+HOME = throwaway_home("hermetic-paths-test-")  # a throwaway profile, never the real one
 
 spec = importlib.util.spec_from_file_location("plugin_api", HERE.parent / "dashboard" / "plugin_api.py")
 api = importlib.util.module_from_spec(spec)

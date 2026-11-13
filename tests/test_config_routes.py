@@ -4,15 +4,14 @@ Run inside Hermes' environment: bash ~/.hermes/hermes-agent/scripts/run-in-herme
 """
 import asyncio
 import importlib.util
-import os
 import shutil
 import sys
-import tempfile
 from pathlib import Path
 
+from _home import throwaway_home
+
 HERE = Path(__file__).resolve().parent
-HOME = Path(tempfile.mkdtemp(prefix="hermetic-config-test-"))
-os.environ["HERMES_HOME"] = str(HOME)  # a throwaway home, never the real one
+HOME = throwaway_home("hermetic-config-test-")  # a throwaway home, never the real one
 (HOME / "config.yaml").write_text("model:\n  default: test/main\n")
 P2 = HOME / "profiles" / "p2"
 P2.mkdir(parents=True)

@@ -243,6 +243,7 @@ async function loadAnalytics(profiles, days, prices) {
               const pr = priceOf(prices, model)
               const extra = costAt(pr, u.input_tokens, u.output_tokens, u.cache_read_tokens)
               if (extra == null) { unpriced = true; continue }
+              if (!extra) continue // a free model adds nothing, so it is no estimate
               dayCost += extra
               estimated.set(model, priceSource(prices, model))
             }

@@ -127,6 +127,17 @@ def test_sessions_route_session_without_replies_is_all_on_its_start_day():
     assert r["sessions"][0]["by_day"] == {today: 1.0}
 
 
+def test_only_zero_cost_sessions_with_tokens_and_a_model_are_handed_over():
+    # nothing to price: no tokens, no model name, or a cost Hermes stored only as the billed one
+    empty = session("empty", 0, replies(0), cost=0.0, tokens=0)
+    nameless = session("nameless", 0, replies(0), cost=0.0, tokens=700)
+    nameless["row"]["model"] = None
+    billed = session("billed", 0, replies(0), cost=0.0, tokens=900)
+    billed["row"]["actual_cost_usd"] = 2.0
+    r = run(1, [empty, nameless, billed])
+    assert "unpriced" not in r["daily"][0], r["daily"][0].get("unpriced")
+
+
 async def _sessions_for(sessions):
     api._SESSION_CACHE.clear()
     db = FakeDb(sessions)

@@ -6,18 +6,17 @@ Run inside Hermes' environment: bash ~/.hermes/hermes-agent/scripts/run-in-herme
 import asyncio
 import importlib.util
 import json
-import os
 import shutil
 import sys
-import tempfile
 import threading
 import time
 import types
 from pathlib import Path
 
+from _home import throwaway_home
+
 HERE = Path(__file__).resolve().parent
-HOME = Path(tempfile.mkdtemp(prefix="hermetic-nous-test-"))
-os.environ["HERMES_HOME"] = str(HOME)  # a throwaway profile, never the real one
+HOME = throwaway_home("hermetic-nous-test-")  # a throwaway profile, never the real one
 
 spec = importlib.util.spec_from_file_location("hermetic_init", HERE.parent / "__init__.py")
 plugin = importlib.util.module_from_spec(spec)

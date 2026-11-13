@@ -3618,7 +3618,7 @@ const HdrHooks = ({ h, profile, onChanged }) => {
 const opIng = op => (op === 'read' ? 'reading ' : op === 'write' ? 'writing ' : 'using ')
 const inChat = chat => (chat ? ' (' + chat + ')' : '')
 
-// Above the popover for two minutes after a question ran out, so a block never passes unseen.
+// Above the popover after a question ran out, so a block never passes unseen: until you have seen it, two minutes at most.
 const RanOutNote = ({ o }) =>
   el('div', { role: 'status', style: { padding: '8px 16px', fontSize: 11, lineHeight: 1.45, color: C.sub, borderBottom: '1px solid ' + C.stroke, maxWidth: 400, boxSizing: 'border-box' } },
     el('span', { style: { color: C.bad } }, 'Blocked ' + opIng(o.op) + o.path),
@@ -5744,6 +5744,14 @@ const Chip = () => {
   const [asks, setAsks] = useState([])
   const askSeen = useRef(new Set())
   const [ranOut, setRanOut] = useState(null) // the last question that ran out (blocked, no answer) in the past 2 minutes
+  // seen once is enough: when the popover that showed the note closes, the note and its dot go
+  const [ranRead, setRanRead] = useState(null)
+  const ranShown = useRef(null)
+  const ranNote = ranOut && ranOut.id !== ranRead ? ranOut : null
+  useEffect(() => {
+    if (open) { if (ranNote && !asks.length && data) ranShown.current = ranNote.id }
+    else if (ranShown.current) { setRanRead(ranShown.current); ranShown.current = null }
+  }, [open, ranNote && ranNote.id, asks.length, !data])
   useEffect(() => {
     let live = true
     let have = ''
@@ -5807,7 +5815,7 @@ const Chip = () => {
         'button',
         {
           type: 'button',
-          title: asks.length ? 'hermetic guard: ' + (asks.length === 1 ? 'a question waits' : asks.length + ' questions wait') + ' for you' : ranOut ? 'hermetic guard blocked ' + opIng(ranOut.op) + ranOut.path + ', no answer in time' : error ? 'hermetic: ' + error : loading ? 'hermetic: loading' : 'hermetic, ' + periodName + ', ' + fmtUsd(spend) + (account ? '' : backendPatched ? ' (Hermes estimate)' : ' (Hermes estimate, backend plugin off)'),
+          title: asks.length ? 'hermetic guard: ' + (asks.length === 1 ? 'a question waits' : asks.length + ' questions wait') + ' for you' : ranNote ? 'hermetic guard blocked ' + opIng(ranNote.op) + ranNote.path + ', no answer in time' : error ? 'hermetic: ' + error : loading ? 'hermetic: loading' : 'hermetic, ' + periodName + ', ' + fmtUsd(spend) + (account ? '' : backendPatched ? ' (Hermes estimate)' : ' (Hermes estimate, backend plugin off)'),
           className: cn(
             'inline-flex h-full items-center gap-2 px-2 text-[0.6875rem] transition-colors',
             'hover:bg-(--chrome-action-hover)',
@@ -5818,7 +5826,7 @@ const Chip = () => {
             fontVariantNumeric: 'tabular-nums'
           }
         },
-        asks.length || ranOut ? el('span', { style: { width: 7, height: 7, borderRadius: 4, flex: 'none', background: asks.length ? C.warn : C.bad } }) : null,
+        asks.length || ranNote ? el('span', { style: { width: 7, height: 7, borderRadius: 4, flex: 'none', background: asks.length ? C.warn : C.bad } }) : null,
         ctxPct != null ? el(ContextGauge, { pct: ctxPct, used: ctxSrc.context_used, max: ctxSrc.context_max, threshold }) : null,
         el(Spark, { values: spark, tone: quotaLow ? 'bad' : tone, marks: resets.filter(r => r.cause === 'swap') }),
         el('span', { style: { color: tone ? 'inherit' : C.text } }, label),
@@ -5831,7 +5839,7 @@ const Chip = () => {
       asks.length
         ? el(AskCard, { key: asks[0].id, ask: asks[0], more: asks.length - 1, onAnswered: id => { asksWaiting.current = Math.max(0, asks.length - 1); setAsks(x => x.filter(a => a.id !== id)); if (asks.length <= 1) setOpen(false) } })
         : data
-        ? el('div', null, ranOut ? el(RanOutNote, { o: ranOut }) : null, el(Body, { meter: data, prices, threshold, retries, yaml, profile, profileLabel, refresh, rates, defaultModel, account, planLimits: limits, cheapest, orProfile, orAny, onPeriod: setChipPeriod, view, onView: pickView, scope, profileCount, onScope: setScope }))
+        ? el('div', null, ranNote ? el(RanOutNote, { o: ranNote }) : null, el(Body, { meter: data, prices, threshold, retries, yaml, profile, profileLabel, refresh, rates, defaultModel, account, planLimits: limits, cheapest, orProfile, orAny, onPeriod: setChipPeriod, view, onView: pickView, scope, profileCount, onScope: setScope }))
         : el('div', { style: { padding: 16, fontSize: 12, color: C.sub, width: 240 } }, error ? error : 'Loading…')
     )
   )

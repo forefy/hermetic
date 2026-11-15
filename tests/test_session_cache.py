@@ -41,11 +41,11 @@ def test_a_new_message_is_picked_up():
     db = FakeDb()
     api._per_session(db, "store-b", ROW, "calls", api._session_calls, every=True)
     db.messages.append({"id": 3, "role": "assistant", "content": "", "timestamp": 12.0,
-                        "tool_calls": [{"function": {"name": "terminal", "arguments": '{"command": "cat ~/.ssh/config"}'}}]})
+                        "tool_calls": [{"function": {"name": "terminal", "arguments": '{"command": "curl https://example.com/x > ~/.ssh/config"}'}}]})
     row = dict(ROW, last_active=12.0, message_count=3)
     calls = api._per_session(db, "store-b", row, "calls", api._session_calls, every=True)
     assert db.reads == 2 and [c[1] for c in calls] == ["skill_view", "terminal"]
-    assert calls[1][3][0] == [("~/.ssh/config", "read")], "touched paths are kept with the call"
+    assert calls[1][3] == (None, {"example.com"}), "hosts are kept with the call, paths wait until HDR shows it"
 
 
 def test_profiles_do_not_share_entries():

@@ -161,15 +161,48 @@ function carryOverLegacyStorage() {
 const OWN = '/api/plugins/hermetic'
 let pluginRest = null // ctx.rest, set in register()
 const inflight = new Map() // identical reads already on their way share one request
+// The first look after Hermes starts reads every recent chat once, which on a long history takes longer
+// than the app waits for one request. The backend then answers how far the read is and carries on, and
+// the read is asked for again until its answer comes. `reading.now` is the share read so far, for the
+// views: it only grows while a look lasts, though several reads start and end inside it.
+const reading = { now: null, asks: new Set(), subs: new Set() }
+const noteReading = (rel, r) => {
+  if (r) reading.asks.add(rel)
+  else reading.asks.delete(rel)
+  if (!reading.asks.size) reading.now = null
+  else if (r) reading.now = { share: Math.max(reading.now ? reading.now.share : 0, r.total > 0 ? r.done / r.total : 0) }
+  reading.subs.forEach(f => f(reading.now))
+}
+const untilRead = async (ask, note, pause = 300) => {
+  try {
+    for (;;) {
+      const r = await ask()
+      if (!(r && r.reading)) return r
+      note(r.reading)
+      await new Promise(done => setTimeout(done, pause))
+    }
+  } finally {
+    note(null)
+  }
+}
+const readingLine = r => 'Reading your history' + (r && r.share > 0 ? ' ' + Math.floor(100 * r.share) + '%' : '')
+const useReading = () => {
+  const [r, setR] = useState(reading.now)
+  useEffect(() => {
+    reading.subs.add(setR)
+    return () => { reading.subs.delete(setR) }
+  }, [])
+  return r
+}
 const api = req => {
   const path = String(req.path || '')
   if (!path.startsWith(OWN)) return Promise.reject(new Error('Not a hermetic route: ' + path))
   if (!pluginRest) return Promise.reject(new Error('hermetic is still loading'))
   let rel = path.slice(OWN.length) || '/'
   if (!/[?&]profile=/.test(rel)) rel += (rel.includes('?') ? '&' : '?') + 'profile=' + encodeURIComponent(req.profile || 'default')
-  const go = () => pluginRest(rel, { method: req.method, body: req.body, timeoutMs: req.timeoutMs })
-  if (req.method && String(req.method).toUpperCase() !== 'GET') { inflight.clear(); return go() } // later reads see the write
-  if (!inflight.has(rel)) inflight.set(rel, go().finally(() => inflight.delete(rel)))
+  const go = suffix => pluginRest(rel + suffix, { method: req.method, body: req.body, timeoutMs: req.timeoutMs })
+  if (req.method && String(req.method).toUpperCase() !== 'GET') { inflight.clear(); return go('') } // later reads see the write
+  if (!inflight.has(rel)) inflight.set(rel, untilRead(() => go('&reading=1'), r => noteReading(rel, r)).finally(() => inflight.delete(rel)))
   return inflight.get(rel)
 }
 // the last data each AAI and HDR view showed, per profile and period: shown at once on reopen
@@ -2355,12 +2388,16 @@ function ViewSkeleton() {
     const a = node.animate([{ opacity: 0.45 }, { opacity: 1 }, { opacity: 0.45 }], { duration: 1600, iterations: Infinity, easing: 'ease-in-out' })
     return () => a.cancel()
   }, [])
+  const reads = useReading()
   const bar = (w, h, extra) => el('div', { style: Object.assign({ width: w, height: h, borderRadius: 4, background: C.track }, extra) })
-  return el('div', { ref, role: 'status', 'aria-label': 'Loading', style: { marginTop: 14, display: 'flex', flexDirection: 'column', gap: 10 } },
-    el('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(3, minmax(0, 1fr))', gap: 8 } },
-      [0, 1, 2].map(i => bar('100%', 54, { key: i, borderRadius: 8 }))),
-    bar('40%', 10, { marginTop: 4 }),
-    ['92%', '78%', '85%', '64%'].map((w, i) => bar(w, 10, { key: i })))
+  return el('div', { role: 'status', 'aria-label': 'Loading', style: { marginTop: 14 } },
+    el('div', { ref, style: { display: 'flex', flexDirection: 'column', gap: 10 } },
+      el('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(3, minmax(0, 1fr))', gap: 8 } },
+        [0, 1, 2].map(i => bar('100%', 54, { key: i, borderRadius: 8 }))),
+      bar('40%', 10, { marginTop: 4 }),
+      ['92%', '78%', '85%', '64%'].map((w, i) => bar(w, 10, { key: i }))),
+    // outside the breathing blocks, so the line stays readable
+    reads ? el('div', { style: { fontSize: 11, color: C.sub, fontVariantNumeric: 'tabular-nums', marginTop: 12 } }, readingLine(reads)) : null)
 }
 const aTd = (v, color, left) => el('td', { style: { textAlign: left ? 'left' : 'right', color: color || C.sub, borderTop: '1px solid ' + C.stroke, padding: '4px 0', whiteSpace: 'nowrap', maxWidth: left ? 150 : undefined, overflow: 'hidden', textOverflow: 'ellipsis' } }, v)
 const aTable = (cols, rows) =>
@@ -5724,6 +5761,7 @@ const Chip = () => {
   const ctxSrc = (liveFocused && typeof liveFocused.context_percent === 'number' ? liveFocused : focusedUsage) || null
   const ctxPct = ctxSrc && typeof ctxSrc.context_percent === 'number' && ctxSrc.context_percent > 0 ? ctxSrc.context_percent : null
   const [open, setOpen] = useState(false)
+  const reads = useReading()
   const asksWaiting = useRef(0) // a guard question stays on screen until it is answered or runs out
   useEffect(() => { popPin.on = false }, [open])
   // Radix closes the popover on clicks inside the app's page. Clicks into an embedded view (the
@@ -5842,7 +5880,7 @@ const Chip = () => {
         ? el(AskCard, { key: asks[0].id, ask: asks[0], more: asks.length - 1, onAnswered: id => { asksWaiting.current = Math.max(0, asks.length - 1); setAsks(x => x.filter(a => a.id !== id)); if (asks.length <= 1) setOpen(false) } })
         : data
         ? el('div', null, ranNote ? el(RanOutNote, { o: ranNote }) : null, el(Body, { meter: data, prices, threshold, retries, yaml, profile, profileLabel, refresh, rates, defaultModel, account, planLimits: limits, cheapest, orProfile, orAny, onPeriod: setChipPeriod, view, onView: pickView, scope, profileCount, onScope: setScope }))
-        : el('div', { style: { padding: 16, fontSize: 12, color: C.sub, width: 240 } }, error ? error : 'Loading…')
+        : el('div', { style: { padding: 16, fontSize: 12, color: C.sub, width: 240, fontVariantNumeric: 'tabular-nums' } }, error ? error : reads ? readingLine(reads) : 'Loading…')
     )
   )
 }

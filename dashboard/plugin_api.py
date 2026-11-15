@@ -10,10 +10,13 @@ Profile scoping (?profile=) is applied by the dashboard before the handler runs.
 """
 
 import asyncio
+import contextvars
+import json as _json
 import math
 import os
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from itertools import zip_longest
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -156,9 +159,9 @@ def _db_messages(db, session_id, since=0.0, every=False, shown=False):
 
 
 # What a route needs from each session, kept until the session changes (new messages move its last
-# activity and count), so reopening HDR or AAI only re-reads the sessions with something new.
+# activity and count), so reopening Costs, HDR or AAI only re-reads the sessions with something new.
 _SESSION_CACHE: Dict[tuple, tuple] = {}
-_SESSION_CACHE_MAX = 5000
+_SESSION_CACHE_MAX = 20000  # a session has one entry for each kind of fact: room for a few thousand chats
 
 
 def _session_stamp(row):
@@ -187,9 +190,18 @@ def _per_session(db, store, row, kind, build, every=False, shown=False):
 
 
 def _session_calls(msgs):
-    """(ts, tool, args, (paths, hosts) it touches) for every tool call in a session, batches opened."""
-    return [(float(m.get("timestamp") or 0), name, args, _hdr_touches(name, args)) for m in msgs if m.get("tool_calls")
+    """[ts, tool, args, (paths, hosts) it touches] for every tool call in a session, batches opened.
+    The paths start as None and ``_hdr_calls`` fills them in when a call is first shown: they are
+    most of the work, and HDR shows them for the period on screen only."""
+    return [[float(m.get("timestamp") or 0), name, args, (None, _hdr_hosts(name, args))] for m in msgs if m.get("tool_calls")
             for name, args in _hdr_flatten(_calls_of(m.get("tool_calls")))]
+
+
+def _session_skills(msgs):
+    """(ts, skill) for every skill a session loaded, from the agent's own skill_view calls."""
+    return [(float(m.get("timestamp") or 0), args.get("name") or args.get("skill")) for m in msgs if m.get("tool_calls")
+            for name, args in _hdr_flatten(_calls_of(m.get("tool_calls")))
+            if name == "skill_view" and (args.get("name") or args.get("skill"))]
 
 
 _TURN_CHARS = 400
@@ -249,46 +261,128 @@ def _session_bulk(marks):
     return resent, bulky
 
 
-# Costs needs two small facts from every recent session: the days its model replied on and how big its
-# old tool output is. Neither needs a message's text, so each is read as one value beside the role of
-# every message, straight from the messages table and for all the sessions that changed at once. That
-# table is a Hermes internal: when it cannot be read this way the messages are loaded through SessionDB
-# instead, a session at a time, and /health says so.
-#   kind: (the value in SQL, extra SQL filter, the same value from a loaded message, SessionDB flags, build)
+# Costs, HDR and AAI each need a few small facts from every recent session: the days its model replied
+# on, how big its old tool output is, the tool calls it made, the turns of the conversation. None of them
+# needs the text of a tool result, which is most of a store, so each is read as a few columns straight
+# from the messages table, a session at a time. That table is a Hermes internal: when it cannot be read
+# this way the messages are loaded through SessionDB instead, and /health says so.
+
+def _model_only(notes):
+    """Whether a message's display notes mark it as one only the model sees: Hermes lists none of those."""
+    for _ in range(2):  # older rows hold the notes as JSON inside JSON
+        if isinstance(notes, str):
+            try:
+                notes = _json.loads(notes)
+            except ValueError:
+                return False
+    return isinstance(notes, dict) and bool(notes.get("model_only"))
+
+
+def _call_id(call):
+    """A tool call's own id, the way Hermes reads it to pair the call with its result."""
+    for raw in (call.get("call_id"), call.get("id")) if isinstance(call, dict) else ():
+        value = raw.strip() if isinstance(raw, str) else ""
+        if value:
+            return value.split("|", 1)[0].strip() or value
+    return ""
+
+
+def _quick_tool_calls(rows):
+    """The replies with tool calls that Hermes' full listing of a session holds, from every stored copy
+    (id, live, timestamp, tool_call_id, tool_calls, tool_name, content, display notes), oldest first.
+    Compaction and rewind leave copies behind. Hermes lists one of them, the live one or else the
+    newest, in the place of the first, and knows the copies of a reply by its call ids, since a prune
+    rewrites their arguments."""
+    kept, order = {}, []
+    for mid, live, ts, call_id, raw, tool_name, content, notes in rows:
+        if not float(ts or 0) > 0 or (notes and _model_only(notes)):
+            continue
+        calls = _calls_of(raw)
+        ids = tuple(_call_id(c) for c in calls)
+        key = (ts, call_id, ids, tool_name) if ids and all(ids) else (ts, call_id, raw, tool_name, content)
+        if key not in kept:
+            order.append(key)
+        if key not in kept or (live, mid) > kept[key][0]:
+            kept[key] = ((live, mid), {"timestamp": ts, "tool_calls": calls})
+    return [kept[key][1] for key in order]
+
+
+_TURN_READ = 2000  # characters read of a message for the 400 that are kept
+
+
+def _quick_turns(rows):
+    """``_session_turns`` of the conversation as shown, from (id, role, timestamp, text, tool calls that
+    load a skill), or None when a text is too spaced out to know its first 400 characters from the
+    part that was read."""
+    msgs = []
+    for mid, role, ts, text, calls in rows:
+        if not float(ts or 0) > 0:
+            continue
+        if isinstance(text, str) and text.startswith("\x00json:"):  # content in parts, kept as JSON behind a marker
+            try:
+                text = _json.loads(text[6:])
+            except ValueError:
+                pass
+        elif isinstance(text, str) and len(text) >= _TURN_READ and len(" ".join(text.split())) < _TURN_CHARS:
+            return None
+        msgs.append({"id": mid, "role": role, "timestamp": ts, "content": text, "tool_calls": calls})
+    return _session_turns(msgs)
+
+
+_LIGHT_CALLS = ("SELECT id, active, timestamp, tool_call_id, tool_calls, tool_name, content, display_metadata FROM messages"
+                " WHERE session_id = ? AND role = 'assistant' AND tool_calls IS NOT NULL")
+# One row for each message Hermes shows: of the copies that share a place in the conversation, the live
+# one or else the newest. Only user messages and replies are asked for, a part of the text is enough,
+# and tool calls matter only when they load a skill.
+_LIGHT_TURNS = """
+    SELECT m.id, m.role, m.timestamp,
+           CASE WHEN typeof(m.content) = 'text' AND instr(CAST(m.content AS BLOB), x'00') = 0
+                THEN substr(m.content, 1, %d) ELSE m.content END,
+           CASE WHEN m.tool_calls LIKE '%%skill_view%%' THEN m.tool_calls END
+    FROM messages AS m
+    WHERE m.session_id = ?1 AND m.role IN ('user', 'assistant') AND (m.active = 1 OR m.compacted = 1)
+      AND m.id = (SELECT c.id FROM messages AS c
+                  WHERE c.session_id = ?1 AND c.display_order = m.display_order AND (c.active = 1 OR c.compacted = 1)
+                    AND (c.display_metadata IS NULL OR COALESCE(json_extract(
+                         CASE WHEN json_valid(c.display_metadata) THEN c.display_metadata ELSE '{}' END, '$.model_only'), 0) = 0)
+                  ORDER BY c.active DESC, c.id DESC LIMIT 1)
+    ORDER BY m.display_order""" % _TURN_READ
+# Hermes gives every shown message its place when it next opens the chat itself. Until then it lists
+# the chat the long way, and so does this.
+_LIGHT_NO_PLACES = ("SELECT 1 FROM messages WHERE session_id = ? AND (active = 1 OR compacted = 1)"
+                    " AND (display_order IS NULL OR display_identity IS NULL) LIMIT 1")
+#   kind: (SQL for one session's rows, SQL that finds a session only Hermes can list, the kind from
+#          those rows, the kind from loaded messages, SessionDB flags for loading them)
 _LIGHT = {
-    "days": ("timestamp", " AND role = 'assistant'", lambda m: m.get("timestamp"), {"every": True}, _session_days),
-    "bulk": ("CASE WHEN role = 'tool' THEN length(content) ELSE 0 END", " AND active = 1",
-             lambda m: len(str(m.get("content") or "")) if m.get("role") == "tool" else 0, {}, _session_bulk),
+    "days": ("SELECT role, timestamp FROM messages WHERE session_id = ? AND role = 'assistant' AND timestamp > 0", None,
+             _session_days, lambda msgs: _session_days([(m.get("role"), m.get("timestamp")) for m in msgs]), {"every": True}),
+    "bulk": ("SELECT role, CASE WHEN role = 'tool' THEN length(content) ELSE 0 END FROM messages"
+             " WHERE session_id = ? AND active = 1 AND timestamp > 0 ORDER BY id", None, _session_bulk,
+             lambda msgs: _session_bulk([(m.get("role"), len(str(m.get("content") or "")) if m.get("role") == "tool" else 0) for m in msgs]), {}),
+    "calls": (_LIGHT_CALLS + " ORDER BY id", None, lambda rows: _session_calls(_quick_tool_calls(rows)), _session_calls, {"every": True}),
+    "skills": (_LIGHT_CALLS + " AND tool_calls LIKE '%skill_view%' ORDER BY id", None,
+               lambda rows: _session_skills(_quick_tool_calls(rows)), _session_skills, {"every": True}),
+    "shown_turns": (_LIGHT_TURNS, _LIGHT_NO_PLACES, _quick_turns, _session_turns, {"shown": True}),
 }
-_LIGHT_CHUNK = 400  # sessions per read, under SQLite's oldest limit on bound values
-_LIGHT_LOCK = threading.Lock()
+_LIGHT_LOCKS = {kind: threading.Lock() for kind in _LIGHT}
+_READING: Dict[tuple, list] = {}  # (store, kind) -> [sessions read, sessions to read] while a read runs
 
 
-def _light_read(store, kind, ids):
-    """{session id: [(role, value) per message, oldest first]} for ``ids``, read-only from the store's file."""
-    import sqlite3
-    value, where = _LIGHT[kind][:2]
-    out = {}
-    conn = sqlite3.connect(Path(store).resolve().as_uri() + "?mode=ro", uri=True, timeout=5)
-    try:
-        for i in range(0, len(ids), _LIGHT_CHUNK):
-            chunk = ids[i:i + _LIGHT_CHUNK]
-            sql = ("SELECT session_id, role, %s FROM messages WHERE session_id IN (%s) AND timestamp > 0%s ORDER BY id"
-                   % (value, ",".join("?" * len(chunk)), where))
-            for sid, role, v in conn.execute(sql, chunk):
-                out.setdefault(sid, []).append((role, v))
-    finally:
-        conn.close()
-    return out
+def _light_read(conn, kind, sid):
+    """One session's ``kind`` from a few columns of its messages, or None when only Hermes can list it."""
+    sql, unless, quick = _LIGHT[kind][:3]
+    if unless and conn.execute(unless, (sid,)).fetchone():
+        return None
+    return quick(conn.execute(sql, (sid,)).fetchall())
 
 
 def _light_sessions(db, store, rows, kind):
-    """{session id: its ``kind``} for ``rows``, kept until a session changes like ``_per_session``.
-    Requests that arrive together wait for one read and share it: a first load asks for three periods
-    and the chat list at once."""
-    _value, _where, of_message, flags, build = _LIGHT[kind]
+    """{session id: its ``kind``} for ``rows``, kept until a session changes. Requests that arrive
+    together wait for one read and share it: a first load asks for several periods at once."""
+    import sqlite3
+    full, flags = _LIGHT[kind][3:]
     out = {}
-    with _LIGHT_LOCK:
+    with _LIGHT_LOCKS[kind]:
         todo = []
         for r in rows:
             hit = _SESSION_CACHE.get((store, r["id"], kind))
@@ -296,25 +390,64 @@ def _light_sessions(db, store, rows, kind):
                 out[r["id"]] = hit[1]
             else:
                 todo.append(r)
-        if not todo:
-            return out
-        marks = None
-        for attempt in (1, 2):  # a read that lands on a checkpoint can fail once
-            try:
-                marks = _light_read(store, kind, [r["id"] for r in todo])
-                _DEGRADED.discard("message_table")
-                break
-            except Exception:
-                _DEGRADED.add("message_table")
-                if attempt == 1:
-                    time.sleep(0.05)
-        for r in todo:
-            if marks is None:
-                out[r["id"]] = _per_session(db, store, r, kind, lambda msgs: build([(m.get("role"), of_message(m)) for m in msgs]), **flags)
-            else:
-                out[r["id"]] = build(marks.get(r["id"], []))
-                _session_keep((store, r["id"], kind), _session_stamp(r), out[r["id"]])
+        conn, failed = None, 0
+        if todo:
+            _READING[(store, kind)] = [0, len(todo)]
+        try:
+            for r in todo:
+                value = None
+                while failed < 2:  # a read that lands on a checkpoint can fail once
+                    try:
+                        conn = conn or sqlite3.connect(Path(store).resolve().as_uri() + "?mode=ro", uri=True, timeout=5)
+                        value = _light_read(conn, kind, r["id"])
+                        break
+                    except Exception:
+                        failed += 1
+                        if conn is not None:
+                            conn.close()
+                            conn = None
+                        if failed < 2:
+                            time.sleep(0.05)
+                if value is None:
+                    value = _per_session(db, store, r, kind, full, **flags)
+                else:
+                    _session_keep((store, r["id"], kind), _session_stamp(r), value)
+                out[r["id"]] = value
+                _READING[(store, kind)][0] += 1
+        finally:
+            _READING.pop((store, kind), None)
+            if conn is not None:
+                conn.close()
+        if todo:
+            (_DEGRADED.add if failed > 1 else _DEGRADED.discard)("message_table")
     return out
+
+
+# The first look after Hermes starts reads every recent session once. On a long history that takes
+# longer than the app waits for one request (30 seconds), however quick each read is. So a route that
+# reads sessions answers within a few seconds either way: with its answer, or with how far the read is
+# while it carries on here, for the popover to ask again. Only a popover that knows to ask again gets
+# the second kind (``reading=1``).
+_ANSWERS: Dict[tuple, Any] = {}  # the work behind an answer, by route and arguments
+_ANSWER_POOL = ThreadPoolExecutor(max_workers=12, thread_name_prefix="hermetic-read")
+_ANSWER_WAIT_S = 3.0
+
+
+async def _answer(key, run, reading):
+    """``run()``'s answer, or {"reading": {done, total}} when ``reading`` is set and it takes a while."""
+    if not reading:
+        return await asyncio.to_thread(run)
+    work = _ANSWERS.get(key)
+    if work is None or work.done():  # what an earlier ask finished is kept per session, so this run is short
+        for k in [k for k, w in _ANSWERS.items() if w.done()]:
+            _ANSWERS.pop(k, None)
+        work = _ANSWERS[key] = _ANSWER_POOL.submit(contextvars.copy_context().run, run)
+    waiter = asyncio.wrap_future(work)
+    waiter.add_done_callback(lambda f: f.cancelled() or f.exception())  # an error nobody waited for stays quiet
+    if not (await asyncio.wait([waiter], timeout=_ANSWER_WAIT_S))[0]:
+        runs = list(_READING.values())
+        return {"reading": {"done": sum(r[0] for r in runs), "total": sum(r[1] for r in runs)}}
+    return work.result()
 
 
 def _sessions_store(profile):
@@ -485,7 +618,7 @@ async def config_raw_save(payload: Dict[str, Any] = Body(default={}), profile: O
 
 
 @router.get("/usage")
-async def usage(days: int = Query(30, ge=1, le=365), profile: Optional[str] = None):
+async def usage(days: int = Query(30, ge=1, le=365), profile: Optional[str] = None, reading: int = 0):
     """Tokens, cost and calls per local day and per model over the last ``days`` local days (today
     included), plus background tasks (titles, compression, review) per task. Hermes books a session's
     totals to the day it started; here each session is spread over the days it ran, by its model
@@ -558,11 +691,11 @@ async def usage(days: int = Query(30, ge=1, le=365), profile: Optional[str] = No
             return {"daily": [daily[k] for k in sorted(daily)], "by_model": by_model, "period_days": days}
         finally:
             db.close()
-    return await asyncio.to_thread(_run)
+    return await _answer(("usage", profile, days), _run, reading)
 
 
 @router.get("/sessions")
-async def sessions(days: int = Query(30, ge=1, le=365), profile: Optional[str] = None):
+async def sessions(days: int = Query(30, ge=1, le=365), profile: Optional[str] = None, reading: int = 0):
     def _run():
         db = _open_sessions_db(profile)
         try:
@@ -594,7 +727,7 @@ async def sessions(days: int = Query(30, ge=1, le=365), profile: Optional[str] =
         finally:
             db.close()
 
-    return await asyncio.to_thread(_run)
+    return await _answer(("sessions", profile, days), _run, reading)
 
 
 def _routing_file_for_profile(profile: Optional[str]):
@@ -1126,22 +1259,19 @@ def _aai_session_data(profile, since30):
     """Per session: title, start, calls; skill loads from the agent's own skill_view tool calls."""
     db = _open_sessions_db(profile)
     try:
-        sessions, titles, store = {}, {}, _sessions_store(profile)
-        for r in _db_sessions(db):
-            titles[r["id"]] = r.get("title")
-            if float(r.get("started_at") or 0) > since30:
-                s = sessions[r["id"]] = {"title": r.get("title") or "untitled", "start": r.get("started_at"), "calls": r.get("api_call_count") or 0, "skills": []}
-                for ts, name, args, _touched in _per_session(db, store, r, "calls", _session_calls, every=True):
-                    skill = name == "skill_view" and ts > since30 and (args.get("name") or args.get("skill"))
-                    if skill:
-                        s["skills"].append({"name": skill, "ts": ts})
+        rows = _db_sessions(db)
+        titles = {r["id"]: r.get("title") for r in rows}
+        recent = [r for r in rows if float(r.get("started_at") or 0) > since30]
+        loads = _light_sessions(db, _sessions_store(profile), recent, "skills")
+        sessions = {r["id"]: {"title": r.get("title") or "untitled", "start": r.get("started_at"), "calls": r.get("api_call_count") or 0,
+                              "skills": [{"name": skill, "ts": ts} for ts, skill in loads[r["id"]] if ts > since30]} for r in recent}
         return sessions, titles
     finally:
         db.close()
 
 
 @router.get("/aai")
-async def aai(days: int = Query(7, ge=1, le=90), profile: Optional[str] = None):
+async def aai(days: int = Query(7, ge=1, le=90), profile: Optional[str] = None, reading: int = 0):
     def _run():
         from hermes_cli.config import load_config_readonly
         _name, home = _profile_home(profile)
@@ -1219,7 +1349,7 @@ async def aai(days: int = Query(7, ge=1, le=90), profile: Optional[str] = None):
             "ledger_total": len(ledger),
         }
 
-    return await asyncio.to_thread(_run)
+    return await _answer(("aai", profile, days), _run, reading)
 
 
 def _aai_ratings(home):
@@ -1255,7 +1385,7 @@ def _aai_plain(text):
 
 @router.get("/aai/rate-queue")
 async def aai_rate_queue(n: int = Query(5, ge=1, le=20), first: Optional[str] = None, skip: Optional[str] = None,
-                         profile: Optional[str] = None):
+                         profile: Optional[str] = None, reading: int = 0):
     """Replies not yet rated: the ones you pushed back on first, taking turns with ones you moved on from
     without a complaint (the judge learns from both), then the rest, newest first in each. ``first`` puts
     one reply at the front (the corrections list opens it here), looked for as far back as that list goes.
@@ -1284,7 +1414,7 @@ async def aai_rate_queue(n: int = Query(5, ge=1, le=20), first: Optional[str] = 
                            "skill": x["skills"][0] if x["skills"] else None} for x in order[:n]],
                 "left": len(order), "ratings": _aai_rating_counts(ratings)}
 
-    return await asyncio.to_thread(_run)
+    return await _answer(("aai/rate-queue", profile, n, first, skip), _run, reading)
 
 
 @router.post("/aai/rate")
@@ -2795,9 +2925,10 @@ def _aai_replies(db, store, rows, since):
     to), your next message (id, ts, text) or None and whether it showed you were unhappy. Read from the
     conversation as shown, so compacted turns count too."""
     out = []
+    turns = _light_sessions(db, store, rows, "shown_turns")
     for r in rows:
         pending, skills, user_id, request = None, [], None, ""
-        for mid, role, ts, text, loaded in _per_session(db, store, r, "shown_turns", _session_turns, shown=True):
+        for mid, role, ts, text, loaded in turns[r["id"]]:
             if role == "user":
                 if _AAI_HERMES_NOTE.match(text):
                     continue
@@ -2814,7 +2945,7 @@ def _aai_replies(db, store, rows, since):
 
 
 @router.get("/aai/corrections")
-async def aai_corrections(days: int = Query(14, ge=1, le=90), profile: Optional[str] = None):
+async def aai_corrections(days: int = Query(14, ge=1, le=90), profile: Optional[str] = None, reading: int = 0):
     """Your messages that push back on the agent ("no, ...", "you forgot ...", "wtf, still broken"), with the reply
     they answer, until that reply is rated, kept as a test or dismissed."""
     def _run():
@@ -2833,7 +2964,7 @@ async def aai_corrections(days: int = Query(14, ge=1, le=90), profile: Optional[
         out = [x for x in out if x["correction_id"] not in gone and x["message_id"] not in done]
         out.sort(key=lambda x: -x["ts"])
         return {"items": out[:60]}
-    return await asyncio.to_thread(_run)
+    return await _answer(("aai/corrections", profile, days), _run, reading)
 
 
 @router.post("/aai/corrections/dismiss")
@@ -3064,6 +3195,7 @@ _HDR = _hdr_rules()
 _HDR_PATH, _HDR_CRED = _HDR.PATH, _HDR.CRED
 _hdr_host_ok, _hdr_op, _hdr_flatten, _hdr_tilde = _HDR.host_ok, _HDR.op, _HDR.flatten, _HDR.tilde
 _hdr_sensitive, _hdr_touches, _hdr_score = _HDR.sensitive, _HDR.touches, _HDR.score
+_hdr_paths, _hdr_hosts = _HDR.paths, _HDR.hosts
 
 
 def _hdr_yaml(path):
@@ -3084,19 +3216,23 @@ def _hdr_root(p):
     return "/" + (parts[1] if len(parts) > 1 else "")
 
 
-def _hdr_calls(profile, since):
-    """(session_id, title, ts, tool, args, base_url, (paths, hosts)) for every tool call since a time."""
+def _hdr_calls(profile, since, paths_from):
+    """(session_id, title, ts, tool, args, base_url, (paths, hosts)) for every tool call since a time,
+    the paths None before ``paths_from``."""
     db = _open_sessions_db(profile)
-    store = _sessions_store(profile)
     try:
-        rows = [(r["id"], r.get("title") or r["id"], r.get("billing_base_url") or "", _per_session(db, store, r, "calls", _session_calls, every=True))
-                for r in _db_sessions(db, since)]
+        rows = _db_sessions(db, since)
+        calls = _light_sessions(db, _sessions_store(profile), rows, "calls")
     finally:
         db.close()
-    for sid, title, base, calls in rows:
-        for ts, name, args, touched in calls:
+    for r in rows:
+        title, base = r.get("title") or r["id"], r.get("billing_base_url") or ""
+        for call in calls[r["id"]]:
+            ts, name, args, touched = call
             if ts > since:
-                yield sid, title, ts, name, args, base, touched
+                if touched[0] is None and ts >= paths_from:
+                    touched = call[3] = (_hdr_paths(name, args), touched[1])
+                yield r["id"], title, ts, name, args, base, touched
 
 
 def _hdr_services(calls):
@@ -3643,7 +3779,7 @@ async def hdr_expected(payload: Dict[str, Any] = Body(default={}), profile: Opti
 
 
 @router.get("/hdr")
-async def hdr(days: int = Query(7, ge=1, le=90), profile: Optional[str] = None):
+async def hdr(days: int = Query(7, ge=1, le=90), profile: Optional[str] = None, reading: int = 0):
     """Everything HDR shows, from Hermes' own records. Recording only."""
     def _run():
         _n, home = _profile_home(profile)
@@ -3655,7 +3791,7 @@ async def hdr(days: int = Query(7, ge=1, le=90), profile: Optional[str] = None):
                 cfg = {}
         now = time.time()
         since, learn = now - days * 86400, now - 90 * 86400
-        calls = list(_hdr_calls(profile, learn))
+        calls = list(_hdr_calls(profile, learn, since))
         first_call = min((c[2] for c in calls), default=now)
         learning = first_call > now - 7 * 86400
 
@@ -3775,7 +3911,7 @@ async def hdr(days: int = Query(7, ge=1, le=90), profile: Optional[str] = None):
             "guard": dict(_hdr_guard(home, since, titles), risky_calls=risky_calls),
         }
     try:
-        return await asyncio.to_thread(_run)
+        return await _answer(("hdr", profile, days), _run, reading)
     except Exception as exc:
         return {"error": f"{type(exc).__name__}: {exc}"[:240]}
 
@@ -3994,7 +4130,7 @@ def _q_version_events(versions):
 
 
 @router.get("/quality")
-async def quality(profile: Optional[str] = None):
+async def quality(profile: Optional[str] = None, reading: int = 0):
     """Per model and provider, the last 30 days by day: calls, replies, replies you pushed back on, output
     tokens, seconds, thinking tokens, cut-off answers and empty replies, with what each endpoint declares,
     the changes seen and the daily check's latest result. The popover picks the period and judges."""
@@ -4058,7 +4194,7 @@ async def quality(profile: Optional[str] = None):
         return {"models": out, "check": {"enabled": bool(settings.get("check")), "last": settings.get("last")},
                 "first_day": _q_day(since)}
 
-    return await asyncio.to_thread(_run)
+    return await _answer(("quality", profile), _run, reading)
 
 
 @router.post("/quality/check")

@@ -4,6 +4,7 @@ Shared by the HDR view (dashboard/plugin_api.py) and the guard hook (__init__.py
 call the same way. Pure functions, no Hermes imports.
 """
 import fnmatch
+import functools
 import json
 import os
 import re
@@ -54,21 +55,36 @@ REDIRECT = re.compile(r"(>>?|\btee(\s+-a)?)\s*['\"]?")
 EDITS = re.compile(r"\b(rm|chmod|chown|touch|mkdir|truncate|sed\s+-i\S*)\b")
 SEP = re.compile(r"[|;&\n]")
 SEPS = re.compile(r"[|;&\n]+")
+ESCAPED = re.compile(r"\\(.)")
+
+
+@functools.lru_cache(maxsize=32)
+def _writes_of(cmd):
+    """Where a command writes: (where each redirect's target starts, each editing command's end with
+    the end of its part of the line, the last word of each copy). Kept per command, since a command
+    is asked about once for every path it names."""
+    edits = []
+    for m in EDITS.finditer(cmd):
+        stop = SEP.search(cmd, m.end())
+        edits.append((m.end(), None if stop is None else stop.start()))
+    copies = set()
+    for seg in SEPS.split(cmd):
+        toks = seg.split()
+        if toks and toks[0] in ("cp", "mv", "install", "rsync", "ln", "ditto"):
+            copies.add(toks[-1].strip("'\""))
+    return [m.end() for m in REDIRECT.finditer(cmd)], edits, copies
 
 
 def op(cmd, raw):
     """write when the command redirects into, edits, or copies onto this path; otherwise read."""
-    if any(cmd.startswith(raw, m.end()) for m in REDIRECT.finditer(cmd)):
+    redirects, edits, copies = _writes_of(cmd)
+    if any(cmd.startswith(raw, end) for end in redirects):
         return "write"
-    for m in EDITS.finditer(cmd):
-        at, stop = cmd.find(raw, m.end()), SEP.search(cmd, m.end())
-        if at >= 0 and (stop is None or at <= stop.start()):
+    for end, stop in edits:
+        at = cmd.find(raw, end)
+        if at >= 0 and (stop is None or at <= stop):
             return "write"
-    for seg in SEPS.split(cmd):
-        toks = seg.split()
-        if toks and toks[0] in ("cp", "mv", "install", "rsync", "ln", "ditto") and toks[-1].strip("'\"") == raw:
-            return "write"
-    return "read"
+    return "write" if raw in copies else "read"
 
 
 # Code that only looks at a path: every line naming it runs one of these read-only commands (or a read-only
@@ -93,13 +109,20 @@ def _read_only_cmd(cmd):
     return bool(segs) and bool(READ_CMD.match(segs[0])) and all(READ_CMD.match(x) or FILTERS.match(x) for x in segs[1:])
 
 
+@functools.lru_cache(maxsize=32)
+def _code_lines(code):
+    """The lines of some code with quiet redirects dropped, or None when anything in it could write."""
+    clean = QUIET.sub(" ", code)
+    return None if WRITES.search(clean) else clean.splitlines()
+
+
 def code_op(code, raw):
     """read when the code only lists or reads this path with known read-only commands and writes nothing
     anywhere; otherwise code (treated as a write: what code does with a path can't be told for sure)."""
-    clean = QUIET.sub(" ", str(code or ""))
-    if WRITES.search(clean):
+    clean = _code_lines(str(code or ""))
+    if clean is None:
         return "code"
-    lines = [ln for ln in clean.splitlines() if raw in ln]
+    lines = [ln for ln in clean if raw in ln]
     for ln in lines:
         lits = [b for _q, b in LIT.findall(ln) if raw in b]
         if not lits:
@@ -143,12 +166,16 @@ def tilde(p):
 
 def home_text(t):
     """Text with the home folder written as ~, however it was named."""
-    return NAMED_HOME.sub("~/", HOME_VAR.sub("~", t))
+    if "HOME" in t:
+        t = HOME_VAR.sub("~", t)
+    return NAMED_HOME.sub("~/", t) if "~" in t else t
 
 
 def shell_text(cmd):
     """A command as the shell reads its paths: backslashes and quotes dropped, the home folder as ~."""
-    return home_text(re.sub(r"\\(.)", r"\1", cmd).replace("'", "").replace('"', ""))
+    if "\\" in cmd:
+        cmd = ESCAPED.sub(r"\1", cmd)
+    return home_text(cmd.replace("'", "").replace('"', ""))
 
 
 def _glob_place(p):
@@ -161,12 +188,18 @@ def _glob_place(p):
     return None
 
 
+# every watched place without its last slash: a path that starts with none of them is in none of them
+_WATCHED = tuple(prefix.rstrip("/") for prefix, _why, _base in SENSITIVE)
+
+
 def sensitive(p):
     """(why, base score) when a path is one HDR watches, else None."""
-    p = ANY_HOME.sub("~", p, count=1)
-    for prefix, why, base in SENSITIVE:
-        if p == prefix or p.startswith(prefix.rstrip("/") + "/") or (prefix.endswith("/") and p.startswith(prefix)):
-            return why, base
+    if p.startswith("/"):
+        p = ANY_HOME.sub("~", p, count=1)
+    if p.startswith(_WATCHED):
+        for prefix, why, base in SENSITIVE:
+            if p == prefix or p.startswith(prefix.rstrip("/") + "/") or (prefix.endswith("/") and p.startswith(prefix)):
+                return why, base
     if any(c in p for c in "*?["):
         hit = _glob_place(p)
         if hit:
@@ -181,40 +214,50 @@ def score(why, base, how):
     return min(100, base + 10) if how in ("write", "code") else (base if why in CRED else 30)
 
 
-def touches(name, args):
-    """(paths with op, hosts) one tool call names."""
-    paths, hosts = [], set()
-    texts, named, how_of = [], "", None
+def hosts(name, args):
+    """The hosts one tool call names."""
+    if name in FILE_TOOLS and args.get("path"):
+        texts = []
+    elif name == "terminal":
+        texts = [str(args.get("command") or "")]
+    elif name in ("execute_code", "browser_exec"):
+        texts = [str(args.get("code") or "")]
+    else:
+        texts = [v if isinstance(v, str) else json.dumps(v) for v in args.values() if isinstance(v, (str, list))]
+    return {h.lower() for t in texts for h in URL.findall(t) if host_ok(h)}
+
+
+def paths(name, args):
+    """The paths one tool call names, each with what the call does to it."""
+    out = []
+    named, how_of = "", None
     if name in FILE_TOOLS and args.get("path"):
         named = home_text(str(args["path"]))
-        paths.append((tilde(named), FILE_TOOLS[name]))
+        out.append((tilde(named), FILE_TOOLS[name]))
         how_of = lambda raw: FILE_TOOLS[name]
     elif name == "terminal":
-        cmd = str(args.get("command") or "")
-        named = shell_text(cmd)
-        paths += [(tilde(m.group(1)), op(named, m.group(1))) for m in PATH.finditer(named)]
+        named = shell_text(str(args.get("command") or ""))
+        out += [(tilde(m.group(1)), op(named, m.group(1))) for m in PATH.finditer(named)]
         if args.get("workdir"):
-            paths.append((tilde(home_text(str(args["workdir"]))), "workdir"))
-        texts.append(cmd)
+            out.append((tilde(home_text(str(args["workdir"]))), "workdir"))
         how_of = lambda raw: op(named, raw)
     elif name in ("execute_code", "browser_exec"):
-        code = str(args.get("code") or "")
-        named = home_text(code)
-        paths += [(tilde(m.group(1)), code_op(named, m.group(1))) for m in PATH.finditer(named)]
-        texts.append(code)
+        named = home_text(str(args.get("code") or ""))
+        out += [(tilde(m.group(1)), code_op(named, m.group(1))) for m in PATH.finditer(named)]
         how_of = lambda raw: code_op(named, raw)
-    else:
-        texts += [v if isinstance(v, str) else json.dumps(v) for v in args.values() if isinstance(v, (str, list))]
     # a key place named only in pieces or relative to the home folder: the place itself, once
-    seen = {folder_of(ANY_HOME.sub("~", p, count=1)) for p, _ in paths if sensitive(p)}
+    seen = {folder_of(ANY_HOME.sub("~", p, count=1)) for p, _ in out if sensitive(p)}
     for m in KEY_PLACES.finditer(named):
         place = "~/" + m.group(1)
         if place not in seen:
             seen.add(place)
-            paths.append((place, how_of(m.group(1))))
-    for t in texts:
-        hosts.update(h.lower() for h in URL.findall(t) if host_ok(h))
-    return paths, hosts
+            out.append((place, how_of(m.group(1))))
+    return out
+
+
+def touches(name, args):
+    """(paths with op, hosts) one tool call names."""
+    return paths(name, args), hosts(name, args)
 
 
 def guarded(hit):
@@ -263,7 +306,7 @@ def rule_covers(rule, hit, session_id=""):
 def risky(name, args):
     """Every sensitive place one tool call touches, as {path, op, why, score}, highest score first."""
     out = []
-    for p, how in touches(name, args if isinstance(args, dict) else {})[0]:
+    for p, how in paths(name, args if isinstance(args, dict) else {}):
         s = sensitive(p)
         if s:
             out.append({"path": p, "op": how, "why": s[0], "score": score(s[0], s[1], how)})

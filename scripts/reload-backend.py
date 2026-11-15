@@ -2,8 +2,10 @@
 """Load backend changes (routes, hooks, guard rules) into a running Hermes without quitting the app.
 
 Hermes 0.22 and later serve the desktop app from the gateway service. This asks Hermes to restart it with
-`hermes gateway restart`, which refuses while a turn, scheduled job or background task is live, and
-retries until Hermes is quiet. It also waits for any open guard question, which a restart would drop.
+`hermes gateway restart`, which refuses while a turn or scheduled job is live, and retries until Hermes
+is quiet. A restart also ends every command the agent left running in the background, and Hermes does not
+count those as live, so this waits for them itself. It waits for any open guard question too, which a
+restart would drop.
 
 Older Hermes Desktop runs plugins inside its own backend. There this waits until no chat is working, in
 every profile, then ends the backend, and the app starts a new one. Chats reconnect on their own either way.
@@ -74,6 +76,31 @@ def open_questions(home):
     return out
 
 
+def background_commands(home):
+    """Commands the agent left running in the background, in every profile. Hermes ends them when its
+    backend restarts, and the chat that started one keeps waiting for a result that never comes."""
+    out = []
+    for h in homes(home):
+        try:
+            with open(os.path.join(h, "processes.json"), encoding="utf-8") as fh:
+                rows = json.load(fh)
+        except (OSError, ValueError):
+            continue
+        for r in rows if isinstance(rows, list) else []:
+            if not isinstance(r, dict):
+                continue
+            pid = r.get("pid")
+            if os.name == "posix" and r.get("pid_scope", "host") == "host" and isinstance(pid, int):
+                try:
+                    os.kill(pid, 0)
+                except ProcessLookupError:
+                    continue  # it ended and Hermes has not tidied its list yet
+                except OSError:
+                    pass
+            out.append("background command: " + " ".join(str(r.get("command") or "").split())[:60])
+    return out
+
+
 def working_chats(home):
     busy, now = [], time.time()
     for h in homes(home):
@@ -122,7 +149,7 @@ def main():
     deadline, said = time.time() + args.wait, None
     while True:
         rows = processes()
-        busy = open_questions(home)
+        busy = open_questions(home) + background_commands(home)
         if old:
             pids = backends(rows)
             if not pids:

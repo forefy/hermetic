@@ -4937,7 +4937,8 @@ const RoutingSection = ({ policyOn = true, providerName, rows, since, recording,
     profile_scope: 'profile sync',
     routing_hook: 'routing rules',
     per_model_routing: 'per-model rules',
-    account_usage: 'billing'
+    account_usage: 'billing',
+    message_table: 'quick loading'
   }
   const degraded = (health || []).map(k => HEALTH_LABEL[k] || k)
   const auxDrift = !!(aux && aux.enabled && ((aux.out_of_sync || []).length || (aux.stale || []).length))

@@ -20,7 +20,8 @@ day_of = lambda ts: time.strftime("%Y-%m-%d", time.localtime(ts))
 
 
 def replies(*days_ago):
-    return [{"role": "assistant", "timestamp": NOON - n * DAY} for n in days_ago]
+    # a second apart: two replies never share a timestamp, a stored copy of one reply does
+    return [{"role": "assistant", "timestamp": NOON - n * DAY + i} for i, n in enumerate(days_ago)]
 
 
 class FakeDb:
@@ -86,13 +87,13 @@ def test_each_model_says_where_it_was_billed():
 
 
 def test_old_big_tool_output_is_counted_per_later_call():
-    big = {"role": "tool", "content": "x" * 40_000}  # 10k tokens, over the 8,000-character prune size
-    small = {"role": "tool", "content": "x" * 4_000}
-    msgs = [big, small] + [{"role": "assistant"}] * 50
-    resent, bulky = api._session_bulk(msgs)
+    big = ("tool", 40_000)  # 10k tokens, over the 8,000-character prune size
+    small = ("tool", 4_000)
+    marks = [big, small] + [("assistant", 0)] * 50
+    resent, bulky = api._session_bulk(marks)
     # the 20 messages after it are Hermes' protected tail; the replies at positions 21 to 51 come after that
     assert bulky == 10_000 and resent == 10_000 * 31, (resent, bulky)
-    assert api._session_bulk([big] + [{"role": "assistant"}] * 20) == (0, 0), "nothing past the protected tail"
+    assert api._session_bulk([big] + [("assistant", 0)] * 20) == (0, 0), "nothing past the protected tail"
 
 
 def test_sessions_wholly_before_the_period_are_left_out():

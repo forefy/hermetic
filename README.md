@@ -139,7 +139,7 @@ Network calls are only done to supported providers (e.g. OpenRouter) to get late
 
 We gave hermetic just enough power to provide extended security, while limiting anything that is not needed for these ops.
 
-- Hermes' session database (read-only, through Hermes' `SessionDB`)
+- Hermes' session database (read-only, through Hermes' `SessionDB`). For Costs it also reads each message's role, time and tool output size straight from that database, read-only, so a big history loads without opening every message.
 - `config.yaml`
 - the skills and their change history
 - scheduled jobs

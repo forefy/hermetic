@@ -12,6 +12,7 @@ Profile scoping (?profile=) is applied by the dashboard before the handler runs.
 import asyncio
 import math
 import os
+import threading
 import time
 from itertools import zip_longest
 from pathlib import Path
@@ -160,20 +161,28 @@ _SESSION_CACHE: Dict[tuple, tuple] = {}
 _SESSION_CACHE_MAX = 5000
 
 
-def _per_session(db, store, row, kind, build, every=False, shown=False):
-    """``build(messages)`` for one session, cached per store (a profile's state.db) and kind."""
-    key = (store, row["id"], kind)
-    stamp = (row.get("last_active"), row.get("message_count"), row.get("api_call_count"))
-    hit = _SESSION_CACHE.get(key)
-    if hit and hit[0] == stamp:
-        return hit[1]
-    value = build(_db_messages(db, row["id"], every=every, shown=shown))
+def _session_stamp(row):
+    return (row.get("last_active"), row.get("message_count"), row.get("api_call_count"))
+
+
+def _session_keep(key, stamp, value):
     if len(_SESSION_CACHE) >= _SESSION_CACHE_MAX:
         try:
             _SESSION_CACHE.pop(next(iter(_SESSION_CACHE)))
         except (StopIteration, KeyError, RuntimeError):
             pass
     _SESSION_CACHE[key] = (stamp, value)
+
+
+def _per_session(db, store, row, kind, build, every=False, shown=False):
+    """``build(messages)`` for one session, cached per store (a profile's state.db) and kind."""
+    key = (store, row["id"], kind)
+    stamp = _session_stamp(row)
+    hit = _SESSION_CACHE.get(key)
+    if hit and hit[0] == stamp:
+        return hit[1]
+    value = build(_db_messages(db, row["id"], every=every, shown=shown))
+    _session_keep(key, stamp, value)
     return value
 
 
@@ -204,14 +213,15 @@ def _session_turns(msgs):
     return out
 
 
-def _session_days(msgs):
-    """{local day: model replies that day} for one session. Hermes keeps a single token and cost total
-    per session, so the usage route spreads it over the days the session actually ran."""
+def _session_days(marks):
+    """{local day: model replies that day} for one session, from (role, timestamp) per message. Hermes
+    keeps a single token and cost total per session, so the usage route spreads it over the days the
+    session actually ran. A reply stored more than once counts once: compaction and rewind both leave
+    a copy behind, with the same timestamp."""
     out = {}
-    for m in msgs:
-        if m.get("role") == "assistant":
-            day = time.strftime("%Y-%m-%d", time.localtime(float(m.get("timestamp") or 0)))
-            out[day] = out.get(day, 0) + 1
+    for ts in {ts for role, ts in marks if role == "assistant"}:
+        day = time.strftime("%Y-%m-%d", time.localtime(float(ts or 0)))
+        out[day] = out.get(day, 0) + 1
     return out
 
 
@@ -221,25 +231,90 @@ _PRUNE_MIN_CHARS = 8000
 _PRUNE_PROTECT = 20
 
 
-def _session_bulk(msgs):
-    """(tokens re-sent, tokens of old big tool output) for one session: every tool result over 8,000
-    characters, counted once for each model call more than 20 messages after it, the calls a prune
-    would have spared it. Characters / 4 as tokens; the active history only, so what compaction already
-    removed is not counted."""
+def _session_bulk(marks):
+    """(tokens re-sent, tokens of old big tool output) for one session, from (role, characters of tool
+    output) per message: every tool result over 8,000 characters, counted once for each model call more
+    than 20 messages after it, the calls a prune would have spared it. Characters / 4 as tokens; the
+    active history only, so what compaction already removed is not counted."""
     import bisect
-    replies = [i for i, m in enumerate(msgs) if m.get("role") == "assistant"]
+    replies = [i for i, (role, _size) in enumerate(marks) if role == "assistant"]
     resent = bulky = 0
-    for i, m in enumerate(msgs):
-        if m.get("role") != "tool":
-            continue
-        size = len(str(m.get("content") or ""))
-        if size <= _PRUNE_MIN_CHARS:
+    for i, (role, size) in enumerate(marks):
+        if role != "tool" or (size or 0) <= _PRUNE_MIN_CHARS:
             continue
         later = len(replies) - bisect.bisect_right(replies, i + _PRUNE_PROTECT)
         if later > 0:
             bulky += size // 4
             resent += (size // 4) * later
     return resent, bulky
+
+
+# Costs needs two small facts from every recent session: the days its model replied on and how big its
+# old tool output is. Neither needs a message's text, so each is read as one value beside the role of
+# every message, straight from the messages table and for all the sessions that changed at once. That
+# table is a Hermes internal: when it cannot be read this way the messages are loaded through SessionDB
+# instead, a session at a time, and /health says so.
+#   kind: (the value in SQL, extra SQL filter, the same value from a loaded message, SessionDB flags, build)
+_LIGHT = {
+    "days": ("timestamp", " AND role = 'assistant'", lambda m: m.get("timestamp"), {"every": True}, _session_days),
+    "bulk": ("CASE WHEN role = 'tool' THEN length(content) ELSE 0 END", " AND active = 1",
+             lambda m: len(str(m.get("content") or "")) if m.get("role") == "tool" else 0, {}, _session_bulk),
+}
+_LIGHT_CHUNK = 400  # sessions per read, under SQLite's oldest limit on bound values
+_LIGHT_LOCK = threading.Lock()
+
+
+def _light_read(store, kind, ids):
+    """{session id: [(role, value) per message, oldest first]} for ``ids``, read-only from the store's file."""
+    import sqlite3
+    value, where = _LIGHT[kind][:2]
+    out = {}
+    conn = sqlite3.connect(Path(store).resolve().as_uri() + "?mode=ro", uri=True, timeout=5)
+    try:
+        for i in range(0, len(ids), _LIGHT_CHUNK):
+            chunk = ids[i:i + _LIGHT_CHUNK]
+            sql = ("SELECT session_id, role, %s FROM messages WHERE session_id IN (%s) AND timestamp > 0%s ORDER BY id"
+                   % (value, ",".join("?" * len(chunk)), where))
+            for sid, role, v in conn.execute(sql, chunk):
+                out.setdefault(sid, []).append((role, v))
+    finally:
+        conn.close()
+    return out
+
+
+def _light_sessions(db, store, rows, kind):
+    """{session id: its ``kind``} for ``rows``, kept until a session changes like ``_per_session``.
+    Requests that arrive together wait for one read and share it: a first load asks for three periods
+    and the chat list at once."""
+    _value, _where, of_message, flags, build = _LIGHT[kind]
+    out = {}
+    with _LIGHT_LOCK:
+        todo = []
+        for r in rows:
+            hit = _SESSION_CACHE.get((store, r["id"], kind))
+            if hit and hit[0] == _session_stamp(r):
+                out[r["id"]] = hit[1]
+            else:
+                todo.append(r)
+        if not todo:
+            return out
+        marks = None
+        for attempt in (1, 2):  # a read that lands on a checkpoint can fail once
+            try:
+                marks = _light_read(store, kind, [r["id"] for r in todo])
+                _DEGRADED.discard("message_table")
+                break
+            except Exception:
+                _DEGRADED.add("message_table")
+                if attempt == 1:
+                    time.sleep(0.05)
+        for r in todo:
+            if marks is None:
+                out[r["id"]] = _per_session(db, store, r, kind, lambda msgs: build([(m.get("role"), of_message(m)) for m in msgs]), **flags)
+            else:
+                out[r["id"]] = build(marks.get(r["id"], []))
+                _session_keep((store, r["id"], kind), _session_stamp(r), out[r["id"]])
+    return out
 
 
 def _sessions_store(profile):
@@ -422,10 +497,12 @@ async def usage(days: int = Query(30, ge=1, le=365), profile: Optional[str] = No
             start = time.mktime(time.strptime(first_day, "%Y-%m-%d"))
             store = _sessions_store(profile)
             daily, models, aux = {}, {}, {}
-            for r in _db_sessions(db, start):
+            rows = _db_sessions(db, start)
+            spreads = _light_sessions(db, store, rows, "days")
+            for r in rows:
                 started = float(r.get("started_at") or 0)
                 start_day = time.strftime("%Y-%m-%d", time.localtime(started))
-                spread = _per_session(db, store, r, "days", _session_days, every=True)
+                spread = spreads[r["id"]]
                 replies = sum(spread.values())
                 parts = {d: n / replies for d, n in spread.items()} if replies else {start_day: 1.0}
                 parts = {d: f for d, f in parts.items() if d >= first_day}
@@ -495,17 +572,18 @@ async def sessions(days: int = Query(30, ge=1, le=365), profile: Optional[str] =
             counts = ("api_call_count", "message_count", "input_tokens", "output_tokens", "cache_read_tokens", "reasoning_tokens")
             rows = []
             store = _sessions_store(profile)
-            for r in _db_sessions(db, cutoff):
-                if not r.get("api_call_count"):
-                    continue
+            listed = [r for r in _db_sessions(db, cutoff) if r.get("api_call_count")]
+            bulk = _light_sessions(db, store, listed, "bulk")
+            spreads = _light_sessions(db, store, listed, "days")
+            for r in listed:
                 row = {k: r.get(k) for k in keys}
                 row.update({k: r.get(k) or 0 for k in counts})
                 row["last_activity_at"] = r.get("last_active") or r.get("last_activity_at") or r.get("started_at")
                 # old big tool output it kept re-sending, for the Costs fix that weighs Hermes' prune
-                row["bulk_resent_tokens"], row["bulk_tokens"] = _per_session(db, store, r, "bulk", _session_bulk)
+                row["bulk_resent_tokens"], row["bulk_tokens"] = bulk[r["id"]]
                 # Hermes keeps one cost per session. This is the share of it that fell on each local day, the
                 # split /usage uses, so a period's total can count only its own part of a long chat.
-                spread = _per_session(db, store, r, "days", _session_days, every=True)
+                spread = spreads[r["id"]]
                 replies = sum(spread.values())
                 row["by_day"] = ({d: n / replies for d, n in spread.items()} if replies
                                  else {time.strftime("%Y-%m-%d", time.localtime(float(r.get("started_at") or 0))): 1.0})

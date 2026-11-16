@@ -14,6 +14,7 @@ import contextvars
 import json as _json
 import math
 import os
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -545,15 +546,37 @@ def _snapshot_fields(snap, extra=None):
                          "detail": w.detail, "scope": w.scope} for w in snap.windows] + ([extra["window"]] if extra.get("window") else [])}
 
 
+def _account_provider(cfg, profile):
+    """The provider whose account a profile's calls are charged to. A config can leave the choice to Hermes
+    (``provider: auto``, or none at all): then the endpoint it names tells, and failing that where the
+    profile's latest chat was billed."""
+    model_cfg = cfg.get("model") if isinstance(cfg.get("model"), dict) else {}
+    provider = str(model_cfg.get("provider") or "").strip()
+    if provider.lower() not in ("", "auto"):
+        return provider
+    host = urlparse(str(model_cfg.get("base_url") or "")).hostname or ""
+    for site, name in (("openrouter.ai", "openrouter"), ("nousresearch.com", "nous")):
+        if host == site or host.endswith("." + site):
+            return name
+    try:
+        db = _open_sessions_db(profile)
+        try:
+            rows = [r for r in _db_sessions(db, time.time() - 30 * 86400) if r.get("billing_provider")]
+        finally:
+            db.close()
+    except Exception:
+        return ""
+    latest = max(rows, key=lambda r: float(r.get("last_active") or r.get("started_at") or 0), default=None)
+    return str((latest or {}).get("billing_provider") or "").strip().lower()
+
+
 @router.get("/account/usage")
 async def account_usage(profile: Optional[str] = None):
     from agent.account_usage import render_account_usage_lines
     from hermes_cli.config import load_config_readonly
 
     def _run():
-        cfg = load_config_readonly() or {}
-        model_cfg = cfg.get("model") if isinstance(cfg.get("model"), dict) else {}
-        provider = str((model_cfg or {}).get("provider") or "").strip()
+        provider = _account_provider(load_config_readonly() or {}, profile)
         if not provider:
             return {"provider": None, "lines": [], "account": None}
         key = (profile or "", provider)
@@ -730,6 +753,69 @@ async def sessions(days: int = Query(30, ge=1, le=365), profile: Optional[str] =
     return await _answer(("sessions", profile, days), _run, reading)
 
 
+# hermetic's call log gains a line with every model call, and is replaced by a new file only when rows
+# older than 90 days are dropped. So it is parsed once and then read on from where the last read
+# stopped, instead of whole on every look. A call is kept as a tuple of the fields read back, with one
+# copy of each repeated name: about 9 MB for 24,000 calls, where whole rows took 38 MB.
+_CALL_FIELDS = ("ts", "session", "platform", "model", "upstream", "input", "output", "cache", "reasoning",
+                "secs", "finish", "empty", "mw", "gen")
+_CALL_SHARED = {"session", "platform", "model", "upstream", "finish"}
+(_C_TS, _C_SESSION, _C_PLATFORM, _C_MODEL, _C_UPSTREAM, _C_INPUT, _C_OUTPUT, _C_CACHE, _C_REASONING,
+ _C_SECS, _C_FINISH, _C_EMPTY, _C_MW, _C_GEN) = range(len(_CALL_FIELDS))
+_CALLS: Dict[str, tuple] = {}  # path -> (file id, bytes read, calls, its first bytes and those just before where reading stopped)
+_CALLS_LOCK = threading.Lock()
+
+
+def _call_tuple(r):
+    try:
+        ts = float(r.get("ts") or 0)
+    except (TypeError, ValueError):
+        return None
+    return (ts,) + tuple(sys.intern(v) if k in _CALL_SHARED and isinstance(v, str) else v
+                         for k, v in ((k, r.get(k)) for k in _CALL_FIELDS[1:]))
+
+
+def _call_rows(path):
+    """The recorded calls in ``path``, oldest first, as ``_CALL_FIELDS`` tuples (None where a row has no
+    such field). Shared between callers: the list handed out is never changed afterwards."""
+    key = str(path)
+    with _CALLS_LOCK:
+        try:
+            st = os.stat(path)
+        except OSError:
+            _CALLS.pop(key, None)
+            return []
+        ino, offset, rows, (head, mark) = _CALLS.get(key) or (None, 0, [], (b"", b""))
+        with open(path, "rb") as fh:
+            if offset:
+                # read on only from the same file, grown at its end: a new file, or one written over in
+                # place, is read whole
+                same = ino == st.st_ino and st.st_size >= offset and fh.read(len(head)) == head
+                fh.seek(offset - len(mark))
+                if not (same and fh.read(len(mark)) == mark):
+                    offset, rows, mark = 0, [], b""
+            if st.st_size > offset:
+                fh.seek(offset)
+                chunk = fh.read(st.st_size - offset)
+                end = chunk.rfind(b"\n") + 1  # a line still being written is read next time
+                if end:
+                    rows = list(rows)  # a list handed out earlier stays as it was
+                    for line in chunk[:end].splitlines():
+                        try:
+                            r = _json.loads(line)
+                        except ValueError:
+                            continue
+                        t = _call_tuple(r) if isinstance(r, dict) else None
+                        if t is not None:
+                            rows.append(t)
+                    if not offset:
+                        head = chunk[:64]
+                    offset += end
+                    mark = (mark + chunk[:end])[-64:]
+        _CALLS[key] = (st.st_ino, offset, rows, (head, mark))
+        return rows
+
+
 def _routing_file_for_profile(profile: Optional[str]):
     _name, home = _profile_home(profile)
     return _data_dir(home) / "routing.jsonl"
@@ -737,8 +823,6 @@ def _routing_file_for_profile(profile: Optional[str]):
 
 @router.get("/routing")
 async def routing(days: int = Query(30, ge=1, le=365), profile: Optional[str] = None):
-    import json as _json
-
     def _run():
         path = _routing_file_for_profile(profile)
         if not path.exists():
@@ -747,36 +831,31 @@ async def routing(days: int = Query(30, ge=1, le=365), profile: Optional[str] = 
         agg: Dict[tuple, Dict[str, Any]] = {}
         since = None
         calls = 0
-        with open(path, encoding="utf-8") as fh:
-            for line in fh:
-                try:
-                    r = _json.loads(line)
-                except Exception:
-                    continue
-                ts = float(r.get("ts") or 0)
-                if since is None or ts < since:
-                    since = ts
-                if ts < cutoff:
-                    continue
-                day = time.strftime("%Y-%m-%d", time.localtime(ts))
-                key = (day, r.get("model") or "", r.get("upstream") or "", r.get("platform") or "")
-                a = agg.get(key)
-                if a is None:
-                    a = agg[key] = {"day": day, "model": key[1], "upstream": key[2], "platform": key[3],
-                                    "calls": 0, "input": 0, "output": 0, "cache": 0, "reasoning": 0, "secs": 0.0,
-                                    "sessions": set(), "mw_checked": 0, "mw_missing": 0}
-                a["calls"] += 1
-                calls += 1
-                a["input"] += int(r.get("input") or 0)
-                a["output"] += int(r.get("output") or 0)
-                a["cache"] += int(r.get("cache") or 0)
-                a["reasoning"] += int(r.get("reasoning") or 0)
-                a["secs"] += float(r.get("secs") or 0)
-                a["sessions"].add(r.get("session") or "")
-                if "mw" in r:  # rows written since the self-check existed
-                    a["mw_checked"] += 1
-                    if not r.get("mw"):
-                        a["mw_missing"] += 1
+        for r in _call_rows(path):
+            ts = r[_C_TS]
+            if since is None or ts < since:
+                since = ts
+            if ts < cutoff:
+                continue
+            day = _q_day(ts)
+            key = (day, r[_C_MODEL] or "", r[_C_UPSTREAM] or "", r[_C_PLATFORM] or "")
+            a = agg.get(key)
+            if a is None:
+                a = agg[key] = {"day": day, "model": key[1], "upstream": key[2], "platform": key[3],
+                                "calls": 0, "input": 0, "output": 0, "cache": 0, "reasoning": 0, "secs": 0.0,
+                                "sessions": set(), "mw_checked": 0, "mw_missing": 0}
+            a["calls"] += 1
+            calls += 1
+            a["input"] += int(r[_C_INPUT] or 0)
+            a["output"] += int(r[_C_OUTPUT] or 0)
+            a["cache"] += int(r[_C_CACHE] or 0)
+            a["reasoning"] += int(r[_C_REASONING] or 0)
+            a["secs"] += float(r[_C_SECS] or 0)
+            a["sessions"].add(r[_C_SESSION] or "")
+            if r[_C_MW] is not None:  # rows written since the self-check existed
+                a["mw_checked"] += 1
+                if not r[_C_MW]:
+                    a["mw_missing"] += 1
         rows = []
         for a in agg.values():
             a["sessions"] = len(a["sessions"])
@@ -3946,8 +4025,17 @@ def _q_save_settings(home, s):
     (_q_dir(home) / "settings.json").write_text(_aai_json.dumps(s), encoding="utf-8")
 
 
+_Q_DAYS_SEEN: Dict[int, str] = {}  # quarter hour -> local day: every UTC offset is a whole quarter hour
+
+
 def _q_day(ts):
-    return time.strftime("%Y-%m-%d", time.localtime(float(ts)))
+    q = int(float(ts) // 900)
+    day = _Q_DAYS_SEEN.get(q)
+    if day is None:
+        if len(_Q_DAYS_SEEN) > 50_000:
+            _Q_DAYS_SEEN.clear()
+        day = _Q_DAYS_SEEN[q] = time.strftime("%Y-%m-%d", time.localtime(q * 900))
+    return day
 
 
 def _q_cfg(profile, home):
@@ -3957,20 +4045,9 @@ def _q_cfg(profile, home):
 
 def _q_calls(home, since):
     """OpenRouter calls since ``since``, oldest first."""
-    path = _data_dir(home) / "routing.jsonl"
-    rows = []
-    try:
-        with open(path, encoding="utf-8") as fh:
-            for line in fh:
-                try:
-                    r = _aai_json.loads(line)
-                except ValueError:
-                    continue
-                if float(r.get("ts") or 0) >= since and r.get("model"):
-                    rows.append(r)
-    except OSError:
-        return []
-    rows.sort(key=lambda r: float(r["ts"]))
+    rows = [{k: v for k, v in zip(_CALL_FIELDS, t) if v is not None}
+            for t in _call_rows(_data_dir(home) / "routing.jsonl") if t[_C_MODEL] and t[_C_TS] >= since]
+    rows.sort(key=lambda r: r["ts"])
     return rows
 
 
@@ -3988,15 +4065,17 @@ def _q_replies(profile, since):
 def _q_attribute(calls, replies, slack=5.0):
     """Each reply's call: the session's last call that ended by the time the reply was saved."""
     import bisect
-    by_session = {}
+    by_session, stamps = {}, {}
     for r in calls:
-        by_session.setdefault(str(r.get("session") or ""), []).append(r)
+        sid = str(r.get("session") or "")
+        by_session.setdefault(sid, []).append(r)
+        stamps.setdefault(sid, []).append(float(r["ts"]))
     out = []
     for sid, ts, pushed in replies:
         rows = by_session.get(sid)
         if not rows:
             continue
-        i = bisect.bisect_right([float(r["ts"]) for r in rows], ts + slack) - 1
+        i = bisect.bisect_right(stamps[sid], ts + slack) - 1
         if i >= 0:
             out.append((rows[i], ts, pushed))
     return out

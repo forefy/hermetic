@@ -8,7 +8,7 @@ const grabConst = name => { const a = src.indexOf('const ' + name + ' = '); retu
 const line = re => src.match(re)[0]
 const { keyShare, periodSpend, lastNDays } = new Function(
   [line(/^const num = .*$/m), line(/^const DEFAULT_DAYS = .*$/m), line(/^const dateStr = d =>\n.*$/m),
-    grabConst('accountWindowStart'), grabConst('lastNDays'), grabConst('keyShare'), grabConst('periodSpend')].join('\n') +
+    grabConst('accountWindowStart'), grabConst('lastNDays'), grabConst('keyShare'), grabConst('firstChatDay'), grabConst('periodBill'), grabConst('periodSpend')].join('\n') +
     '\nreturn { keyShare, periodSpend, lastNDays }'
 )()
 

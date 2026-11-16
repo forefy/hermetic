@@ -37,6 +37,40 @@ def test_a_reply_goes_to_the_call_that_made_it():
     assert api._q_attribute(calls, [("s1", NOW - 400, True)]) == [], "a reply before any call has no provider"
 
 
+def test_the_call_log_is_read_on_from_where_it_stopped():
+    import os
+    path = HOME / "calls.jsonl"
+    path.write_text(json.dumps(call(NOW - 30, "s1", "A")) + "\n")
+    first = api._call_rows(path)
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(call(NOW - 20, "s1", "B")) + "\n" + '{"ts": 1, "mo')
+    second = api._call_rows(path)
+    assert len(first) == 1, "a list handed out earlier does not change"
+    assert [r[api._C_UPSTREAM] for r in second] == ["A", "B"], "a half-written line waits for the next read"
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write('del": "x/m"}\nnot json\n[1]\n')
+    third = api._call_rows(path)
+    assert len(third) == 3 and third[2][api._C_TS] == 1.0, "the rest of that line is read, lines that are no row are skipped"
+    assert third[0][api._C_SESSION] is third[1][api._C_SESSION], "a repeated name is kept once"
+    tmp = HOME / "calls.tmp"
+    tmp.write_text(json.dumps(call(NOW, "s9", "Z")) + "\n")
+    os.replace(tmp, path)  # how the log drops its old rows
+    assert [r[api._C_UPSTREAM] for r in api._call_rows(path)] == ["Z"], "a new file is read whole"
+    path.write_text(json.dumps(call(NOW, "s8", "Y")) + "\n" + json.dumps(call(NOW, "s8", "W")) + "\n")  # written over in place
+    assert [r[api._C_UPSTREAM] for r in api._call_rows(path)] == ["Y", "W"], "a file written over in place is read whole"
+    path.unlink()
+    assert api._call_rows(path) == []
+
+
+def test_calls_come_back_as_rows_with_the_fields_they_have():
+    (HOME / "hermetic").mkdir(exist_ok=True)
+    rows = [dict(call(NOW - 40, "s1", "A"), gen="gen-1"), call(NOW - 50, "s1", "B"), dict(call(NOW - 9999999, "s0", "C")), {"ts": NOW - 10, "session": "s2"}]
+    (HOME / "hermetic" / "routing.jsonl").write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+    got = api._q_calls(HOME, NOW - 100)
+    assert [r["upstream"] for r in got] == ["B", "A"], "oldest first, only calls with a model in the period"
+    assert got[1]["gen"] == "gen-1" and "gen" not in got[0] and "empty" not in got[0], got
+
+
 def test_endpoint_changes_between_days():
     (HOME / "hermetic" / "quality").mkdir(parents=True, exist_ok=True)
     path = HOME / "hermetic" / "quality" / "endpoints.jsonl"

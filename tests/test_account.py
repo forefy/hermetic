@@ -92,6 +92,44 @@ def test_a_git_checkout_shows_its_branch_and_a_pinned_one_does_not():
         shutil.rmtree(repo, ignore_errors=True)
 
 
+class _Chats:
+    def __init__(self, rows):
+        self.rows = rows
+
+    def list_sessions_rich(self, **kw):
+        return self.rows
+
+    def close(self):
+        pass
+
+
+def _provider(model_cfg, rows=()):
+    import time
+    now = time.time()
+    saved = api._open_sessions_db
+    api._open_sessions_db = lambda profile: _Chats([dict(r, started_at=now - 60 * i, last_active=now - 60 * i) for i, r in enumerate(rows)])
+    try:
+        return api._account_provider({"model": model_cfg} if model_cfg is not None else {}, None)
+    finally:
+        api._open_sessions_db = saved
+
+
+def test_the_account_is_found_when_the_config_leaves_the_provider_to_hermes():
+    assert _provider({"provider": "openrouter"}) == "openrouter", "a named provider is taken as it is"
+    assert _provider({"provider": "anthropic", "base_url": "https://openrouter.ai/api/v1"}) == "anthropic"
+    # the server this was found on: provider auto, endpoint OpenRouter, its own key and bill
+    assert _provider({"provider": "auto", "base_url": "https://openrouter.ai/api/v1"}) == "openrouter"
+    assert _provider({"base_url": "https://inference-api.nousresearch.com/v1"}) == "nous"
+    assert _provider({"provider": "auto", "base_url": "https://not-openrouter.ai.example/v1"}) == "", "a look-alike address is not OpenRouter"
+
+
+def test_without_an_endpoint_the_latest_chat_tells_where_calls_are_billed():
+    rows = [{"id": "new", "billing_provider": "openrouter"}, {"id": "old", "billing_provider": "nous"}, {"id": "draft", "billing_provider": None}]
+    assert _provider({"provider": "auto"}, rows) == "openrouter"
+    assert _provider(None, rows[::-1]) == "nous", "the latest chat, whatever the order they are listed in"
+    assert _provider({"provider": "auto"}) == "", "no chat yet: no account to ask for"
+
+
 if __name__ == "__main__":
     failed = 0
     for name, fn in list(globals().items()):

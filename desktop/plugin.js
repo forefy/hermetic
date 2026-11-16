@@ -8,9 +8,10 @@
  *          kept as tests, replays on other versions, providers or models, and
  *          automatic tests when the background review changes a skill.
  *
- * Data comes through the desktop plugin SDK: host.profiles, host.request (config), host.logs,
- * session.usage ticks, and this plugin's own backend under /api/plugins/hermetic/ via
- * ctx.rest; plus the public OpenRouter /models list.
+ * Data comes through the desktop plugin SDK: host.profiles, host.request (config, and the focused
+ * chat's /usage report where the backend names no account), host.logs, session.usage ticks, and
+ * this plugin's own backend under /api/plugins/hermetic/ via ctx.rest; plus the public OpenRouter
+ * /models list.
  * No API key ever reaches the renderer. OpenRouter-only parts hide when the profile
  * does not use OpenRouter.
  *
@@ -160,6 +161,22 @@ function carryOverLegacyStorage() {
 // home and secrets), so the active backend answers for every local profile.
 const OWN = '/api/plugins/hermetic'
 let pluginRest = null // ctx.rest, set in register()
+// The machine a request is for. The SDK sends a plugin's own requests to the window's primary connection
+// only, while a chat can belong to another one: a bot on a second connection, with its own hermetic, its
+// own config and its own bill. For such a chat the app's own request function is used (the one ctx.rest
+// wraps), because it takes the connection by name and the SDK has no call for that yet. `aim` is that
+// connection while such a chat is focused ({ connectionId, profile, target }), and null otherwise. An app
+// without that function leaves the machine named but unasked (`mute`): its requests fail instead of
+// going to the primary machine, whose numbers would then show for the wrong chat.
+let aim = null
+const aimKey = to => (to ? to.connectionId : '')
+const offAt = new Set() // machines without a hermetic backend, by aimKey: see "chats the backend cannot answer for"
+const backendOff = () => offAt.has(aimKey(aim))
+const billedKey = () => 'billed' + (aim ? '@' + aim.connectionId : '') // each machine has its own bill
+const namedApi = () => {
+  const bridge = typeof window !== 'undefined' ? window.hermesDesktop : null
+  return bridge && typeof bridge.api === 'function' ? bridge.api : null
+}
 const inflight = new Map() // identical reads already on their way share one request
 // The first look after Hermes starts reads every recent chat once, which on a long history takes longer
 // than the app waits for one request. The backend then answers how far the read is and carries on, and
@@ -199,11 +216,40 @@ const api = req => {
   if (!path.startsWith(OWN)) return Promise.reject(new Error('Not a hermetic route: ' + path))
   if (!pluginRest) return Promise.reject(new Error('hermetic is still loading'))
   let rel = path.slice(OWN.length) || '/'
+  const to = req.here ? null : aim // `here`: the primary machine whatever chat is focused (its guard's questions)
+  if (to && to.mute) return Promise.reject(new Error('hermetic cannot ask this machine'))
+  const key = aimKey(to)
+  // a machine without the backend is asked for its health only, once per refresh
+  if (offAt.has(key) && !rel.startsWith('/health')) return Promise.reject(new Error('404: hermetic is not on this machine'))
   if (!/[?&]profile=/.test(rel)) rel += (rel.includes('?') ? '&' : '?') + 'profile=' + encodeURIComponent(req.profile || 'default')
-  const go = suffix => pluginRest(rel + suffix, { method: req.method, body: req.body, timeoutMs: req.timeoutMs })
+  if (to && to.target !== to.profile) {
+    // that machine may know the profile by another name than this window does
+    const [route, query = ''] = rel.split('?')
+    const params = new URLSearchParams(query)
+    if (params.get('profile') === to.profile) params.set('profile', to.target)
+    rel = route + '?' + params.toString()
+  }
+  const how = { method: req.method, body: req.body, timeoutMs: req.timeoutMs }
+  const go = to
+    ? suffix => namedApi()({ connectionId: to.connectionId, profile: to.profile, path: OWN + rel + suffix, ...how })
+    : suffix => pluginRest(rel + suffix, how)
   if (req.method && String(req.method).toUpperCase() !== 'GET') { inflight.clear(); return go('') } // later reads see the write
-  if (!inflight.has(rel)) inflight.set(rel, untilRead(() => go('&reading=1'), r => noteReading(rel, r)).finally(() => inflight.delete(rel)))
-  return inflight.get(rel)
+  const id = key + ' ' + rel
+  if (!inflight.has(id)) inflight.set(id, untilRead(() => go('&reading=1'), r => noteReading(id, r)).finally(() => inflight.delete(id)))
+  return inflight.get(id)
+}
+// Routes an older hermetic does not have yet, by machine: asked once, then left alone until that machine
+// reports another version. A whole backend that is missing is `offAt`'s, not this.
+const missingRoutes = new Set()
+const askRoute = async (name, req) => {
+  const key = aimKey(req.here ? null : aim) + ' ' + name
+  if (missingRoutes.has(key)) throw new Error('404: ' + name + ' is not on this machine')
+  try {
+    return await api(req)
+  } catch (e) {
+    if (noRoute(e) && !offAt.has(aimKey(req.here ? null : aim))) missingRoutes.add(key)
+    throw e
+  }
 }
 // the last data each AAI and HDR view showed, per profile and period: shown at once on reopen
 // while a fresh copy loads
@@ -224,17 +270,181 @@ const botLabel = p => {
   return String(p.name || '').replace(/[-_]+/g, ' ').trim().replace(/\b\w/g, c => c.toUpperCase())
 }
 
+// ---- chats the backend cannot answer for ------------------------------------
+
+// A chat's numbers come from hermetic's backend on the machine the chat lives on (see `aim`). Where that
+// machine has no hermetic (a server reached over SSH, say: its routes answer 404, as this computer's do
+// while the Agent half is off), Costs shows what Hermes itself keeps for each chat (tokens, cost, model,
+// times), read through the SDK's own chat list. The same goes for a chat on another connection in an app
+// without a request function that can name one. That list leaves out a bot's own chat, subagent runs and
+// archived chats, and holds a profile's newest 500.
+const noRoute = e => /404|Not Found/i.test(String(e && e.message))
+// Hermes keeps one total per chat, and splitting it over the days the chat ran takes its messages (the
+// backend's job). Here the whole chat counts on the day it was last active, which is also how a period
+// picks its chats, so the total and the chat list of a period agree.
+const chatDay = r => dateStr(new Date((num(r.last_active) || num(r.started_at)) * 1000))
+const TOKEN_KEYS = ['input_tokens', 'output_tokens', 'cache_read_tokens']
+// What the backend's /usage answers, from that list alone
+const usageOfChats = (rows, days) => {
+  const first = lastNDays(days)[0]
+  const daily = new Map()
+  const models = new Map()
+  for (const r of rows) {
+    const day = chatDay(r)
+    if (day < first) continue
+    const d = daily.get(day) || { day, input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, estimated_cost: 0, sessions: 0, api_calls: 0 }
+    daily.set(day, d)
+    for (const k of TOKEN_KEYS) d[k] += num(r[k])
+    d.estimated_cost += num(r.estimated_cost_usd)
+    d.api_calls += num(r.api_call_count)
+    d.sessions += 1
+    if (!r.model) continue
+    // stored at $0 despite tokens (a subscription): its tokens per model, for a list-price estimate
+    if (!num(r.estimated_cost_usd) && !num(r.actual_cost_usd) && TOKEN_KEYS.some(k => num(r[k]) > 0)) {
+      d.unpriced = d.unpriced || {}
+      const u = (d.unpriced[r.model] = d.unpriced[r.model] || { input_tokens: 0, output_tokens: 0, cache_read_tokens: 0 })
+      for (const k of TOKEN_KEYS) u[k] += num(r[k])
+    }
+    const m = models.get(r.model) || { model: r.model, input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, estimated_cost: 0, api_calls: 0, hosts: [] }
+    models.set(r.model, m)
+    for (const k of TOKEN_KEYS) m[k] += num(r[k])
+    m.estimated_cost += num(r.estimated_cost_usd)
+    m.api_calls += num(r.api_call_count)
+    let billedAt = ''
+    try { billedAt = new URL(String(r.billing_base_url || '')).hostname } catch { /* no address stored */ }
+    if (billedAt && !m.hosts.includes(billedAt)) m.hosts.push(billedAt)
+  }
+  return {
+    daily: Array.from(daily.values()).sort((a, b) => (a.day < b.day ? -1 : 1)),
+    by_model: Array.from(models.values()).sort((a, b) => b.input_tokens + b.output_tokens - (a.input_tokens + a.output_tokens))
+  }
+}
+// And what its /sessions answers: the chats with model calls in the last `days` days
+const sessionsOfChats = (rows, days) => {
+  const cutoff = Date.now() / 1000 - days * 86400
+  return rows
+    .filter(r => num(r.api_call_count) > 0 && (num(r.last_active) || num(r.started_at)) > cutoff)
+    .map(r => ({ ...r, by_day: { [chatDay(r)]: 1 } }))
+}
+// A bot's own chat is hidden from that list. The chat in front of the user is then counted from its live
+// counters: what its agent has used since it started, in tokens (no cost, so it is priced at list price).
+const liveChat = (usage, id) => {
+  const u = usage || {}
+  const input = num(u.input)
+  if (!id || !(input + num(u.output) > 0)) return null
+  const now = Date.now() / 1000
+  return { id, model: u.model || '', api_call_count: num(u.calls), input_tokens: input, output_tokens: num(u.output),
+    cache_read_tokens: Math.max(0, num(u.prompt) - input), estimated_cost_usd: 0, started_at: now, last_active: now }
+}
+const chatListed = (rows, id) => rows.some(r => r.id === id || r._lineage_root_id === id || (Array.isArray(r._lineage_ids) && r._lineage_ids.includes(id)))
+const ownChats = new Map() // machine and profile -> { at, rows }: one read serves every loader of a refresh
+// `route` names another machine of this window (see apartMachine), null the one its requests go to
+const loadOwnChats = (route, profile) => {
+  const key = (route ? route.connectionId : '') + '\n' + profile
+  const hit = ownChats.get(key)
+  if (hit && Date.now() - hit.at < 5000) return hit.rows
+  if (typeof host.listPersistedSessions !== 'function') return Promise.reject(new Error('This Hermes has no chat list for plugins'))
+  const rows = host.listPersistedSessions(route, { profile, limit: 500 }).then(r => (r && r.sessions) || [])
+  ownChats.set(key, { at: Date.now(), rows })
+  rows.catch(() => ownChats.delete(key))
+  return rows
+}
+// A profile's chats for a refresh that reads `own` instead of the backend: the list, and the focused chat
+// apart when the list does not have it
+const ownRows = async (own, profile) => {
+  const rows = await loadOwnChats(own.route, profile)
+  const live = own.live && own.live.profile === profile && !chatListed(rows, own.live.row.id) ? [own.live.row] : []
+  return { rows, live }
+}
+const connectionOf = async id => {
+  try {
+    return (await host.connections()).find(c => c.id === id) || null
+  } catch {
+    return null
+  }
+}
+// The machine the window is connected to when that is not this computer: its name, else null
+async function awayMachine() {
+  const id = typeof host.activeConnectionId === 'function' ? host.activeConnectionId() : null
+  if (!id || id === 'local') return null
+  const row = await connectionOf(id)
+  return row && row.kind === 'local' ? null : (row && row.label) || id
+}
+// A bot of another machine can sit next to this window's own, as a second connection: the focused chat's
+// machine when it is not the one the window is connected to, else null.
+let routes = { at: 0, list: [] }
+// The machine a chat is on when that is not the one this window is connected to, by connection id, and ''
+// for the window's own. Everything on screen belongs to one of them.
+const machineOf = owner => {
+  const reach = (typeof host.activeConnectionId === 'function' && host.activeConnectionId()) || 'local'
+  return owner && owner.connectionId && owner.connectionId !== reach ? owner.connectionId : ''
+}
+// Where a chat's requests go (see `aim`): null for the window's own machine, else its machine by name,
+// with the profile name that machine knows the chat's profile by (from the routes read last).
+const aimOf = owner => {
+  const connectionId = machineOf(owner)
+  if (!connectionId) return null
+  const profile = owner.profile || 'default'
+  const route = routes.list.find(r => r.connectionId === connectionId && r.profile === profile)
+  return { connectionId, profile, target: (route && route.targetProfile) || profile, mute: !namedApi() }
+}
+async function apartMachine(owner) {
+  if (!machineOf(owner)) return null
+  if (typeof host.profileRoutes === 'function' && Date.now() - routes.at > 300_000) {
+    try {
+      routes = { at: Date.now(), list: (await host.profileRoutes()) || [] }
+    } catch {
+      /* the last list will do */
+    }
+  }
+  const profile = owner.profile || 'default'
+  const route = routes.list.find(r => r.connectionId === owner.connectionId && r.profile === profile) || { connectionId: owner.connectionId, profile, targetProfile: profile }
+  const row = await connectionOf(owner.connectionId)
+  const local = owner.connectionId === 'local' || !!(row && row.kind === 'local')
+  return { route, profile, target: route.targetProfile || profile, name: local ? 'this computer' : (row && row.label) || owner.connectionId, local }
+}
+// What the bar's copy button hands over: a request to paste into the chat in front of the user, whose
+// agent runs on the machine that lacks hermetic. A bare command would read as one to run on this computer,
+// and a command that reaches the machine from outside (ssh) makes that agent log in to itself.
+const INSTALL_REQUEST = 'Install the hermetic plugin on this machine:\nhermes plugins install hermetic --enable'
+
+const profileRows = r => ((r && r.profiles) || []).map(p => ({ name: p.name, isDefault: !!p.is_default, label: botLabel(p) }))
 async function loadProfiles() {
   try {
-    const r = await host.profiles.list()
-    const list = (r && r.profiles) || []
-    return list.map(p => ({ name: p.name, isDefault: !!p.is_default, label: botLabel(p) }))
+    return profileRows(await host.profiles.list())
   } catch {
     return [{ name: 'default', isDefault: true }]
   }
 }
+// Another machine's profiles, with the names its bots go by: the app's profile list, asked for that
+// machine. An app that cannot ask by machine answers with the window's own list instead, so a list that
+// reads the same as the window's own is not used, and one machine's bot name never shows for another's.
+// Kept for five minutes, and waited for a few seconds at most: the numbers do not depend on it.
+const farProfiles = new Map() // connection id -> { at, list, ask }
+const FAR_PROFILES_WAIT_MS = 4000
+function loadFarProfiles(route) {
+  const key = route.connectionId
+  const have = farProfiles.get(key) || {}
+  if (have.at && Date.now() - have.at < 300_000) return Promise.resolve(have.list)
+  if (!have.ask) {
+    const names = r => JSON.stringify(((r && r.profiles) || []).map(p => [p.name, p.bot_title || '', p.display_name || '']))
+    have.ask = Promise.all([host.profiles.list({ connectionId: key, profile: route.profile }), host.profiles.list()]).then(
+      ([there, here]) => {
+        const list = names(there) === names(here) ? null : profileRows(there)
+        farProfiles.set(key, { at: Date.now(), list })
+        return list
+      },
+      () => {
+        have.ask = null
+        return have.list || null
+      }
+    )
+    farProfiles.set(key, have)
+  }
+  return Promise.race([have.ask, new Promise(done => setTimeout(() => done(have.list || null), FAR_PROFILES_WAIT_MS))])
+}
 
-async function loadAnalytics(profiles, days, prices) {
+async function loadAnalytics(profiles, days, prices, own) {
   const daily = new Map() // day -> merged record
   const aux = new Map() // model -> { task -> {input, output, cost} }
   const byModel = new Map() // model -> {input, output, cost, calls}
@@ -244,7 +454,12 @@ async function loadAnalytics(profiles, days, prices) {
   await Promise.all(
     profiles.map(async p => {
       try {
-        const r = await api({ path: OWN + '/usage?days=' + days, profile: p.isDefault ? 'default' : p.name })
+        const name = p.target || (p.isDefault ? 'default' : p.name)
+        let r
+        if (own) {
+          const { rows, live } = await ownRows(own, name)
+          r = usageOfChats(rows.concat(live), days)
+        } else r = await api({ path: OWN + '/usage?days=' + days, profile: name })
         // a profile Hermes priced at $0 despite tokens (custom endpoints), or at under a tenth of list price
         // (it knew the price of a sliver only): blend list prices of its models for every day instead
         const models = (r && r.by_model) || []
@@ -317,8 +532,8 @@ async function loadAnalytics(profiles, days, prices) {
   return { daily, aux, byModel, total, estimated, unpriced }
 }
 
-async function loadAllAnalytics(profiles, prices) {
-  const [d1, d7, d30] = await Promise.all([loadAnalytics(profiles, 1, prices), loadAnalytics(profiles, 7, prices), loadAnalytics(profiles, DEFAULT_DAYS, prices)])
+async function loadAllAnalytics(profiles, prices, own) {
+  const [d1, d7, d30] = await Promise.all([loadAnalytics(profiles, 1, prices, own), loadAnalytics(profiles, 7, prices, own), loadAnalytics(profiles, DEFAULT_DAYS, prices, own)])
   return { daily: d30.daily, periods: { today: d1, '7d': d7, '30d': d30 } }
 }
 
@@ -345,15 +560,21 @@ const mapSessionRow = (s, profile) => ({
   bulky: num(s.bulk_tokens)
 })
 
-async function loadSessions(profiles) {
+async function loadSessions(profiles, own) {
   const out = []
   let complete = true
+  let live = false // the focused chat counts in the totals without being in the list
   await Promise.all(
     (profiles || [{ name: 'default', isDefault: true }]).map(async p => {
       try {
         const suffix = '?days=' + DEFAULT_DAYS + (p.isDefault ? '' : '&profile=' + encodeURIComponent(p.name))
         let r = null
-        for (const base of [OWN + '/sessions']) {
+        if (own) {
+          const mine = await ownRows(own, p.target || (p.isDefault ? 'default' : p.name))
+          if (mine.live.length) live = true
+          r = { sessions: sessionsOfChats(mine.rows, DEFAULT_DAYS) }
+        }
+        for (const base of r ? [] : [OWN + '/sessions']) {
           try {
             const got = await api({ path: base + suffix })
             if (got && Array.isArray(got.sessions)) {
@@ -371,7 +592,7 @@ async function loadSessions(profiles) {
       }
     })
   )
-  return { sessions: out, complete }
+  return { sessions: out, complete, live }
 }
 
 async function loadPrices() {
@@ -730,17 +951,24 @@ async function loadBilledHistory() {
 
 // The installed version, from the backend's plugin.yaml, shown small at the bottom of the popover, and the
 // branch and commit instead when hermetic runs from a git checkout rather than a catalog release
-let hermeticVersion = null
-let hermeticCheckout = null
+const builds = new Map() // machine (aimKey) -> { version, checkout }
 
 // Hermes internals the backend plugin could not find (a Hermes update renamed them); fallbacks run.
+// Asked in every refresh along with the config: a 404 here means the machine asked has no hermetic
+// backend, and no answer at all (null) means the machine is not answering, so nothing more is asked of it.
+const HEALTH_WAIT_MS = 10_000
 async function loadHealth() {
+  const key = aimKey(aim)
   try {
-    const r = await api({ path: '/api/plugins/hermetic/health' })
-    if (r && r.version) hermeticVersion = r.version
-    hermeticCheckout = (r && r.checkout) || null
+    const r = await api({ path: '/api/plugins/hermetic/health', timeoutMs: HEALTH_WAIT_MS })
+    offAt.delete(key)
+    // another version may have the routes this one lacked
+    if (r && r.version && (builds.get(key) || {}).version !== r.version) for (const k of Array.from(missingRoutes)) if (k.startsWith(key + ' ')) missingRoutes.delete(k)
+    builds.set(key, { version: (r && r.version) || (builds.get(key) || {}).version || null, checkout: (r && r.checkout) || null })
     return (r && r.missing) || []
-  } catch {
+  } catch (e) {
+    if (!noRoute(e)) return null
+    offAt.add(key)
     return []
   }
 }
@@ -889,8 +1117,6 @@ function spendLimit(a, period, total) {
   return { used: pick.used, cap: pick.cap, left: pick.left, by: pick.by, interval: pick.interval, reset_at: pick.reset_at, share: share(pick), lowest: Math.min.apply(null, all.map(share)), canTotal, tip }
 }
 
-let backendPatched = true
-
 // The focused profile's plan limits or credits, for providers other than OpenRouter (whose bill and
 // limit the account line above covers): Anthropic and Codex windows, Nous credits, provider plugins.
 async function loadLimits(profile) {
@@ -916,29 +1142,54 @@ async function loadNousBilled(profile) {
   }
 }
 
-async function loadAccount(sid) {
-  for (const path of [OWN + '/account/usage']) {
-    try {
-      const r = await api({ path, timeoutMs: 20_000 })
-      if (r && Array.isArray(r.lines)) {
-        backendPatched = true
-        const parsed = parseAccountLines(r.lines)
-        if (parsed) return Object.assign(parsed, { budgets: (r.account && r.account.budgets) || [] })
-        break
-      }
-    } catch {
-      /* try the next source */
+// The account of the profile's provider as hermetic's backend tells it: that profile's own, as each
+// profile can have its own key. null: the backend answered, and there is none to tell. undefined: no answer.
+async function loadAccount(sid, profile) {
+  let answered = false
+  try {
+    const r = await api({ path: OWN + '/account/usage', profile, timeoutMs: 20_000 })
+    if (r && Array.isArray(r.lines)) {
+      answered = true
+      const parsed = parseAccountLines(r.lines)
+      if (parsed) return Object.assign(parsed, { budgets: (r.account && r.account.budgets) || [] })
     }
-    backendPatched = false
+  } catch {
+    /* try the next source */
   }
-  if (!sid) return null
+  const none = answered ? null : undefined
+  if (!sid) return none
   try {
     const r = await host.request('session.usage', { session_id: sid }, 20_000)
     const u = (r && (r.usage || r.result || r)) || {}
-    return parseAccountLines(Array.isArray(u.account_lines) ? u.account_lines : [])
+    return parseAccountLines(Array.isArray(u.account_lines) ? u.account_lines : []) || none
   } catch {
-    return null
+    return none
   }
+}
+
+// The account as the chat's own Hermes reports it, from the text its /usage command prints: the account
+// of the provider that chat really runs on. It stands in where the machine's hermetic names no account
+// (a config that says "auto", read by an older backend). `route` names another machine. Whatever comes
+// back is kept for a minute, so a machine is asked once a minute at most.
+const chatAccounts = new Map() // machine -> { at, account }
+const chatAccountWanted = new Set() // machines whose last look needed the chat's own report
+async function loadChatAccount(sid, route) {
+  const key = route ? route.connectionId : ''
+  const have = chatAccounts.get(key)
+  if (have && Date.now() - have.at < 60_000) return have.account
+  if (!sid || (route && typeof host.requestProfile !== 'function')) return null
+  let account = null
+  try {
+    const ask = { session_id: sid, command: '/usage' }
+    const r = route ? await host.requestProfile(route, 'slash.exec', ask, 20_000) : await host.request('slash.exec', ask, 20_000)
+    // the chat's token counts come first, in a block of their own: only the account lines are read
+    const blocks = String((r && r.output) || '').split(/\n\s*\n/).filter(b => !b.trim().startsWith('Session Token Usage'))
+    account = parseAccountLines(blocks.join('\n').split('\n'))
+  } catch {
+    /* a chat that is not open on that machine, or a Hermes without that report */
+  }
+  chatAccounts.set(key, { at: Date.now(), account })
+  return account
 }
 
 // ---- pricing math -----------------------------------------------------------
@@ -1045,7 +1296,10 @@ const costAt = (p, input, output, cache) =>
 
 // ---- live ticks -------------------------------------------------------------
 
-const live = new Map() // sid -> { samples: [{t, input, output, cache, model}], last }
+// Live ticks come from every chat of the window, whatever machine it runs on. A tick's machine is known
+// for the focused chat (aimKey) and taken to be the window's own for any other, so one machine's running
+// agents and cache resets never show among another's numbers.
+const live = new Map() // sid -> { samples: [{t, input, output, cache, model}], last, at }
 
 const RESETS_MAX = 3000
 let resets = []
@@ -1055,7 +1309,7 @@ function initResets() {
   if (!sget('resetsSince', null)) sset('resetsSince', Date.now())
 }
 
-function detectReset(sid, prev, cur, usage) {
+function detectReset(sid, prev, cur, usage, at) {
   if (!prev) return
   const dIn = cur.input - prev.input
   const dCache = cur.cache - prev.cache
@@ -1066,16 +1320,17 @@ function detectReset(sid, prev, cur, usage) {
   // A cold call re-sends the context as fresh input while cache reads stay flat.
   if (dIn < ctx * 0.5 || dCache > ctx * 0.1) return
   const compacted = num(usage.compressions) > num(prev.raw && prev.raw.compressions)
-  resets.push({ t: cur.t, sid, cause: compacted ? 'compaction' : 'swap', tokens: dIn, model: cur.model, calls: num(usage.calls), cache: cur.cache, input: cur.input })
+  resets.push({ t: cur.t, sid, cause: compacted ? 'compaction' : 'swap', tokens: dIn, model: cur.model, calls: num(usage.calls), cache: cur.cache, input: cur.input, ...(at ? { at } : {}) })
   if (resets.length > RESETS_MAX) resets = resets.slice(-RESETS_MAX)
   sset('resets', resets)
 }
 
-function recordTick(sid, usage) {
+function recordTick(sid, usage, focused) {
   if (!sid || !usage) return
-  const e = live.get(sid) || { samples: [], last: null }
+  const e = live.get(sid) || { samples: [], last: null, at: '' }
+  if (focused) e.at = aimKey(aim)
   const s = { t: Date.now(), input: num(usage.input), output: num(usage.output), cache: num(usage.cache_read_tokens), model: usage.model || '', raw: usage }
-  detectReset(sid, e.last, s, usage)
+  detectReset(sid, e.last, s, usage, e.at)
   e.samples.push(s)
   const cutoff = Date.now() - LIVE_WINDOW_MS
   while (e.samples.length > 2 && e.samples[0].t < cutoff) e.samples.shift()
@@ -1098,7 +1353,7 @@ function liveRates(prices, fallbackModel) {
     const outDelta = Math.max(0, lastS.output - first.output)
     const spent = costAt(p, inDelta, outDelta, cacheDelta)
     if (spent == null) continue
-    out.push({ sid, rate: spent / hours, usage: lastS.raw, recentMs: now - lastS.t })
+    out.push({ sid, at: e.at || '', rate: spent / hours, usage: lastS.raw, recentMs: now - lastS.t })
   }
   return out
 }
@@ -1209,11 +1464,13 @@ function computeModel(data, period, hoverDay, prices, threshold, defaultModel, b
 
   // Delegate runs and hidden sessions are not listed by the sessions route; their
   // cost is the gap between the analytics total and what the listed sessions add up to.
+  // (Read from Hermes' own chat list, the gap is the focused chat, counted from its live counters.)
   const remainder = hoverDay || data.sessionsComplete ? 0 : Math.max(0, periodCost - totalSessCost - auxCost)
   if (remainder > 0.01) {
     enriched.push({
       id: '__subagents',
-      title: 'subagents',
+      title: data.liveChat ? 'This chat' : 'subagents',
+      tip: data.liveChat ? 'What this chat has used since its agent started, at list prices' : 'Delegate runs and hidden sessions: total minus the sessions listed above',
       synthetic: true,
       kind: 'subagent',
       cost: remainder,
@@ -1300,7 +1557,7 @@ function computeModel(data, period, hoverDay, prices, threshold, defaultModel, b
   // cache resets from live ticks (runtime sid → stored session by matching counters)
   const since = start * 1000
   const until = end === Infinity ? Infinity : end * 1000
-  const periodResets = resets.filter(r => r.t >= since && r.t < until)
+  const periodResets = resets.filter(r => r.t >= since && r.t < until && (r.at || '') === (data.at || ''))
   const sidMap = new Map()
   for (const r of periodResets) {
     if (sidMap.has(r.sid)) continue
@@ -1378,11 +1635,27 @@ const keyShare = (meter, period) => {
   const all = sum(meter.orDaily)
   return all > 0 ? Math.min(1, sum(meter.daily) / all) : null
 }
+// The day of the first chat on record, among the chats loaded (the last 30 days).
+const firstChatDay = data => {
+  let t = Infinity
+  for (const x of (data && data.sessions) || []) if (x.started > 0 && x.started < t) t = x.started
+  return t < Infinity ? dateStr(new Date(t * 1000)) : null
+}
+// The key's bill for a period, or null where it cannot stand for the chats on record: a billing window
+// (OpenRouter's UTC week or month) that starts before the first of them also holds what the key spent
+// before, on another machine or app. A server set up today with a key used all month is one.
+const periodBill = (account, period, data) => {
+  if (!account) return null
+  const v = period === 'today' ? account.today : period === '7d' ? account.week : account.month
+  if (v == null || period === 'today') return v == null ? null : v
+  const first = firstChatDay(data)
+  return first && first <= accountWindowStart(period) ? v : null
+}
 const periodSpend = (data, account, period, scope = 'all') => {
   const days = period === 'today' ? lastNDays(1) : period === '7d' ? lastNDays(7) : lastNDays(DEFAULT_DAYS)
   const listCost = () => (data ? days.reduce((a, d) => a + (data.daily.get(d) || { cost: 0 }).cost, 0) : 0)
   if (account) {
-    const v = period === 'today' ? account.today : period === '7d' ? account.week : account.month
+    const v = periodBill(account, period, data)
     if (v != null) {
       if (scope === 'all') return v
       const f = keyShare(data, period)
@@ -1394,35 +1667,102 @@ const periodSpend = (data, account, period, scope = 'all') => {
 
 // ---- data hook --------------------------------------------------------------
 
+const NOTHING_YET = { loading: true, error: null, data: null, prices: {}, threshold: 0.5, retries: 0, yaml: '', account: null }
+// One machine's numbers never stand in for another's: while the focused chat's machine (`want`) loads,
+// its own last numbers show, or none yet. `seen` holds the last numbers of each machine.
+const shownFor = (state, seen, want) => (state.at === undefined || state.at === want ? state : seen.get(want) || { ...NOTHING_YET, prices: state.prices, at: want })
+// a failed look belongs to the machine that was asked: its last numbers stay with it, another machine's do not
+const failedFor = (state, seen, at, error) => (state.at === undefined || state.at === at ? { ...state, at, loading: false, error } : { ...(seen.get(at) || NOTHING_YET), at, loading: false, error })
+
 function useMeterData() {
-  const [state, setState] = useState({ loading: true, error: null, data: null, prices: {}, threshold: 0.5, retries: 0, yaml: '', account: null })
-  const busy = useRef(false)
+  const [state, setState] = useState(NOTHING_YET)
+  const seen = useRef(new Map()) // the last numbers shown for each machine, by its key
+  const busy = useRef(null) // the look that is running: { at }
+  const turn = useRef(0)
   const timer = useRef(null)
   const sidRef = useRef(null)
   const profileRef = useRef('default')
+  const again = useRef(false)
+  const focusRef = useRef({}) // the focused chat: its machine and profile, its stored and running ids, its live counters
 
   const refresh = async () => {
-    if (busy.current) return
-    busy.current = true
+    const at = machineOf(focusRef.current.owner) // the machine this look is for
+    // Asked for while one runs for the same machine: run once more when it ends. A look for a machine that
+    // is no longer in front is dropped at its next step, and this one starts at once.
+    if (busy.current && busy.current.at === at) {
+      // asked again as it starts, for the same profile (the hook's effects fire together when the popover
+      // mounts): the running look covers it
+      if (Date.now() - busy.current.t < 300 && busy.current.profile === profileRef.current) return
+      return void (again.current = true)
+    }
+    const mine = ++turn.current
+    busy.current = { at, t: Date.now(), profile: profileRef.current }
+    again.current = false
+    // Requests follow the chat in front (see `aim`), so a look goes on only while its machine is that one:
+    // past this point its remaining requests would reach another machine.
+    const dropped = () => mine !== turn.current || machineOf(focusRef.current.owner) !== at
     const profile = profileRef.current
     try {
-      const [profiles, prices, yaml] = await Promise.all([loadProfiles(), loadPrices(), loadConfigRaw(profile)])
+      const apart = await apartMachine(focusRef.current.owner)
+      if (dropped()) return
+      aim = aimOf(focusRef.current.owner) // once more, with the routes that look just read
+      const blind = !!aim && aim.mute // another machine, and no way to ask it
+      const wasOff = !blind && backendOff()
+      // the health check tells whether that machine has the backend at all; what does not depend on it is
+      // asked at the same time
+      const [health, [profiles, prices, yamlAsked]] = await Promise.all([
+        blind ? [] : loadHealth(),
+        Promise.all([
+          // a chat on another machine is shown for its own profile, under the name that machine gives its bot
+          apart
+            ? loadFarProfiles(apart.route).then(list => {
+                const row = (list || []).find(p => p.name === apart.target)
+                return [{ name: profile, isDefault: apart.profile === 'default', target: apart.target, ...(row ? { label: row.label } : {}) }]
+              })
+            : loadProfiles(),
+          loadPrices(),
+          blind ? '' : loadConfigRaw(profile)
+        ])
+      ])
+      if (dropped()) return
+      if (health === null) {
+        // a machine that does not answer is asked nothing else, and looked at again shortly
+        clearTimeout(timer.current)
+        timer.current = setTimeout(refresh, HEALTH_WAIT_MS)
+        throw new Error((apart ? apart.name : 'Hermes') + ' is not answering')
+      }
+      const off = !blind && backendOff()
+      // a backend that has just come back was not asked for the config with the rest
+      const yaml = wasOff && !off ? await loadConfigRaw(profile) : yamlAsked
+      const away = !off ? null : !apart ? await awayMachine() : apart.local ? null : apart.name
+      if (dropped()) return
+      // Hermes' own chat list stands in where there is no backend to ask
+      const liveRow = off || blind ? liveChat(focusRef.current.usage, focusRef.current.id) : null
+      const own = off || blind ? { route: apart ? apart.route : null, live: liveRow ? { profile: apart ? apart.target : profile, row: liveRow } : null } : null
       // "profile": only the focused chat's profile; "all": every profile added up
       const scope = sget('scope', 'profile') === 'all' ? 'all' : 'profile'
       const scoped = scope === 'all' ? profiles : profiles.filter(p => p.name === profile)
       const shown = scoped.length ? scoped : profiles
-      const [analytics, sessionsResult, retries, account, routingAll, aux, billedHistory, health, limits, nousBilled] = await Promise.all([
-        loadAllAnalytics(shown, prices),
-        loadSessions(profiles),
-        loadRetries(lastNDays(DEFAULT_DAYS)[0]),
-        loadAccount(sidRef.current),
-        loadRouting(profiles),
-        loadAux(profile),
-        loadBilledHistory(),
-        loadHealth(),
-        loadLimits(profile),
-        configUsesNous(yaml) ? loadNousBilled(profile) : null
+      // What only this window's own machine can tell is left out for a chat on another one: the app's log
+      // (retries). A machine that cannot be asked gets nothing asked. Two answers that only some looks use
+      // are asked here too, so they cost no extra wait: provider quality for a profile that may route through
+      // OpenRouter, and the chat's own account report on a machine whose last look needed it.
+      const chatAsk = () => loadChatAccount(apart ? focusRef.current.sid : sidRef.current, apart ? apart.route : null)
+      const chatEarly = !blind && chatAccountWanted.has(at)
+      const [analytics, sessionsResult, retries, toldAccount, routingAll, aux, billedHistory, limits, nousBilled, qualityEarly, chatAccount] = await Promise.all([
+        loadAllAnalytics(shown, prices, own),
+        loadSessions(shown, own),
+        apart ? 0 : loadRetries(lastNDays(DEFAULT_DAYS)[0]),
+        blind || away ? null : loadAccount(apart ? null : sidRef.current, profile),
+        blind ? { rows: [], since: null, recording: false, reachable: false } : loadRouting(profiles),
+        blind ? null : loadAux(profile),
+        blind ? {} : loadBilledHistory(),
+        blind ? null : loadLimits(profile),
+        !blind && configUsesNous(yaml) ? loadNousBilled(profile) : null,
+        !own && configUsesOpenRouter(yaml) !== false ? loadQuality(profile) : null,
+        chatEarly ? chatAsk() : null
       ])
+      if (dropped()) return
       // Nous credits that are only topped up have no allowance to measure against: under $1 left after
       // paid calls this week is low (a free-only account at $0 is not)
       if (limits && limits.credits != null && limits.credits < 1 && lastNDays(7).some(d => num(((nousBilled || {})[d] || {}).billed) > 0)) limits.low = true
@@ -1442,14 +1782,23 @@ function useMeterData() {
         const latest = sessionsResult.sessions.filter(x => x.profile === profile && (x.provider || x.base)).sort((a, b) => b.last - a.last)[0]
         if (latest) orCfg = /openrouter/i.test(latest.provider + latest.base)
       }
-      const orProfile = orCfg === true || (orCfg == null && routingAll.rows.some(r => r.profile === profile))
+      // without the backend there is no config to read or change, so no OpenRouter parts either
+      const orProfile = !own && (orCfg === true || (orCfg == null && routingAll.rows.some(r => r.profile === profile)))
       const orNames = new Set(routingAll.rows.map(r => r.profile).filter(Boolean))
       if (orCfg === true) orNames.add(profile)
+      // an OpenRouter profile whose machine's hermetic answered without an account: the chat's own Hermes is
+      // asked (not where the backend gave no answer at all: that machine has enough to do)
+      const chatNeeded = orProfile && toldAccount === null
+      if (chatNeeded) chatAccountWanted.add(at)
+      else chatAccountWanted.delete(at)
+      const account = toldAccount || (chatNeeded ? (chatEarly ? chatAccount : await chatAsk()) : null)
+      if (dropped()) return
       const orAny = scope === 'all' ? orProfile || routingAll.rows.length > 0 || !!account : orProfile
       // OpenRouter bills the whole key, so the bill is compared with every profile that uses it
       const orList = profiles.filter(p => orNames.has(p.name))
       const sameSet = orList.length === shown.length && orList.every(p => inScope.has(p.name))
       const orAnalytics = account && orList.length && !sameSet ? await loadAllAnalytics(orList, prices) : null
+      if (dropped()) return
       const topModel = (sessionsResult.sessions.slice().sort((a, b) => b.cost - a.cost)[0] || {}).model || ''
       const routeModels = Array.from(
         new Set(
@@ -1457,10 +1806,11 @@ function useMeterData() {
         )
       )
       const [cheapest, endpoints, quality] = orAny
-        ? await Promise.all([loadCheapestEndpoint(topModel), loadEndpoints(routeModels), orProfile ? loadQuality(profile) : null])
+        ? await Promise.all([loadCheapestEndpoint(topModel), loadEndpoints(routeModels), orProfile ? qualityEarly : null])
         : [null, {}, null]
+      if (dropped()) return
       {
-        const local = sget('billed', null) || {}
+        const local = sget(billedKey(), null) || {}
         let changed = false
         for (const [day, usd] of Object.entries(billedHistory || {})) {
           const v = num(usd)
@@ -1469,22 +1819,23 @@ function useMeterData() {
             changed = true
           }
         }
-        if (changed) sset('billed', local)
+        if (changed) sset(billedKey(), local)
       }
       const acc = account || null
       if (acc && acc.today != null) {
         const utcDay = new Date().toISOString().slice(0, 10)
-        const billed = sget('billed', null) || {}
+        const billed = sget(billedKey(), null) || {}
         billed[utcDay] = acc.today
         const keys = Object.keys(billed).sort()
         for (const k of keys.slice(0, Math.max(0, keys.length - 60))) delete billed[k]
-        sset('billed', billed)
+        sset(billedKey(), billed)
       }
-      setState(s => ({
+      const before = seen.current.get(at)
+      const next = {
         loading: false,
         error: null,
         cheapest,
-        data: { ...analytics, sessions: sessionsResult.sessions.filter(x => inScope.has(x.profile)), sessionsComplete: sessionsResult.complete, routing, endpoints, aux, health, quality,
+        data: { ...analytics, sessions: sessionsResult.sessions.filter(x => inScope.has(x.profile)), sessionsComplete: sessionsResult.complete && !sessionsResult.live, liveChat: sessionsResult.live, at, routing, endpoints, aux, health, quality,
           orDaily: orAnalytics ? orAnalytics.daily : null, providerName: providerLabel(yaml), nousBilled },
         scope,
         profileCount: profiles.length,
@@ -1494,16 +1845,33 @@ function useMeterData() {
         yaml,
         profile,
         profileLabel: (profiles.find(p => p.name === profile) || {}).label || profile,
+        off: !!own,
+        aside: blind ? { machine: apart.name, apart: true } : away ? { machine: away } : null,
+        // the machine the numbers are from when it is not the window's own, its name while nothing else says
+        // it, and the name of the chat's bot there
+        at,
+        fromMachine: apart && !blind && !off ? apart.name : null,
+        fromBot: (apart && profiles[0].label) || null,
         orProfile,
         orAny,
         // the OpenRouter account card belongs to OpenRouter profiles (or to the all-profiles total)
-        account: scope === 'all' || orProfile ? account || s.account : null,
+        // (the last account read stands in when a read fails, but never another machine's)
+        account: scope === 'all' || orProfile ? account || (before ? before.account : null) : null,
         limits
-      }))
+      }
+      seen.current.set(at, next)
+      setState(next)
     } catch (e) {
-      setState(s => ({ ...s, loading: false, error: (e && e.message) || 'load failed' }))
+      if (!dropped()) setState(s => failedFor(s, seen.current, at, (e && e.message) || 'load failed'))
     } finally {
-      busy.current = false
+      // a newer look has taken over where this is no longer the running one
+      if (mine === turn.current) {
+        busy.current = null
+        if (again.current) {
+          again.current = false
+          refresh()
+        }
+      }
     }
   }
 
@@ -1522,6 +1890,19 @@ function useMeterData() {
   useEffect(() => {
     if (sidRef.current && !state.account) refresh()
   }, [focusedSid, activeSid])
+
+  // the focused chat or the window itself now sits on another machine: show that one's numbers at once
+  const owner = host.state.focusedSessionOwner ? useValue(host.state.focusedSessionOwner) : null
+  focusRef.current = { owner: owner || null, id: useValue(host.state.focusedStoredSessionId) || null, sid: focusedSid || null, usage: useValue(host.state.focusedUsage) || null }
+  // requests go to the machine of the chat in front from the moment that chat changes, whatever a look is
+  // doing: a view opened or a change saved right after a switch must never reach the machine left behind
+  aim = aimOf(owner || null)
+  const machine = ((owner && owner.connectionId) || '') + ' ' + ((typeof host.activeConnectionId === 'function' && host.activeConnectionId()) || '')
+  const firstLook = useRef(true) // the first look is started by the effect below, every later machine change here
+  useEffect(() => {
+    if (!firstLook.current) refresh()
+    firstLook.current = false
+  }, [machine])
 
   useEffect(() => {
     refresh()
@@ -1543,7 +1924,7 @@ function useMeterData() {
     if (busy.current) setTimeout(refresh, 900)
     else refresh()
   }
-  return { ...state, refresh, setScope }
+  return { ...shownFor(state, seen.current, machineOf(owner)), refresh, setScope }
 }
 
 function useLive(prices, fallbackModel) {
@@ -1551,7 +1932,8 @@ function useLive(prices, fallbackModel) {
   useEffect(() => {
     const off = host.onEvent('session.usage', payload => {
       if (!payload || !payload.usage) return
-      recordTick(payload.session_id || payload.sessionId || payload.sid, payload.usage)
+      const sid = payload.session_id || payload.sessionId || payload.sid
+      recordTick(sid, payload.usage, !!sid && sid === host.state.focusedSessionId.get())
       bump(x => x + 1)
     })
     const iv = setInterval(() => bump(x => x + 1), 5000)
@@ -2289,7 +2671,7 @@ const SessionRow = ({ s, threshold, hot, onHover, current }) => {
       'div',
       {
         style: { display: 'grid', gridTemplateColumns: 'minmax(0,1.5fr) 52px minmax(0,1fr) 30px 46px', gap: 8, alignItems: 'center', padding: '7px 0', borderTop: '1px solid ' + C.stroke, fontSize: 12 },
-        title: 'Delegate runs and hidden sessions: total minus the sessions listed above'
+        title: s.tip
       },
       el('div', { style: { display: 'flex', alignItems: 'center', gap: 6, color: C.sub } }, el('span', { style: { color: C.faint } }, '⌐'), el('span', null, s.title)),
       el('div', { style: { textAlign: 'right', color: C.text, fontVariantNumeric: 'tabular-nums' } }, fmtUsd(s.cost).replace(/^\$/, '')),
@@ -3191,7 +3573,7 @@ const TimelineView = ({ items }) => {
 // AAI, v7 layout: quick look, then what needs you, then what is happening, then tools and settings
 const AaiView2 = ({ profile, period, yaml, orProfile, auxOn, onChanged }) => {
   const days = AAI_DAYS[period] || 7
-  const ck = 'aai|' + profile + '|' + days
+  const ck = 'aai|' + aimKey(aim) + '|' + profile + '|' + days
   const seen = viewCache.get(ck) || {}
   const [data, setData] = useState(seen.data || null)
   const [err, setErr] = useState(null)
@@ -3594,7 +3976,7 @@ const HdrGuard = ({ g, profile, days, onChanged }) => {
       const r = await api(profileReq(profile, { path: '/api/plugins/hermetic/hdr/guard', method: 'POST', body }))
       if (r && r.ok === false) throw new Error(r.error || 'Could not save')
       onChanged && onChanged()
-    } catch (e) { setErr(/404|Not Found/i.test(String(e && e.message)) ? 'Restart Hermes to load the guard' : (e && e.message) || 'Could not save') } finally { setBusy(false) }
+    } catch (e) { setErr(noRoute(e) ? 'Restart Hermes to load the guard' : (e && e.message) || 'Could not save') } finally { setBusy(false) }
   }
   const n = g.risky_calls || 0
   const span = days === 1 ? 'Today' : 'In the last ' + days + ' days'
@@ -3656,6 +4038,49 @@ const HdrHooks = ({ h, profile, onChanged }) => {
 const opIng = op => (op === 'read' ? 'reading ' : op === 'write' ? 'writing ' : 'using ')
 const inChat = chat => (chat ? ' (' + chat + ')' : '')
 
+// Copies a text, and shows a tick for a moment once it has
+const CopyBtn = ({ text, label = 'Copy to clipboard', style }) => {
+  const [copied, setCopied] = useState(false)
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(text)
+      setCopied(true)
+      setTimeout(() => setCopied(false), 1500)
+    } catch {
+      /* clipboard unavailable */
+    }
+  }
+  return el(Tip, { label: copied ? 'Copied' : label },
+    el('button', { type: 'button', 'aria-label': label, onClick: copy, className: 'hover:text-(--ui-text-primary) hover:bg-(--ui-bg-secondary)',
+      style: { display: 'flex', alignItems: 'center', justifyContent: 'center', flex: 'none', width: 22, height: 22, padding: 0, border: 'none', borderRadius: 5, background: 'transparent', color: copied ? C.ok : C.dim, cursor: 'pointer', ...style } },
+      el('svg', { width: 13, height: 13, viewBox: '0 0 16 16', 'aria-hidden': true, style: { display: 'block' } },
+        copied
+          ? el('path', { d: 'm3.5 8.5 3 3 6-7', fill: 'none', stroke: 'currentColor', strokeWidth: 1.6, strokeLinecap: 'round', strokeLinejoin: 'round' })
+          : [
+              el('rect', { key: 'a', x: 5.5, y: 5.5, width: 8, height: 8.5, rx: 1.6, fill: 'none', stroke: 'currentColor', strokeWidth: 1.4 }),
+              el('path', { key: 'b', d: 'M10.5 5.5V3.6A1.6 1.6 0 0 0 8.9 2H4.1A1.6 1.6 0 0 0 2.5 3.6v5.8A1.6 1.6 0 0 0 4.1 11h1.4', fill: 'none', stroke: 'currentColor', strokeWidth: 1.4, strokeLinecap: 'round' })
+            ])))
+}
+
+// The chats on screen come from Hermes' own list, not hermetic's backend: says of which machine, and what
+// would show everything. For a machine without hermetic that is a request to copy for its agent, which
+// installs it there. `apart`: a chat on another connection in an app that cannot ask that connection by
+// name, where only making it the primary one helps.
+const AsideNote = ({ aside }) => {
+  const { machine, apart } = aside
+  const name = el('span', { key: 'm', style: { color: C.text } }, machine)
+  const second = { color: C.dim, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }
+  return el('div', { role: 'status', style: { padding: '8px 12px 6px 16px', fontSize: 11, lineHeight: 1.45, color: C.sub, borderBottom: '1px solid ' + C.stroke, maxWidth: 400, boxSizing: 'border-box' } },
+    el(Tip, { label: apart ? 'A plugin can only ask the primary connection, so this comes from Hermes\' own records' : 'Until then Costs shows Hermes\' own total for each chat, on the day it was last active' },
+      el('div', { style: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, apart ? ['Limited view of ', name] : ['hermetic is not installed on ', name])),
+    apart
+      ? el('div', { style: { ...second, paddingBottom: 2 } }, 'Make it primary in Settings to see everything')
+      : el('div', { style: { display: 'flex', alignItems: 'center', gap: 6 } },
+          // the request as it will be pasted, its lines kept apart
+          el(Tip, { label: el('span', { style: { whiteSpace: 'pre-line' } }, INSTALL_REQUEST) }, el('span', { style: second }, 'Ask its agent to install it')),
+          el(CopyBtn, { text: INSTALL_REQUEST, label: 'Copy the request for the agent' })))
+}
+
 // Above the popover after a question ran out, so a block never passes unseen: until you have seen it, two minutes at most.
 const RanOutNote = ({ o }) =>
   el('div', { role: 'status', style: { padding: '8px 16px', fontSize: 11, lineHeight: 1.45, color: C.sub, borderBottom: '1px solid ' + C.stroke, maxWidth: 400, boxSizing: 'border-box' } },
@@ -3705,7 +4130,7 @@ const AskCard = ({ ask, more, onAnswered }) => {
 
 const HdrView = ({ profile, period }) => {
   const days = AAI_DAYS[period] || 7
-  const ck = 'hdr|' + profile + '|' + days
+  const ck = 'hdr|' + aimKey(aim) + '|' + profile + '|' + days
   const [d, setD] = useState(() => viewCache.get(ck) || null)
   const [err, setErr] = useState(null)
   const [tick, setTick] = useState(0)
@@ -3714,7 +4139,7 @@ const HdrView = ({ profile, period }) => {
     if (viewCache.has(ck)) setD(viewCache.get(ck))
     api(profileReq(profile, { path: '/api/plugins/hermetic/hdr?days=' + days }))
       .then(r => live && (r && r.error ? setErr(r.error) : (viewCache.set(ck, r), setD(r), setErr(null))))
-      .catch(e => live && setErr(/404|Not Found/i.test(String(e && e.message)) ? 'Restart Hermes to load HDR: Hermes menu, Quit and Keep Windows, then reopen.' : (e && e.message) || 'Backend plugin off'))
+      .catch(e => live && setErr(noRoute(e) ? 'Restart Hermes to load HDR: Hermes menu, Quit and Keep Windows, then reopen.' : (e && e.message) || 'Backend plugin off'))
     return () => { live = false }
   }, [profile, days, tick])
   if (err) return el('div', { style: { fontSize: 11, color: C.faint, marginTop: 14 } }, err)
@@ -3747,7 +4172,10 @@ const HdrView = ({ profile, period }) => {
 // direction of the view arrow, kept across renders (see the header in Body)
 let navDir = 1
 
-const Body = ({ meter, prices, threshold, retries, yaml, profile, profileLabel, refresh, rates, defaultModel, account, planLimits, onPeriod, cheapest, orProfile = true, orAny = true, view = 'costs', onView, scope = 'all', profileCount = 1, onScope }) => {
+// the small outlined tag next to the total
+const TAG = { font: 'inherit', fontSize: 10.5, padding: '1px 7px', borderRadius: 8, border: '1px solid ' + C.stroke, background: 'transparent', color: C.sub, whiteSpace: 'nowrap', flex: 'none' }
+
+const Body = ({ meter, prices, threshold, retries, yaml, profile, profileLabel, refresh, rates, defaultModel, account, planLimits, onPeriod, cheapest, orProfile = true, orAny = true, view = 'costs', onView, scope = 'all', profileCount = 1, onScope, off = false, aside = null, at = '', fromMachine = null, fromBot = null }) => {
   const currentId = useValue(host.state.focusedStoredSessionId) || null
   const [period, setPeriod] = useState(() => sget('period', '7d'))
   const [hover, setHover] = useState(null)
@@ -3767,7 +4195,7 @@ const Body = ({ meter, prices, threshold, retries, yaml, profile, profileLabel, 
   // day's OpenRouter list cost), like the headline
   const billed = useMemo(() => {
     if (account == null) return null
-    const raw = sget('billed', null) || {}
+    const raw = sget(billedKey(), null) || {}
     if (scope === 'all' || !meter.orDaily) return raw
     const out = {}
     for (const [day, usd] of Object.entries(raw)) {
@@ -3786,7 +4214,7 @@ const Body = ({ meter, prices, threshold, retries, yaml, profile, profileLabel, 
   const liveTone = liveRate >= 5 ? 'bad' : liveRate >= 1.5 ? 'warn' : null
   const multiple = typicalHourly > 0 ? liveRate / typicalHourly : 0
 
-  const acct = account ? (period === 'today' ? account.today : period === '7d' ? account.week : account.month) : null
+  const acct = periodBill(account, period, meter)
   const [limTotal, setLimTotal] = useState(() => !!sget('limTotal', false))
   const lim = spendLimit(account, period, limTotal)
   const flipLimit = e => {
@@ -3927,13 +4355,13 @@ const Body = ({ meter, prices, threshold, retries, yaml, profile, profileLabel, 
     (i.id === 'aux' && !!facts.auxModel && /flash/i.test(facts.auxModel)) ||
     (i.id === 'fallback' && facts.allowFallbacks !== false) ||
     (i.id === 'compact' && i.change && threshold <= i.change.value + 1e-9)
-  const pending = improvements.filter(i => !applied(i))
+  const pending = off ? [] : improvements.filter(i => !applied(i)) // a fix is a config change, which takes the backend
   pending.sort((a, b) => b.save - a.save)
   const topImprove = pending[0]
   const worseProvider = orProfile ? qualityWorst(meter.quality, qualityDays(period), yaml) : null
   let verdictTone = 'ok'
   let verdict
-  if (!backendPatched && !account) {
+  if (off && !aside && !account) {
     verdictTone = 'warn'
     verdict = 'Backend plugin off, add hermetic to plugins.enabled and restart'
   } else if (agents > 0 && liveTone) {
@@ -3941,7 +4369,7 @@ const Body = ({ meter, prices, threshold, retries, yaml, profile, profileLabel, 
     verdict = agents + (agents === 1 ? ' agent' : ' agents') + ' running at ' + fmtRate(liveRate) + (multiple >= 2 ? ', ' + Math.round(multiple) + '× your usual' : '')
   } else if (agents > 0) {
     verdict = agents + (agents === 1 ? ' agent' : ' agents') + ' running at ' + fmtRate(liveRate)
-  } else if (m.bloatOver) {
+  } else if (m.bloatOver && !off) {
     verdictTone = 'warn'
     verdict = trunc(m.bloat.title, 28) + ' is past the compaction threshold'
   } else if (worseProvider) {
@@ -3955,13 +4383,14 @@ const Body = ({ meter, prices, threshold, retries, yaml, profile, profileLabel, 
 
   // The session with the highest average prompt size this period, as a share of its model's window,
   // against the auto-compaction threshold. Named in the label so it cannot read as the current chat.
+  // (the compaction threshold is a config value, which only the backend reads: without it the share stands alone)
   const bloatCell = m.bloat
     ? {
-        tone: m.bloatOver ? 'warn' : 'ok',
+        tone: off ? null : m.bloatOver ? 'warn' : 'ok',
         label: el('span', null, 'Peak context', el('span', { style: { color: C.dim, marginLeft: 6 } }, m.bloat.title || shortModel(m.bloat.model))),
         value: fmtPct(m.bloat.ctxShare * 100),
-        sub: el('span', { style: { fontSize: 13, fontWeight: 400, color: C.dim, marginLeft: 4 } }, '/ ' + Math.round(threshold * 100) + '%'),
-        tip: trunc(m.bloat.title, 40) + ': ' + fmtTok(m.bloat.ctxPerCall) + ' tokens per call on average ÷ ' + fmtTok(m.bloat.window) + ' window, auto-compaction at ' + Math.round(threshold * 100) + '%'
+        sub: off ? '' : el('span', { style: { fontSize: 13, fontWeight: 400, color: C.dim, marginLeft: 4 } }, '/ ' + Math.round(threshold * 100) + '%'),
+        tip: trunc(m.bloat.title, 40) + ': ' + fmtTok(m.bloat.ctxPerCall) + ' tokens per call on average ÷ ' + fmtTok(m.bloat.window) + ' window' + (off ? '' : ', auto-compaction at ' + Math.round(threshold * 100) + '%')
       }
     : { tone: null, label: 'Peak context', value: '-', sub: '', tip: 'No context window known for the models used this period' }
 
@@ -3989,7 +4418,7 @@ const Body = ({ meter, prices, threshold, retries, yaml, profile, profileLabel, 
   const head = el(
     'div',
     { style: { display: 'flex', alignItems: 'center', gap: 8 } },
-    el('span', { style: { fontSize: 11, color: C.sub } }, 'hermetic', el('span', { style: { color: C.dim, marginLeft: 6 } }, VIEWS[vi][1])),
+    el('span', { style: { fontSize: 11, color: C.sub, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, 'hermetic', el('span', { style: { color: C.dim, marginLeft: 6 } }, VIEWS[vi][1])),
     el('span', { style: { flex: 1 } }),
     el(SegmentedControl, {
       value: period,
@@ -4013,8 +4442,8 @@ const Body = ({ meter, prices, threshold, retries, yaml, profile, profileLabel, 
   )
   // the running version and a way to reach the author, small at the bottom of every view
   // (a plain link: Hermes Desktop opens it in the browser)
-  const co = hermeticCheckout
-  const ver = hermeticVersion ? 'v' + hermeticVersion : ''
+  const { version, checkout: co } = builds.get(at || '') || {}
+  const ver = version ? 'v' + version : ''
   const build = co ? co.branch + ' ' + co.commit + (co.edited ? '*' : '') : ver
   const foot = el('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: 8, marginTop: 'auto', paddingTop: 14, fontSize: 10, color: C.faint } },
     co ? el(Tip, { label: 'Running from a git checkout' + (ver ? ' of ' + ver : '') + (co.edited ? ' with uncommitted changes' : '') + ', not a catalog release' }, el('span', null, build))
@@ -4026,8 +4455,10 @@ const Body = ({ meter, prices, threshold, retries, yaml, profile, profileLabel, 
   )
   // a column at least as tall as the card, so the footer sits at the bottom when a view is short
   const card = (...kids) => el('div', { style: cardStyle }, el('div', { style: { minHeight: '100%', display: 'flex', flexDirection: 'column' } }, ...kids))
-  if (view === 'hdr') return card(head, el(HdrView, { profile, period }), foot)
-  if (isAai) return card(head, el(AaiView2, { profile, period, yaml, orProfile, auxOn: !!(meter.aux && meter.aux.enabled), onChanged: refresh }), foot)
+  if (aside && view !== 'costs') return card(head, el('div', { style: { fontSize: 11, color: C.faint, marginTop: 14 } }, VIEWS[vi][1] + ' needs ' + (aside.apart ? aside.machine + ' as the primary connection' : 'hermetic on ' + aside.machine)), foot)
+  // (keyed by machine: a view that showed one machine starts over for another)
+  if (view === 'hdr') return card(head, el(HdrView, { key: 'hdr ' + at, profile, period }), foot)
+  if (isAai) return card(head, el(AaiView2, { key: 'aai ' + at, profile, period, yaml, orProfile, auxOn: !!(meter.aux && meter.aux.enabled), onChanged: refresh }), foot)
   return card(
     head,
     el(
@@ -4044,9 +4475,16 @@ const Body = ({ meter, prices, threshold, retries, yaml, profile, profileLabel, 
       provSplit.length > 1
         ? el(Tip, { label: 'List cost by provider: ' + provSplit.map(([k, v]) => k + ' ' + fmtUsd(v)).join(', ') }, el('span', { title: headlineLabel, style: { fontSize: 11, color: C.sub, cursor: 'help', borderBottom: '1px dotted ' + C.faint, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', flex: '0 1 auto' } }, headlineLabel))
         : el('span', { title: headlineLabel, style: { fontSize: 11, color: C.sub, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', flex: '0 1 auto' } }, headlineLabel),
-      profileCount > 1 && onScope
+      // A chat on another machine carries its bot's name here, as that machine gives it (else the machine's
+      // name), where this computer's chats carry their profile. There is nothing to switch: such a chat is
+      // shown for its own profile only.
+      fromMachine
+        ? el(Tip, { label: 'From hermetic on ' + fromMachine }, el('span', { style: TAG }, fromBot || fromMachine))
+        : fromBot
+        ? el('span', { style: TAG }, fromBot)
+        : profileCount > 1 && onScope
         ? el(Tip, { label: scope === 'all' ? 'Every profile added up. Click to show only this chat\'s profile' : 'Only this chat\'s profile. Click to add up every profile' },
-            el('button', { type: 'button', onClick: () => onScope(scope === 'all' ? 'profile' : 'all'), style: { font: 'inherit', fontSize: 10.5, padding: '1px 7px', borderRadius: 8, cursor: 'pointer', border: '1px solid ' + C.stroke, background: 'transparent', color: C.sub, whiteSpace: 'nowrap', flex: 'none' } },
+            el('button', { type: 'button', onClick: () => onScope(scope === 'all' ? 'profile' : 'all'), style: { ...TAG, cursor: 'pointer' } },
               scope === 'all' ? 'all profiles' : profileLabel || profile))
         : null,
       el(
@@ -4058,11 +4496,11 @@ const Body = ({ meter, prices, threshold, retries, yaml, profile, profileLabel, 
         agents ? fmtRate(liveRate) + '\u2003' + agents + (agents === 1 ? ' agent' : ' agents') : fmtRate(periodRate)
       )
     ),
-    acct != null
+    acct != null || lim
       ? el(
           'div',
           { style: { display: 'flex', flexWrap: 'wrap', columnGap: 14, rowGap: 2, marginTop: 4, fontSize: 11, color: C.sub, fontVariantNumeric: 'tabular-nums', minHeight: 16 } },
-          comparable ? el('span', { style: { whiteSpace: 'nowrap' } }, 'Hermes ', el('span', { style: { color: C.text } }, fmtUsd(shown ? hermesCost : periodHermes))) : null,
+          comparable && acct != null ? el('span', { style: { whiteSpace: 'nowrap' } }, 'Hermes ', el('span', { style: { color: C.text } }, fmtUsd(shown ? hermesCost : periodHermes))) : null,
           elsewhere != null && elsewhere > 0.01 ? el('span', { title: 'billed minus the list-price estimate: the cost of being routed to pricier providers', style: { whiteSpace: 'nowrap' } }, 'routing premium ', el('span', { style: { color: C.text } }, fmtUsd(elsewhere))) : null,
           lim
             ? el(
@@ -4130,13 +4568,15 @@ const Body = ({ meter, prices, threshold, retries, yaml, profile, profileLabel, 
               sub: nous.floors ? nous.floors + (nous.floors === 1 ? ' minimum charge' : ' minimum charges') : 'list price',
               tip: 'Nous Portal billed ' + fmtUsd(nous.billed) + ' for ' + nous.calls + (nous.calls === 1 ? ' call' : ' calls') + ', ' + fmtUsd(nous.list) + ' at its list prices' + (nous.floors ? ', ' + nous.floors + ' raised to its minimum charge' : '')
             })
-          : el(Cell, {
-            tone: routingTone,
-            label: orAny ? 'Routing' : 'Background',
-            value: m.auxCost > 0 ? fmtUsd(m.auxCost) : 'clean',
-            sub: m.auxCost > 0 ? 'aux on paid lane' : '',
-            tip: 'Background review, compression and title generation billed on paid models (' + fmtPct(m.auxShare * 100) + ' of spend)'
-          }),
+          : off
+            ? el(Cell, { tone: null, label: 'Background', value: '-', sub: '', tip: 'Background tasks are counted by hermetic\'s backend' })
+            : el(Cell, {
+              tone: routingTone,
+              label: orAny ? 'Routing' : 'Background',
+              value: m.auxCost > 0 ? fmtUsd(m.auxCost) : 'clean',
+              sub: m.auxCost > 0 ? 'aux on paid lane' : '',
+              tip: 'Background review, compression and title generation billed on paid models (' + fmtPct(m.auxShare * 100) + ' of spend)'
+            }),
       el(Cell, {
         tone: cacheHit == null || cacheUnreported ? null : cacheHit >= 0.9 ? 'ok' : cacheHit >= 0.75 ? 'warn' : 'bad',
         label: 'Cache hit',
@@ -4159,7 +4599,7 @@ const Body = ({ meter, prices, threshold, retries, yaml, profile, profileLabel, 
     ),
     el(SessionsSection, { m, threshold, currentId }),
     el(FlowSection, { m, drift }),
-    el(RoutingSection, {
+    off ? null : el(RoutingSection, {
       policyOn: orProfile,
       providerName: meter.providerName,
       rows: meter.routing ? meter.routing.rows : [],
@@ -4629,7 +5069,7 @@ async function freshConfig(profile) {
 
 async function loadQuality(profile) {
   try {
-    const r = await api(profileReq(profile, { path: OWN + '/quality' }))
+    const r = await askRoute('/quality', profileReq(profile, { path: OWN + '/quality' }))
     return r && Array.isArray(r.models) ? r : null
   } catch {
     return null
@@ -5020,7 +5460,6 @@ const RoutingSection = ({ policyOn = true, providerName, rows, since, recording,
   const [editing, setEditing] = useState(false)
   const [showDiff, setShowDiff] = useState(false)
   const [pick, setPick] = useState(null)
-  const [copied, setCopied] = useState(false)
   const [more, setMore] = useState(null)
   const [othersAll, setOthersAll] = useState(false)
   const OTHERS_ROWS = 5
@@ -5666,38 +6105,7 @@ const RoutingSection = ({ policyOn = true, providerName, rows, since, recording,
                   { style: { background: 'var(--ui-bg-tertiary)', borderRadius: 6, padding: '8px 34px 8px 10px', fontSize: 11, fontFamily: 'var(--font-mono, ui-monospace, monospace)', whiteSpace: 'pre', overflow: 'auto', maxHeight: 260, color: C.sub } },
                   rawPolicy
                 ),
-                el(
-                  Tip,
-                  { label: copied ? 'Copied' : 'Copy to clipboard' },
-                  el(
-                    'button',
-                    {
-                      type: 'button',
-                      'aria-label': 'Copy to clipboard',
-                      onClick: async () => {
-                        try {
-                          await navigator.clipboard.writeText(rawPolicy)
-                          setCopied(true)
-                          setTimeout(() => setCopied(false), 1500)
-                        } catch {
-                          /* clipboard unavailable */
-                        }
-                      },
-                      className: 'hover:text-(--ui-text-primary) hover:bg-(--ui-bg-secondary)',
-                      style: { position: 'absolute', top: 6, right: 6, display: 'flex', alignItems: 'center', justifyContent: 'center', width: 22, height: 22, padding: 0, border: 'none', borderRadius: 5, background: 'transparent', color: copied ? C.ok : C.dim, cursor: 'pointer' }
-                    },
-                    el(
-                      'svg',
-                      { width: 13, height: 13, viewBox: '0 0 16 16', 'aria-hidden': true, style: { display: 'block' } },
-                      copied
-                        ? el('path', { d: 'm3.5 8.5 3 3 6-7', fill: 'none', stroke: 'currentColor', strokeWidth: 1.6, strokeLinecap: 'round', strokeLinejoin: 'round' })
-                        : [
-                            el('rect', { key: 'a', x: 5.5, y: 5.5, width: 8, height: 8.5, rx: 1.6, fill: 'none', stroke: 'currentColor', strokeWidth: 1.4 }),
-                            el('path', { key: 'b', d: 'M10.5 5.5V3.6A1.6 1.6 0 0 0 8.9 2H4.1A1.6 1.6 0 0 0 2.5 3.6v5.8A1.6 1.6 0 0 0 4.1 11h1.4', fill: 'none', stroke: 'currentColor', strokeWidth: 1.4, strokeLinecap: 'round' })
-                          ]
-                    )
-                  )
-                )
+                el(CopyBtn, { text: rawPolicy, style: { position: 'absolute', top: 6, right: 6 } })
               )
             : null,
           dirty && showDiff && change
@@ -5752,9 +6160,9 @@ const ContextGauge = ({ pct, used, max, threshold }) => {
 // ---- chip -------------------------------------------------------------------
 
 const Chip = () => {
-  const { loading, error, data, prices, threshold, retries, yaml, profile, profileLabel, refresh, account, limits, cheapest, orProfile, orAny, scope, profileCount, setScope } = useMeterData()
+  const { loading, error, data, prices, threshold, retries, yaml, profile, profileLabel, refresh, account, limits, cheapest, orProfile, orAny, scope, profileCount, setScope, off, aside, at, fromMachine, fromBot } = useMeterData()
   const defaultModel = useValue(host.state.model) || ''
-  const rates = useLive(prices, defaultModel)
+  const rates = useLive(prices, defaultModel).filter(r => r.at === (at || '')) // the shown machine's running chats
   const focusedUsage = useValue(host.state.focusedUsage)
   const focusedSid = useValue(host.state.focusedSessionId)
   const liveFocused = focusedSid && live.get(focusedSid) && live.get(focusedSid).last ? live.get(focusedSid).last.raw : null
@@ -5800,10 +6208,10 @@ const Chip = () => {
       while (live) {
         let r
         try {
-          r = await api({ path: OWN + '/hdr/guard/asks?wait=25&have=' + encodeURIComponent(have), timeoutMs: 40_000 })
+          r = await api({ path: OWN + '/hdr/guard/asks?wait=25&have=' + encodeURIComponent(have), timeoutMs: 40_000, here: true })
         } catch (e) {
           // an older backend without this route: check again in a minute; a restarting one: in a few seconds
-          await sleep(/404|Not Found/i.test(String(e && e.message)) ? 60_000 : 5000)
+          await sleep(noRoute(e) ? 60_000 : 5000)
           continue
         }
         if (!live) return
@@ -5841,8 +6249,9 @@ const Chip = () => {
   const planUsed = limits ? Math.max(0, ...limits.windows.filter(w => w.scope !== 'model' && w.used_percent != null).map(w => w.used_percent)) : 0
   const quotaLow = (quotaLeft != null && quotaLeft <= 0.05) || planUsed >= 95 || !!(limits && limits.low)
 
-  const label = error ? '-' : running ? fmtRate(liveRate) : fmtUsd(spend)
-  const sub = error ? '' : running ? fmtUsd(spend) + (rates.length > 1 ? '\u2003' + rates.length + ' agents' : '') : fmtRate(avgRate)
+  // no number before the first answer: $0 would read as this machine's spend
+  const label = error ? '-' : !data ? '' : running ? fmtRate(liveRate) : fmtUsd(spend)
+  const sub = error || !data ? '' : running ? fmtUsd(spend) + (rates.length > 1 ? '\u2003' + rates.length + ' agents' : '') : fmtRate(avgRate)
   const periodName = period === 'today' ? 'today' : period === '7d' ? 'last 7 days' : 'last 30 days'
 
   return el(
@@ -5855,7 +6264,7 @@ const Chip = () => {
         'button',
         {
           type: 'button',
-          title: asks.length ? 'hermetic guard: ' + (asks.length === 1 ? 'a question waits' : asks.length + ' questions wait') + ' for you' : ranNote ? 'hermetic guard blocked ' + opIng(ranNote.op) + ranNote.path + ', no answer in time' : error ? 'hermetic: ' + error : loading ? 'hermetic: loading' : 'hermetic, ' + periodName + ', ' + fmtUsd(spend) + (account ? '' : backendPatched ? ' (Hermes estimate)' : ' (Hermes estimate, backend plugin off)'),
+          title: asks.length ? 'hermetic guard: ' + (asks.length === 1 ? 'a question waits' : asks.length + ' questions wait') + ' for you' : ranNote ? 'hermetic guard blocked ' + opIng(ranNote.op) + ranNote.path + ', no answer in time' : error ? 'hermetic: ' + error : loading ? 'hermetic: loading' : 'hermetic, ' + periodName + ', ' + fmtUsd(spend) + (account ? '' : aside ? (aside.apart ? ' (Hermes estimate for ' : ' (Hermes estimate, no hermetic on ') + aside.machine + ')' : off ? ' (Hermes estimate, backend plugin off)' : ' (Hermes estimate)'),
           className: cn(
             'inline-flex h-full items-center gap-2 px-2 text-[0.6875rem] transition-colors',
             'hover:bg-(--chrome-action-hover)',
@@ -5868,7 +6277,7 @@ const Chip = () => {
         },
         asks.length || ranNote ? el('span', { style: { width: 7, height: 7, borderRadius: 4, flex: 'none', background: asks.length ? C.warn : C.bad } }) : null,
         ctxPct != null ? el(ContextGauge, { pct: ctxPct, used: ctxSrc.context_used, max: ctxSrc.context_max, threshold }) : null,
-        el(Spark, { values: spark, tone: quotaLow ? 'bad' : tone, marks: resets.filter(r => r.cause === 'swap') }),
+        el(Spark, { values: spark, tone: quotaLow ? 'bad' : tone, marks: resets.filter(r => r.cause === 'swap' && (r.at || '') === (at || '')) }),
         el('span', { style: { color: tone ? 'inherit' : C.text } }, label),
         sub ? el('span', { style: { color: tone ? 'inherit' : C.dim, opacity: tone ? 0.85 : 1 } }, sub) : null
       )
@@ -5879,7 +6288,7 @@ const Chip = () => {
       asks.length
         ? el(AskCard, { key: asks[0].id, ask: asks[0], more: asks.length - 1, onAnswered: id => { asksWaiting.current = Math.max(0, asks.length - 1); setAsks(x => x.filter(a => a.id !== id)); if (asks.length <= 1) setOpen(false) } })
         : data
-        ? el('div', null, ranNote ? el(RanOutNote, { o: ranNote }) : null, el(Body, { meter: data, prices, threshold, retries, yaml, profile, profileLabel, refresh, rates, defaultModel, account, planLimits: limits, cheapest, orProfile, orAny, onPeriod: setChipPeriod, view, onView: pickView, scope, profileCount, onScope: setScope }))
+        ? el('div', null, ranNote ? el(RanOutNote, { o: ranNote }) : null, aside ? el(AsideNote, { aside }) : null, el(Body, { meter: data, prices, threshold, retries, yaml, profile, profileLabel, refresh, rates, defaultModel, account, planLimits: limits, cheapest, orProfile, orAny, onPeriod: setChipPeriod, view, onView: pickView, scope, profileCount, onScope: setScope, off, aside, at, fromMachine, fromBot }))
         : el('div', { style: { padding: 16, fontSize: 12, color: C.sub, width: 240, fontVariantNumeric: 'tabular-nums' } }, error ? error : reads ? readingLine(reads) : 'Loading…')
     )
   )

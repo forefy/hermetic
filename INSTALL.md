@@ -52,8 +52,23 @@ Click it. A popover opens with **Hermetic Costs** at the top; the arrow at the t
 | The Plugins page shows "copying…" next to Desktop | Hermes has not restarted since the install | Quit and Keep Windows, then open Hermes |
 | The button is there, but AAI or HDR asks you to restart | The backend is not loaded in this profile | Restart Hermes, and check that **Agent** is on for this profile |
 | Provider routing, the policy bar or the OpenRouter account card are missing | Costs follows the profile of the chat you are in, and that profile does not use OpenRouter | Open a chat in an OpenRouter profile, or click the profile pill next to the total to see all profiles |
+| A bar on top says "hermetic is not installed on …" | The chat in front of you runs on another machine, and that machine has no Hermetic | See [Hermes on another machine](#hermes-on-another-machine) |
 
 Hermes turns plugins on per profile. To use Hermetic in another profile, switch to it, open **Capabilities**, then **Plugins**, and click **Install here** on Hermetic.
+
+## Hermes on another machine
+
+Hermes Desktop can also connect to a Hermes that runs somewhere else, a server over SSH for example, as the window's primary connection or as a second one whose bots are listed next to this computer's own. The popover always comes from this computer and follows the chat in front of you: it asks the Hermetic on the machine that chat runs on, so the costs, the providers and the settings you see there are that machine's. That machine needs no screen, only Hermetic's Agent half.
+
+Until it has that, the popover shows a limited Costs view of that machine, from what Hermes itself keeps for each chat (tokens, cost, model and times). A chat counts on the day it was last active, a bot's own chat only while it is the one in front of you (from its live token count, at list prices), and AAI and HDR stay empty. A bar on top says which machine it is, and its copy button gives you a request to paste into the chat in front of you, whose agent runs on that machine and installs Hermetic there. It comes down to this, run on that machine:
+
+```bash
+hermes plugins install hermetic --enable
+```
+
+If the bar is still there a minute after the install, quit and reopen Hermes Desktop.
+
+The two machines can run different versions of Hermetic for a while, since each one updates on its own. The popover shows what that machine's Hermetic can answer, and its version is at the bottom of the popover.
 
 ## Update
 

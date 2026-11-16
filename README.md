@@ -149,6 +149,12 @@ We gave hermetic just enough power to provide extended security, while limiting 
 - Hermes' hook approvals (`shell-hooks-allowlist.json`), gateway hooks in `hooks/`, the hook scripts themselves (a copy of each, as first seen, is kept in `hermetic/hdr/hooks.json` to show later edits), and its own routing records.
 - HDR runs `ps` and `lsof` locally to list ports opened under Hermes.
 
+### Chats on another machine
+
+The popover follows the chat in front of you. When that chat runs on another machine (a server the window is connected to, or a bot on a second connection), the popover asks the hermetic installed on that machine, so what you see and change there is that machine's. A tag next to the total then names that chat's bot, as its own machine calls it (read through the SDK's profile list), or the machine. Where the hermetic on a chat's machine names no provider account (an older one reading a config that says `auto`), the popover asks that chat's own Hermes for the report its `/usage` command prints and reads the account lines from it. The plugin SDK sends a plugin's requests to the window's primary connection only, so for a second connection the popover uses the app's own request function, which takes the connection by name, and only for hermetic's own routes.
+
+Where that machine has no hermetic, Costs shows what Hermes itself keeps for each chat (tokens, cost, model and times), read through the SDK's own chat list, plus the live token count of the chat in front of you. A bar on top then offers a request to paste to that machine's own agent, which installs hermetic there. hermetic itself installs and runs nothing on that machine. See [INSTALL.md](INSTALL.md#hermes-on-another-machine).
+
 ### Disk writes (only when you ask)
 
 - Routing rules and the fixes you apply (through Hermes' own config functions, shown before writing)

@@ -255,10 +255,12 @@ check('a backend that does not answer says nothing, so its machine is not asked 
 // requests go to the machine of the focused chat: the primary one through the SDK, another one by name
 const sent = []
 const named = []
-const door = new Function('pluginRest', 'window', "const OWN = '/api/plugins/hermetic'\n" + grab('let aim = null', '// the last data each AAI') +
-  '\nreturn { api, aimAt: v => { aim = v }, offAt, backendOff, billedKey }')(
+const store = new Map()
+const storeFns = "const sget = (k, fb) => (store.has(k) ? store.get(k) : fb)\nconst sset = (k, v) => store.set(k, v)\n"
+const door = new Function('pluginRest', 'window', 'store', "const OWN = '/api/plugins/hermetic'\n" + storeFns + grab('let aim = null', '// the last data each AAI') +
+  '\nreturn { api, aimAt: v => { aim = v }, offAt, backendOff, billedKey, watchGuardOf, guardMachines }')(
   async (rel, how) => { sent.push([rel, how && how.method]); return { ok: 'primary' } },
-  { hermesDesktop: { api: async req => { named.push(req); return { ok: req.connectionId } } } })
+  { hermesDesktop: { api: async req => { named.push(req); return { ok: req.connectionId } } } }, store)
 const usage = { path: '/api/plugins/hermetic/usage?days=7' }
 check('a chat on the primary machine asks through the SDK', (await door.api(usage)).ok === 'primary' && sent.length === 1 && sent[0][0] === '/usage?days=7&profile=default&reading=1' && !named.length, JSON.stringify({ sent, named }))
 door.aimAt({ connectionId: 'c1', profile: 'default', target: 'default' })
@@ -294,6 +296,20 @@ try { await door.api(usage) } catch (e) { refusedHere = e }
 door.aimAt({ connectionId: 'c2', profile: 'default', target: 'default' })
 check('and the other way round', noRoute(refusedHere) && (await door.api(usage)).ok === 'c2')
 
+// a guard question belongs to the machine that asked: it is answered there, whatever chat is in front
+door.offAt.clear()
+door.aimAt({ connectionId: 'c1', profile: 'default', target: 'default' })
+const sentBefore = sent.length, namedBefore = named.length
+await door.api({ path: '/api/plugins/hermetic/hdr/guard/answer', method: 'POST', body: { id: 'x' }, on: null })
+check('an answer for this machine goes here while another machine\'s chat is in front', sent.length === sentBefore + 1 && named.length === namedBefore)
+door.aimAt(null)
+await door.api({ path: '/api/plugins/hermetic/hdr/guard/answer', method: 'POST', body: { id: 'y' }, on: { connectionId: 'c2', profile: 'default', target: 'default' } })
+check('and one for another machine goes there while this machine\'s chat is in front', named.length === namedBefore + 1 && named[named.length - 1].connectionId === 'c2' && sent.length === sentBefore + 1)
+door.watchGuardOf({ connectionId: 'c1', profile: 'default', target: 'ops' }, 'build-box')
+check('a machine with hermetic is remembered for its guard questions, across restarts', door.guardMachines.get('c1').name === 'build-box' && store.get('guardMachines').length === 1 && store.get('guardMachines')[0].target === 'ops')
+const again = new Function('pluginRest', 'window', 'store', "const OWN = '/api/plugins/hermetic'\n" + storeFns + grab('let aim = null', '// the last data each AAI') + '\nreturn { guardMachines }')(null, {}, store)
+check('and watched again after a restart', again.guardMachines.get('c1') && again.guardMachines.get('c1').target === 'ops')
+
 // an app without a way to ask by name: the machine is still the one in view, and is never asked as the primary one
 door.offAt.clear()
 door.aimAt({ connectionId: 'c3', profile: 'default', target: 'default', mute: true })
@@ -307,7 +323,7 @@ check('while the guard still asks the primary machine', sent.length === sentSoFa
 
 // a route an older hermetic lacks is asked once per machine, then left alone
 const asked = []
-const routes = new Function('pluginRest', 'window', "const OWN = '/api/plugins/hermetic'\nconst noRoute = e => /404|Not Found/i.test(String(e && e.message))\n" + grab('let aim = null', '// the last data each AAI') +
+const routes = new Function('pluginRest', 'window', "const OWN = '/api/plugins/hermetic'\nconst noRoute = e => /404|Not Found/i.test(String(e && e.message))\nconst sget = (k, fb) => fb\nconst sset = () => {}\n" + grab('let aim = null', '// the last data each AAI') +
   '\nreturn { askRoute, missingRoutes, aimAt: v => { aim = v }, offAt }')(
   async rel => { asked.push(['here', rel]); throw new Error('404: {"detail":"Not Found"}') },
   { hermesDesktop: { api: async req => { asked.push([req.connectionId, req.path]); if (req.connectionId === 'c1') throw new Error('404: {"detail":"Not Found"}'); return { models: [] } } } })
@@ -343,4 +359,13 @@ check('a running chat is counted for its own machine', where['here-1'] === '' &&
 check('so another machine\'s agents never show as running here', running.filter(r => r.at === 'c1').length === 1 && running.filter(r => r.at === '').length === 2)
 const marks = ticks.resetsNow()
 check('a cache reset carries its machine too', marks.length === 1 && marks[0].sid === 'there-1' && marks[0].at === 'c1', JSON.stringify(marks))
+// a hermetic behind the latest that Hermes will not update: the command, or a request for that machine's agent
+const upd = new Function(grab('const UPDATE_CMD = ', 'const UpdateNote = ') + grab('const olderVersion = ', 'async function loadProfiles()') + '\nreturn { updateRequest, olderVersion }')()
+const pinned = { never: true, auto: false, fix: 'hermes plugins remove hermetic && hermes plugins install https://github.com/forefy/hermetic --enable --force' }
+check('another machine gets a request for its agent', upd.updateRequest(pinned, 'build-box') === 'Update the hermetic plugin on this machine to the latest version:\n' + pinned.fix)
+check('this machine gets the command alone', upd.updateRequest(pinned, null) === pinned.fix)
+check('an older backend that does not say how it was installed gets the plain update', upd.updateRequest(null, null) === 'hermes plugins update hermetic')
+check('a linked folder has nothing to run', upd.updateRequest({ never: true, auto: false, fix: null }, null) === null)
+check('versions compare by number, not by text', upd.olderVersion('1.4.0', '1.5.0') && upd.olderVersion('1.9.0', '1.10.0') && upd.olderVersion('1.5', '1.5.1') && !upd.olderVersion('1.5.0', '1.5.0') && !upd.olderVersion('2.0.0', '1.9.9'))
+check('an unknown version is never called outdated', !upd.olderVersion(null, '1.5.0') && !upd.olderVersion('1.5.0', null) && !upd.olderVersion('dev', '1.5.0'))
 process.exit(failed ? 1 : 0)

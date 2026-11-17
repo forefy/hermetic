@@ -14,6 +14,7 @@ import contextvars
 import json as _json
 import math
 import os
+import re
 import sys
 import threading
 import time
@@ -1133,6 +1134,42 @@ async def nous_billed(days: int = Query(30, ge=1, le=90), profile: Optional[str]
 
 # ---- health: which Hermes internals are missing (the popover shows a line only when degraded) -----
 
+# Whether Hermes moves this hermetic to newer versions by itself, from how it installed it, and the command
+# that updates it by hand. A linked folder and an install held at one commit never move (``never``), and
+# Hermes applies updates to the others only with plugins.auto_apply on (``auto``). ``auto`` is None when
+# the install is not one Hermes recorded.
+_SOURCE_RE = re.compile(r"^https://[A-Za-z0-9.-]+/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+?(\.git)?$")
+_UPDATE_CMD = "hermes plugins update hermetic"
+
+
+def _update_state():
+    try:
+        from hermes_constants import get_hermes_home
+        from hermes_cli.config import load_config_readonly
+        plugins = Path(get_hermes_home()) / "plugins"
+        auto = bool(((load_config_readonly() or {}).get("plugins") or {}).get("auto_apply"))
+        if (plugins / "hermetic").is_symlink():
+            return {"never": True, "why": "link", "auto": False, "fix": None}  # someone's own checkout
+        try:
+            rec = _json.loads((plugins / ".install-metadata.json").read_text(encoding="utf-8-sig")).get("hermetic")
+        except (OSError, ValueError, AttributeError):
+            rec = None
+        if not isinstance(rec, dict):
+            return {"never": False, "why": None, "auto": None, "fix": None}
+        catalog = rec.get("catalog")
+        if rec.get("pinned") is True and not (isinstance(catalog, dict) and catalog.get("pin")):
+            if isinstance(catalog, dict):  # a catalog install held at a chosen commit: updating moves it back
+                return {"never": True, "why": "held", "auto": False, "fix": _UPDATE_CMD}
+            # a pin stays on a reinstall from the same source, so the install is removed first
+            source = str(rec.get("source") or "")
+            source = source.removesuffix(".git") if _SOURCE_RE.match(source) else "https://github.com/forefy/hermetic"
+            return {"never": True, "why": "pinned", "auto": False,
+                    "fix": "hermes plugins remove hermetic && hermes plugins install " + source + " --enable --force"}
+        return {"never": False, "why": None, "auto": auto, "fix": _UPDATE_CMD}
+    except Exception:
+        return None
+
+
 @router.get("/health")
 async def health():
     def _run():
@@ -1159,7 +1196,8 @@ async def health():
                     break
         except OSError:
             pass
-        return {"missing": sorted(set(missing) | _DEGRADED), "version": version, "checkout": _own_checkout()}
+        return {"missing": sorted(set(missing) | _DEGRADED), "version": version, "checkout": _own_checkout(),
+                "updates": _update_state()}
 
     return await asyncio.to_thread(_run)
 

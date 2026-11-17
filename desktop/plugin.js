@@ -216,7 +216,9 @@ const api = req => {
   if (!path.startsWith(OWN)) return Promise.reject(new Error('Not a hermetic route: ' + path))
   if (!pluginRest) return Promise.reject(new Error('hermetic is still loading'))
   let rel = path.slice(OWN.length) || '/'
-  const to = req.here ? null : aim // `here`: the primary machine whatever chat is focused (its guard's questions)
+  // `on`: that machine (null: the primary one), whatever chat is focused, for what belongs to one machine,
+  // like a guard question and its answer. `here`: the primary machine.
+  const to = req.on !== undefined ? req.on : req.here ? null : aim
   if (to && to.mute) return Promise.reject(new Error('hermetic cannot ask this machine'))
   const key = aimKey(to)
   // a machine without the backend is asked for its health only, once per refresh
@@ -237,6 +239,44 @@ const api = req => {
   const id = key + ' ' + rel
   if (!inflight.has(id)) inflight.set(id, untilRead(() => go('&reading=1'), r => noteReading(id, r)).finally(() => inflight.delete(id)))
   return inflight.get(id)
+}
+// Other machines with hermetic, whose guard questions this popover watches as well as this machine's, so a
+// bot there is asked and answered like a local one: learned when one of their chats is in front, kept
+// across restarts. connection id -> { connectionId, profile, target, name }
+const guardMachines = new Map((sget('guardMachines', []) || []).filter(m => m && m.connectionId).map(m => [m.connectionId, m]))
+const guardWatch = new Set() // listeners told when a machine is added
+const watchGuardOf = (to, name) => {
+  const had = guardMachines.get(to.connectionId)
+  if (had && had.name === name && had.target === to.target) return
+  guardMachines.set(to.connectionId, { connectionId: to.connectionId, profile: to.profile, target: to.target, name })
+  sset('guardMachines', Array.from(guardMachines.values()))
+  guardWatch.forEach(f => f())
+}
+// The window's other connections that run hermetic, found by asking each one's health (a 404 means it has
+// none), for their guard questions. At start and every ten minutes, so a bot on a server is asked like a
+// local one before any of its chats has been in front.
+async function findGuardMachines() {
+  if (!namedApi() || typeof host.profileRoutes !== 'function') return
+  let list = []
+  try {
+    list = (await host.profileRoutes()) || []
+  } catch {
+    return
+  }
+  const reach = (typeof host.activeConnectionId === 'function' && host.activeConnectionId()) || 'local'
+  const seen = new Set()
+  for (const r of list) {
+    if (!r || !r.connectionId || r.connectionId === reach || seen.has(r.connectionId)) continue
+    seen.add(r.connectionId)
+    const to = { connectionId: r.connectionId, profile: r.profile || 'default', target: r.targetProfile || r.profile || 'default' }
+    try {
+      await api({ path: OWN + '/health', on: to, timeoutMs: 10_000 })
+      const row = await connectionOf(r.connectionId)
+      watchGuardOf(to, (row && row.label) || r.connectionId)
+    } catch {
+      /* no hermetic there, or not reachable now */
+    }
+  }
 }
 // Routes an older hermetic does not have yet, by machine: asked once, then left alone until that machine
 // reports another version. A whole backend that is missing is `offAt`'s, not this.
@@ -409,6 +449,31 @@ async function apartMachine(owner) {
 const INSTALL_REQUEST = 'Install the hermetic plugin on this machine:\nhermes plugins install hermetic --enable'
 
 const profileRows = r => ((r && r.profiles) || []).map(p => ({ name: p.name, isDefault: !!p.is_default, label: botLabel(p) }))
+// The latest hermetic, from its plugin.yaml on GitHub (it moves only with a release), read twice a day: what
+// an installed one is measured against
+async function loadLatestVersion() {
+  const cached = sget('latest', null)
+  if (cached && Date.now() - cached.t < 12 * 3600_000) return cached.v
+  try {
+    const res = await fetch('https://raw.githubusercontent.com/forefy/hermetic/main/plugin.yaml')
+    if (!res.ok) throw new Error(String(res.status))
+    const m = (await res.text()).match(/^version:\s*["']?(\d+(?:\.\d+)*)/m)
+    const v = m ? m[1] : null
+    sset('latest', { t: Date.now(), v })
+    return v
+  } catch {
+    return cached ? cached.v : null
+  }
+}
+// whether version a comes before version b ("1.4.0" before "1.10.0")
+const olderVersion = (a, b) => {
+  const x = String(a || '').split('.').map(Number)
+  const y = String(b || '').split('.').map(Number)
+  if (!a || !b || x.some(isNaN) || y.some(isNaN)) return false
+  for (let i = 0; i < Math.max(x.length, y.length); i++) if ((x[i] || 0) !== (y[i] || 0)) return (x[i] || 0) < (y[i] || 0)
+  return false
+}
+
 async function loadProfiles() {
   try {
     return profileRows(await host.profiles.list())
@@ -964,7 +1029,7 @@ async function loadHealth() {
     offAt.delete(key)
     // another version may have the routes this one lacked
     if (r && r.version && (builds.get(key) || {}).version !== r.version) for (const k of Array.from(missingRoutes)) if (k.startsWith(key + ' ')) missingRoutes.delete(k)
-    builds.set(key, { version: (r && r.version) || (builds.get(key) || {}).version || null, checkout: (r && r.checkout) || null })
+    builds.set(key, { version: (r && r.version) || (builds.get(key) || {}).version || null, checkout: (r && r.checkout) || null, updates: (r && r.updates) || null })
     return (r && r.missing) || []
   } catch (e) {
     if (!noRoute(e)) return null
@@ -1710,7 +1775,7 @@ function useMeterData() {
       const wasOff = !blind && backendOff()
       // the health check tells whether that machine has the backend at all; what does not depend on it is
       // asked at the same time
-      const [health, [profiles, prices, yamlAsked]] = await Promise.all([
+      const [health, [profiles, prices, yamlAsked, latest]] = await Promise.all([
         blind ? [] : loadHealth(),
         Promise.all([
           // a chat on another machine is shown for its own profile, under the name that machine gives its bot
@@ -1721,7 +1786,8 @@ function useMeterData() {
               })
             : loadProfiles(),
           loadPrices(),
-          blind ? '' : loadConfigRaw(profile)
+          blind ? '' : loadConfigRaw(profile),
+          loadLatestVersion()
         ])
       ])
       if (dropped()) return
@@ -1732,6 +1798,7 @@ function useMeterData() {
         throw new Error((apart ? apart.name : 'Hermes') + ' is not answering')
       }
       const off = !blind && backendOff()
+      if (apart && !blind && !off) watchGuardOf(aim, apart.name)
       // a backend that has just come back was not asked for the config with the rest
       const yaml = wasOff && !off ? await loadConfigRaw(profile) : yamlAsked
       const away = !off ? null : !apart ? await awayMachine() : apart.local ? null : apart.name
@@ -1852,6 +1919,12 @@ function useMeterData() {
         at,
         fromMachine: apart && !blind && !off ? apart.name : null,
         fromBot: (apart && profiles[0].label) || null,
+        // that machine's hermetic is behind the latest and Hermes will not update it by itself
+        outdated: (() => {
+          const b = builds.get(at) || {}
+          if (off || !olderVersion(b.version, latest) || (b.updates && b.updates.auto)) return null
+          return { updates: b.updates || null, latest }
+        })(),
         orProfile,
         orAny,
         // the OpenRouter account card belongs to OpenRouter profiles (or to the all-profiles total)
@@ -4066,26 +4139,37 @@ const CopyBtn = ({ text, label = 'Copy to clipboard', style }) => {
 // would show everything. For a machine without hermetic that is a request to copy for its agent, which
 // installs it there. `apart`: a chat on another connection in an app that cannot ask that connection by
 // name, where only making it the primary one helps.
-const AsideNote = ({ aside }) => {
-  const { machine, apart } = aside
-  const name = el('span', { key: 'm', style: { color: C.text } }, machine)
-  const second = { color: C.dim, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }
-  return el('div', { role: 'status', style: { padding: '8px 12px 6px 16px', fontSize: 11, lineHeight: 1.45, color: C.sub, borderBottom: '1px solid ' + C.stroke, maxWidth: 400, boxSizing: 'border-box' } },
-    el(Tip, { label: apart ? 'A plugin can only ask the primary connection, so this comes from Hermes\' own records' : 'Until then Costs shows Hermes\' own total for each chat, on the day it was last active' },
-      el('div', { style: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, apart ? ['Limited view of ', name] : ['hermetic is not installed on ', name])),
-    apart
-      ? el('div', { style: { ...second, paddingBottom: 2 } }, 'Make it primary in Settings to see everything')
-      : el('div', { style: { display: 'flex', alignItems: 'center', gap: 6 } },
-          // the request as it will be pasted, its lines kept apart
-          el(Tip, { label: el('span', { style: { whiteSpace: 'pre-line' } }, INSTALL_REQUEST) }, el('span', { style: second }, 'Ask its agent to install it')),
-          el(CopyBtn, { text: INSTALL_REQUEST, label: 'Copy the request for the agent' })))
+// The notices above the view, one look for all: a dot in the tone the rest of the popover uses, a few
+// words, the details in the tooltip, and a copy button when there is something to run.
+const Notice = ({ tone, tip, copy, copyLabel, children }) =>
+  el('div', { role: 'status', style: { display: 'flex', alignItems: 'center', gap: 8, minHeight: 34, padding: '0 10px 0 16px', fontSize: 11.5, color: C.text, borderBottom: '1px solid ' + C.stroke, maxWidth: 400, boxSizing: 'border-box' } },
+    el(Dot, { tone }),
+    tip
+      ? el(Tip, { label: tip }, el('span', { style: { minWidth: 0, flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', cursor: 'help' } }, children))
+      : el('span', { style: { minWidth: 0, flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, children),
+    copy ? el(CopyBtn, { text: copy, label: copyLabel }) : null)
+
+// A hermetic behind the latest version that Hermes will not update by itself (automatic plugin updates off,
+// or an install Hermes never moves). The copy button holds the command, or for another machine a request
+// for its agent. An older backend does not say how it was installed, so only its version counts.
+const UPDATE_CMD = 'hermes plugins update hermetic'
+const updateRequest = (u, machine) => {
+  const cmd = (u && u.fix) || (u && u.never ? null : UPDATE_CMD)
+  return cmd ? (machine ? 'Update the hermetic plugin on this machine to the latest version:\n' : '') + cmd : null
+}
+const UpdateNote = ({ updates, latest, machine }) => {
+  const request = updateRequest(updates, machine)
+  return el(Notice, { tone: 'warn', tip: request ? el('span', { style: { whiteSpace: 'pre-line' } }, request) : null, copy: request, copyLabel: machine ? 'Copy the request for its agent' : 'Copy the command' },
+    machine ? 'Auto-update is off on ' + machine + ', update to ' + latest : 'Auto-update is off, update to ' + latest + ' manually')
 }
 
-// Above the popover after a question ran out, so a block never passes unseen: until you have seen it, two minutes at most.
+const AsideNote = ({ aside }) =>
+  aside.apart
+    ? el(Notice, { tone: 'warn', tip: 'This Hermes cannot ask hermetic on ' + aside.machine }, 'Limited view, update Hermes for more')
+    : el(Notice, { tone: 'warn', tip: el('span', { style: { whiteSpace: 'pre-line' } }, INSTALL_REQUEST), copy: INSTALL_REQUEST, copyLabel: 'Copy the request for its agent' }, 'Limited view, install hermetic on ' + aside.machine)
+
 const RanOutNote = ({ o }) =>
-  el('div', { role: 'status', style: { padding: '8px 16px', fontSize: 11, lineHeight: 1.45, color: C.sub, borderBottom: '1px solid ' + C.stroke, maxWidth: 400, boxSizing: 'border-box' } },
-    el('span', { style: { color: C.bad } }, 'Blocked ' + opIng(o.op) + o.path),
-    ', no answer in time' + inChat(o.chat))
+  el(Notice, { tone: 'bad', tip: 'No answer in time' + inChat(o.chat) }, 'Guard blocked ' + opIng(o.op) + o.path + (o.machine ? ' on ' + o.machine : ''))
 
 const AskCard = ({ ask, more, onAnswered }) => {
   const [scope, setScope] = useState('file')
@@ -4099,7 +4183,8 @@ const AskCard = ({ ask, more, onAnswered }) => {
   const answer = async decision => {
     setBusy(true); setErr(null)
     try {
-      const r = await api({ path: OWN + '/hdr/guard/answer', method: 'POST', body: { id: ask.id, decision, scope, remember } })
+      // the answer goes to the machine that asked, whatever chat is in front
+      const r = await api({ path: OWN + '/hdr/guard/answer', method: 'POST', body: { id: ask.id, decision, scope, remember }, on: ask.at ? guardMachines.get(ask.at) || null : null })
       if (r && r.ok === false) throw new Error(r.error || 'Could not answer')
       onAnswered(ask.id)
     } catch (e) { setErr((e && e.message) || 'Could not answer') } finally { setBusy(false) }
@@ -4116,7 +4201,7 @@ const AskCard = ({ ask, more, onAnswered }) => {
         el('div', { style: { fontSize: 12.5, fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, 'The agent wants to ' + (ask.op === 'read' ? 'read ' : ask.op === 'write' ? 'write ' : 'use ') + ask.path),
         el('div', { style: { fontSize: 10.5, color: C.dim } }, 'Hermes doesn’t check this itself'))),
     el('div', { style: { display: 'grid', gridTemplateColumns: '62px minmax(0,1fr)', gap: '2px 8px', marginTop: 10, fontSize: 11 } },
-      ...kv('tool', ask.tool), ...kv(isJob ? 'job' : 'chat', ask.chat || '-'), ...kv('profile', ask.profile || 'default'), ...kv('why', ask.why)),
+      ...kv('tool', ask.tool), ...(ask.machine ? kv('machine', ask.machine) : []), ...kv(isJob ? 'job' : 'chat', ask.chat || '-'), ...kv('profile', ask.profile || 'default'), ...kv('why', ask.why)),
     el('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginTop: 10, fontSize: 10.5, color: C.dim } }, 'Rule for', el(SegmentedControl, { value: scope, onChange: setScope, options: scopes })),
     el('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginTop: 6, fontSize: 10.5, color: C.dim } }, 'Remember', el(SegmentedControl, { value: remember, onChange: setRemember, options: remembers })),
     el('div', { style: { display: 'flex', alignItems: 'center', gap: 8, marginTop: 12 } },
@@ -4455,7 +4540,7 @@ const Body = ({ meter, prices, threshold, retries, yaml, profile, profileLabel, 
   )
   // a column at least as tall as the card, so the footer sits at the bottom when a view is short
   const card = (...kids) => el('div', { style: cardStyle }, el('div', { style: { minHeight: '100%', display: 'flex', flexDirection: 'column' } }, ...kids))
-  if (aside && view !== 'costs') return card(head, el('div', { style: { fontSize: 11, color: C.faint, marginTop: 14 } }, VIEWS[vi][1] + ' needs ' + (aside.apart ? aside.machine + ' as the primary connection' : 'hermetic on ' + aside.machine)), foot)
+  if (aside && view !== 'costs') return card(head, el('div', { style: { fontSize: 11, color: C.faint, marginTop: 14 } }, VIEWS[vi][1] + ' needs ' + (aside.apart ? 'a newer Hermes' : 'hermetic on ' + aside.machine)), foot)
   // (keyed by machine: a view that showed one machine starts over for another)
   if (view === 'hdr') return card(head, el(HdrView, { key: 'hdr ' + at, profile, period }), foot)
   if (isAai) return card(head, el(AaiView2, { key: 'aai ' + at, profile, period, yaml, orProfile, auxOn: !!(meter.aux && meter.aux.enabled), onChanged: refresh }), foot)
@@ -6160,7 +6245,7 @@ const ContextGauge = ({ pct, used, max, threshold }) => {
 // ---- chip -------------------------------------------------------------------
 
 const Chip = () => {
-  const { loading, error, data, prices, threshold, retries, yaml, profile, profileLabel, refresh, account, limits, cheapest, orProfile, orAny, scope, profileCount, setScope, off, aside, at, fromMachine, fromBot } = useMeterData()
+  const { loading, error, data, prices, threshold, retries, yaml, profile, profileLabel, refresh, account, limits, cheapest, orProfile, orAny, scope, profileCount, setScope, off, aside, at, fromMachine, fromBot, outdated } = useMeterData()
   const defaultModel = useValue(host.state.model) || ''
   const rates = useLive(prices, defaultModel).filter(r => r.at === (at || '')) // the shown machine's running chats
   const focusedUsage = useValue(host.state.focusedUsage)
@@ -6200,37 +6285,57 @@ const Chip = () => {
     if (open) { if (ranNote && !asks.length && data) ranShown.current = ranNote.id }
     else if (ranShown.current) { setRanRead(ranShown.current); ranShown.current = null }
   }, [open, ranNote && ranNote.id, asks.length, !data])
+  // One loop for each machine: this window's own ('') and every other machine with hermetic that has been
+  // seen. Each question and ran-out note carries its machine (`at`, and `machine` for the name).
   useEffect(() => {
     let live = true
-    let have = ''
+    const running = new Set()
+    const ranBy = new Map()
     const sleep = ms => new Promise(done => setTimeout(done, ms))
-    const loop = async () => {
+    const loop = async at => {
+      running.add(at)
+      let have = ''
       while (live) {
+        const far = at ? guardMachines.get(at) : null
         let r
         try {
-          r = await api({ path: OWN + '/hdr/guard/asks?wait=25&have=' + encodeURIComponent(have), timeoutMs: 40_000, here: true })
+          r = await api({ path: OWN + '/hdr/guard/asks?wait=25&have=' + encodeURIComponent(have), timeoutMs: 40_000, on: far })
         } catch (e) {
-          // an older backend without this route: check again in a minute; a restarting one: in a few seconds
-          await sleep(noRoute(e) ? 60_000 : 5000)
+          // an older backend without this route: check again in a minute; a restarting one: in a few
+          // seconds, another machine that cannot be reached: in half a minute
+          await sleep(noRoute(e) ? 60_000 : at ? 30_000 : 5000)
           continue
         }
         if (!live) return
-        if (r && r.key == null) await sleep(2000) // a backend that answers at once: ask every 2s as before
+        // a backend that answers at once: ask every 2s as before, another machine's every 10s
+        if (r && r.key == null) await sleep(at ? 10_000 : 2000)
         have = (r && r.key) || ''
-        const list = (r && r.asks) || []
-        asksWaiting.current = list.length
-        setAsks(list)
+        const name = far ? far.name : ''
+        const list = ((r && r.asks) || []).map(a => ({ ...a, at, machine: name }))
+        setAsks(x => {
+          const next = x.filter(a => a.at !== at).concat(list)
+          asksWaiting.current = next.length
+          return next
+        })
         for (const a of list) {
-          if (askSeen.current.has(a.id)) continue
-          askSeen.current.add(a.id)
+          if (askSeen.current.has(at + ' ' + a.id)) continue
+          askSeen.current.add(at + ' ' + a.id)
           setOpen(true)
         }
         const gone = (r && r.ran_out) || []
-        setRanOut(gone.length ? gone[gone.length - 1] : null)
+        if (gone.length) ranBy.set(at, { ...gone[gone.length - 1], at, machine: name })
+        else ranBy.delete(at)
+        const latest = Array.from(ranBy.values()).sort((a, b) => num(b.ts) - num(a.ts))[0] || null
+        setRanOut(latest)
       }
     }
-    loop()
-    return () => { live = false }
+    const startNew = () => { for (const at of guardMachines.keys()) if (live && !running.has(at)) loop(at) }
+    loop('')
+    startNew()
+    guardWatch.add(startNew)
+    findGuardMachines()
+    const finding = setInterval(findGuardMachines, 600_000)
+    return () => { live = false; guardWatch.delete(startNew); clearInterval(finding) }
   }, [])
 
   const week = lastNDays(7)
@@ -6286,9 +6391,9 @@ const Chip = () => {
       PopoverContent,
       { align: 'end', sideOffset: 8, variant: 'menu', className: 'w-auto p-0 overflow-hidden', onInteractOutside: e => { if (popPin.on) e.preventDefault() } },
       asks.length
-        ? el(AskCard, { key: asks[0].id, ask: asks[0], more: asks.length - 1, onAnswered: id => { asksWaiting.current = Math.max(0, asks.length - 1); setAsks(x => x.filter(a => a.id !== id)); if (asks.length <= 1) setOpen(false) } })
+        ? el(AskCard, { key: asks[0].at + ' ' + asks[0].id, ask: asks[0], more: asks.length - 1, onAnswered: id => { asksWaiting.current = Math.max(0, asks.length - 1); setAsks(x => x.filter(a => !(a.id === id && a.at === asks[0].at))); if (asks.length <= 1) setOpen(false) } })
         : data
-        ? el('div', null, ranNote ? el(RanOutNote, { o: ranNote }) : null, aside ? el(AsideNote, { aside }) : null, el(Body, { meter: data, prices, threshold, retries, yaml, profile, profileLabel, refresh, rates, defaultModel, account, planLimits: limits, cheapest, orProfile, orAny, onPeriod: setChipPeriod, view, onView: pickView, scope, profileCount, onScope: setScope, off, aside, at, fromMachine, fromBot }))
+        ? el('div', null, ranNote ? el(RanOutNote, { o: ranNote }) : null, aside ? el(AsideNote, { aside }) : outdated ? el(UpdateNote, { updates: outdated.updates, latest: outdated.latest, machine: fromMachine }) : null, el(Body, { meter: data, prices, threshold, retries, yaml, profile, profileLabel, refresh, rates, defaultModel, account, planLimits: limits, cheapest, orProfile, orAny, onPeriod: setChipPeriod, view, onView: pickView, scope, profileCount, onScope: setScope, off, aside, at, fromMachine, fromBot }))
         : el('div', { style: { padding: 16, fontSize: 12, color: C.sub, width: 240, fontVariantNumeric: 'tabular-nums' } }, error ? error : reads ? readingLine(reads) : 'Loading…')
     )
   )

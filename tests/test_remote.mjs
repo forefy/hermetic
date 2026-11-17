@@ -360,12 +360,17 @@ check('so another machine\'s agents never show as running here', running.filter(
 const marks = ticks.resetsNow()
 check('a cache reset carries its machine too', marks.length === 1 && marks[0].sid === 'there-1' && marks[0].at === 'c1', JSON.stringify(marks))
 // a hermetic behind the latest that Hermes will not update: the command, or a request for that machine's agent
-const upd = new Function(grab('const UPDATE_CMD = ', 'const UpdateNote = ') + grab('const olderVersion = ', 'async function loadProfiles()') + '\nreturn { updateRequest, olderVersion }')()
+const upd = new Function(grab('const UPDATE_CMD = ', 'const UpdateNote = ') + grab('const latestFor = ', 'async function loadProfiles()') + '\nreturn { updateRequest, olderVersion, latestFor }')()
 const pinned = { never: true, auto: false, fix: 'hermes plugins remove hermetic && hermes plugins install https://github.com/forefy/hermetic --enable --force' }
 check('another machine gets a request for its agent', upd.updateRequest(pinned, 'build-box') === 'Update the hermetic plugin on this machine to the latest version:\n' + pinned.fix)
 check('this machine gets the command alone', upd.updateRequest(pinned, null) === pinned.fix)
 check('an older backend that does not say how it was installed gets the plain update', upd.updateRequest(null, null) === 'hermes plugins update hermetic')
 check('a linked folder has nothing to run', upd.updateRequest({ never: true, auto: false, fix: null }, null) === null)
 check('versions compare by number, not by text', upd.olderVersion('1.4.0', '1.5.0') && upd.olderVersion('1.9.0', '1.10.0') && upd.olderVersion('1.5', '1.5.1') && !upd.olderVersion('1.5.0', '1.5.0') && !upd.olderVersion('2.0.0', '1.9.9'))
+const both = { main: '1.6.0', catalog: '1.5.0' }
+check('a catalog install is measured against the catalog, which is what it can update to', upd.latestFor({ catalog: true }, both) === '1.5.0')
+check('any other install against GitHub', upd.latestFor({ catalog: false }, both) === '1.6.0')
+check('a backend too old to say how it was installed counts as a catalog install', upd.latestFor(null, both) === '1.5.0')
+check('without the catalog\'s version, GitHub\'s', upd.latestFor({ catalog: true }, { main: '1.6.0', catalog: null }) === '1.6.0')
 check('an unknown version is never called outdated', !upd.olderVersion(null, '1.5.0') && !upd.olderVersion('1.5.0', null) && !upd.olderVersion('dev', '1.5.0'))
 process.exit(failed ? 1 : 0)

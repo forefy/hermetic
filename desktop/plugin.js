@@ -457,22 +457,29 @@ async function apartMachine(owner) {
 const INSTALL_REQUEST = 'Install the hermetic plugin on this machine:\nhermes plugins install hermetic --enable'
 
 const profileRows = r => ((r && r.profiles) || []).map(p => ({ name: p.name, isDefault: !!p.is_default, label: botLabel(p) }))
-// The latest hermetic, from its plugin.yaml on GitHub (it moves only with a release), read twice a day: what
-// an installed one is measured against
-async function loadLatestVersion() {
-  const cached = sget('latest', null)
+// The latest hermetic, read twice a day: on GitHub (its plugin.yaml, which moves only with a release) and in
+// the Hermes plugin catalog (its entry there, which moves when a release is reviewed)
+const LATEST_FROM = {
+  main: 'https://raw.githubusercontent.com/forefy/hermetic/main/plugin.yaml',
+  catalog: 'https://raw.githubusercontent.com/NousResearch/hermes-agent/main/plugin-catalog/hermetic.yaml'
+}
+async function loadLatestVersion(source) {
+  const cached = sget('latest:' + source, null)
   if (cached && Date.now() - cached.t < 12 * 3600_000) return cached.v
   try {
-    const res = await fetch('https://raw.githubusercontent.com/forefy/hermetic/main/plugin.yaml')
+    const res = await fetch(LATEST_FROM[source])
     if (!res.ok) throw new Error(String(res.status))
     const m = (await res.text()).match(/^version:\s*["']?(\d+(?:\.\d+)*)/m)
     const v = m ? m[1] : null
-    sset('latest', { t: Date.now(), v })
+    sset('latest:' + source, { t: Date.now(), v })
     return v
   } catch {
     return cached ? cached.v : null
   }
 }
+// What an installed hermetic is measured against: the catalog's version for a catalog install, as that is
+// what it can update to (also for a backend too old to say how it was installed), GitHub's for any other
+const latestFor = (updates, latest) => (!updates || updates.catalog ? latest.catalog || latest.main : latest.main)
 // whether version a comes before version b ("1.4.0" before "1.10.0")
 const olderVersion = (a, b) => {
   const x = String(a || '').split('.').map(Number)
@@ -1813,7 +1820,7 @@ function useMeterData() {
             : loadProfiles(),
           loadPrices(),
           blind ? '' : loadConfigRaw(profile),
-          loadLatestVersion()
+          Promise.all([loadLatestVersion('main'), loadLatestVersion('catalog')]).then(([main, catalog]) => ({ main, catalog }))
         ])
       ])
       if (dropped()) return
@@ -1950,8 +1957,9 @@ function useMeterData() {
         // that machine's hermetic is behind the latest and Hermes will not update it by itself
         outdated: (() => {
           const b = builds.get(at) || {}
-          if (off || !olderVersion(b.version, latest) || (b.updates && b.updates.auto)) return null
-          return { updates: b.updates || null, latest }
+          const newest = latestFor(b.updates, latest)
+          if (off || !olderVersion(b.version, newest) || (b.updates && b.updates.auto)) return null
+          return { updates: b.updates || null, latest: newest }
         })(),
         orProfile,
         orAny,

@@ -46,13 +46,13 @@ def test_a_catalog_install_follows_the_catalog():
     installed({"pinned": True, "revision": "a" * 40, "source": "https://github.com/forefy/hermetic.git",
                "catalog": {"name": "hermetic", "pin": "a" * 40}})
     s = api._update_state()
-    assert s["never"] is False and s["fix"] == "hermes plugins update hermetic", s
+    assert s["never"] is False and s["fix"] == "hermes plugins update hermetic" and s["catalog"] is True, s
 
 
 def test_a_tracked_github_install_is_updated():
     installed({"pinned": False, "revision": "b" * 40, "source": "https://github.com/forefy/hermetic.git"})
     s = api._update_state()
-    assert s["never"] is False and s["fix"] == "hermes plugins update hermetic", s
+    assert s["never"] is False and s["fix"] == "hermes plugins update hermetic" and s["catalog"] is False, s
 
 
 def test_an_install_at_a_fixed_commit_never_updates_and_is_reinstalled_unpinned():
@@ -70,7 +70,7 @@ def test_a_source_that_is_not_a_plain_repo_address_is_not_put_in_the_command():
 def test_a_catalog_install_held_at_a_chosen_commit_is_moved_by_an_update():
     installed({"pinned": True, "revision": "d" * 40, "source": "https://github.com/forefy/hermetic.git", "catalog": {"name": "hermetic", "pin": ""}})
     s = api._update_state()
-    assert s["never"] and s["auto"] is False and s["fix"] == "hermes plugins update hermetic", s
+    assert s["never"] and s["auto"] is False and s["fix"] == "hermes plugins update hermetic" and s["catalog"] is True, s
 
 
 def test_an_install_hermes_can_move_follows_the_automatic_updates_switch():

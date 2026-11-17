@@ -1141,7 +1141,8 @@ async def nous_billed(days: int = Query(30, ge=1, le=90), profile: Optional[str]
 # Whether Hermes moves this hermetic to newer versions by itself, from how it installed it, and the command
 # that updates it by hand. A linked folder and an install held at one commit never move (``never``), and
 # Hermes applies updates to the others only with plugins.auto_apply on (``auto``). ``auto`` is None when
-# the install is not one Hermes recorded.
+# the install is not one Hermes recorded. ``catalog``: it came from the Hermes plugin catalog, whose
+# version is the one it can update to.
 _SOURCE_RE = re.compile(r"^https://[A-Za-z0-9.-]+/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+?(\.git)?$")
 _UPDATE_CMD = "hermes plugins update hermetic"
 
@@ -1153,23 +1154,23 @@ def _update_state():
         plugins = Path(get_hermes_home()) / "plugins"
         auto = bool(((load_config_readonly() or {}).get("plugins") or {}).get("auto_apply"))
         if (plugins / "hermetic").is_symlink():
-            return {"never": True, "auto": False, "fix": None}  # someone's own checkout
+            return {"never": True, "auto": False, "fix": None, "catalog": False}  # someone's own checkout
         try:
             rec = _json.loads((plugins / ".install-metadata.json").read_text(encoding="utf-8-sig")).get("hermetic")
         except (OSError, ValueError, AttributeError):
             rec = None
         if not isinstance(rec, dict):
-            return {"never": False, "auto": None, "fix": None}
+            return {"never": False, "auto": None, "fix": None, "catalog": False}
         catalog = rec.get("catalog")
         if rec.get("pinned") is True and not (isinstance(catalog, dict) and catalog.get("pin")):
             if isinstance(catalog, dict):  # a catalog install held at a chosen commit: updating moves it back
-                return {"never": True, "auto": False, "fix": _UPDATE_CMD}
+                return {"never": True, "auto": False, "fix": _UPDATE_CMD, "catalog": True}
             # a pin stays on a reinstall from the same source, so the install is removed first
             source = str(rec.get("source") or "")
             source = source.removesuffix(".git") if _SOURCE_RE.match(source) else "https://github.com/forefy/hermetic"
-            return {"never": True, "auto": False,
+            return {"never": True, "auto": False, "catalog": False,
                     "fix": "hermes plugins remove hermetic && hermes plugins install " + source + " --enable --force"}
-        return {"never": False, "auto": auto, "fix": _UPDATE_CMD}
+        return {"never": False, "auto": auto, "fix": _UPDATE_CMD, "catalog": isinstance(catalog, dict)}
     except Exception:
         return None
 

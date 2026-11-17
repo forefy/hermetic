@@ -34,6 +34,8 @@ const oldMachine = chats(daysBefore(monthStart, 3))
 check('a machine with chats from before the month uses the month\'s bill', periodBill(account, '30d', oldMachine) === 29.01 && periodSpend(oldMachine, account, '30d', 'all') === 29.01)
 check('the week the same way', periodBill(account, '7d', chats(daysBefore(accountWindowStart('7d'), 1))) === 1.21)
 check('no chats on record, no bill to compare', periodBill(account, '30d', { sessions: [] }) === null)
+check('a machine shown from Hermes\' chat list (a bot\'s own chat left out) keeps each window\'s bill', periodBill(account, '30d', { sessions: [], partial: true }) === 29.01 && periodBill(account, '7d', { sessions: [], partial: true }) === 1.21)
+check('and its period spend is that bill', periodSpend({ sessions: [], partial: true, daily: new Map() }, account, '30d', 'all') === 29.01)
 check('no account, no bill', periodBill(null, '30d', oldMachine) === null && periodBill({ month: null }, '30d', oldMachine) === null)
 // a machine whose chats began inside the month: 30 days is never less than 7
 const weekStart = accountWindowStart('7d')

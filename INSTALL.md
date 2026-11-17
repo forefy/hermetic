@@ -52,7 +52,8 @@ Click it. A popover opens with **Hermetic Costs** at the top; the arrow at the t
 | The Plugins page shows "copying…" next to Desktop | Hermes has not restarted since the install | Quit and Keep Windows, then open Hermes |
 | The button is there, but AAI or HDR asks you to restart | The backend is not loaded in this profile | Restart Hermes, and check that **Agent** is on for this profile |
 | Provider routing, the policy bar or the OpenRouter account card are missing | Costs follows the profile of the chat you are in, and that profile does not use OpenRouter | Open a chat in an OpenRouter profile, or click the profile pill next to the total to see all profiles |
-| A bar on top says "hermetic is not installed on …" | The chat in front of you runs on another machine, and that machine has no Hermetic | See [Hermes on another machine](#hermes-on-another-machine) |
+| A bar on top says "Limited view, install hermetic on …" | The window is connected to another machine, and that machine has no Hermetic | See [Hermes on another machine](#hermes-on-another-machine) |
+| A bar on top says "Limited view of …" | The chat in front of you runs on a second connection, and this Hermes cannot let plugins reach it | See [Hermes on another machine](#hermes-on-another-machine) |
 
 Hermes turns plugins on per profile. To use Hermetic in another profile, switch to it, open **Capabilities**, then **Plugins**, and click **Install here** on Hermetic.
 
@@ -70,6 +71,8 @@ If the bar is still there a minute after the install, quit and reopen Hermes Des
 
 The two machines can run different versions of Hermetic for a while, since each one updates on its own. The popover shows what that machine's Hermetic can answer, and its version is at the bottom of the popover.
 
+For a bot on a second connection this needs a Hermes whose plugin SDK can name that connection (`ctx.restProfile`). An older Hermes cannot let plugins reach it, so such a bot gets a limited view with its OpenRouter bill when it uses one, and its HDR, AAI and guard questions do not reach this popover.
+
 ## Update
 
 Hermetic does not update itself. Updates come through Hermes:
@@ -83,7 +86,7 @@ hermes plugins install forefy/hermetic --enable --force
 
 Either way, restart Hermes afterwards as in step 1.
 
-The popover tells you, for this computer and for every other machine you chat with, when hermetic there is behind the latest version and Hermes will not update it by itself (`plugins.auto_apply` is off, or the install is held at one commit), and when an update waits for Hermes to restart.
+The popover tells you, for this computer and for every other machine it can ask, when hermetic there is behind the latest version and Hermes will not update it by itself (`plugins.auto_apply` is off, or the install is held at one commit), and when an update waits for Hermes to restart.
 
 ## Remove
 

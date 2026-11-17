@@ -1,6 +1,6 @@
 // A chat's numbers come from hermetic on the machine the chat lives on, also when that is a second
-// connection of the window. Where that machine has no hermetic, Costs reads Hermes' own chat list, plus
-// the focused chat's live counters. Run: node tests/test_remote.mjs
+// connection of the window, asked through ctx.restProfile. Where that machine cannot be asked or has no
+// hermetic, Costs reads Hermes' own chat list, plus the focused chat's live counters. Run: node tests/test_remote.mjs
 import fs from 'fs'
 import path from 'path'
 import { fileURLToPath } from 'url'
@@ -216,8 +216,8 @@ const oldSdk = new Function('host', grab('const money = ', 'function parseAccoun
 check('an app that cannot ask another machine never shows this machine\'s bill for it', (await oldSdk.loadChatAccount('run-1', { connectionId: 'c1', profile: 'default' })) === null)
 
 // where a chat's requests go is known at once from the chat itself, before any look has run
-const aims = (reach, named) => new Function('host', 'namedApi', helpers + grab('const noRoute = ', 'async function loadProfiles()') + '\nreturn { aimOf, apartMachine }')(
-  { activeConnectionId: () => reach, connections: async () => conns, profileRoutes: routesOf }, () => (named ? () => {} : null))
+const aims = (reach, named) => new Function('host', 'farRest', helpers + grab('const noRoute = ', 'async function loadProfiles()') + '\nreturn { aimOf, apartMachine }')(
+  { activeConnectionId: () => reach, connections: async () => conns, profileRoutes: routesOf }, named ? () => {} : null)
 const aimsHere = aims(null, true)
 check('a chat on this window\'s own machine is asked through the SDK', aimsHere.aimOf({ connectionId: 'local', profile: 'default' }) === null && aimsHere.aimOf(null) === null)
 const firstAim = aimsHere.aimOf({ connectionId: 'c1', profile: 'default' })
@@ -257,10 +257,14 @@ const sent = []
 const named = []
 const store = new Map()
 const storeFns = "const sget = (k, fb) => (store.has(k) ? store.get(k) : fb)\nconst sset = (k, v) => store.set(k, v)\n"
-const door = new Function('pluginRest', 'window', 'store', "const OWN = '/api/plugins/hermetic'\n" + storeFns + grab('let aim = null', '// the last data each AAI') +
+// ctx.restProfile: the route names the machine, the path stays inside hermetic's own namespace
+const restProfile = async (route, rel, how) => {
+  named.push({ connectionId: route.connectionId, profile: route.profile, path: '/api/plugins/hermetic' + rel, method: how && how.method, body: how && how.body })
+  return { ok: route.connectionId }
+}
+const door = new Function('pluginRest', 'farRest', 'store', "const OWN = '/api/plugins/hermetic'\n" + storeFns + grab('let aim = null', '// the last data each AAI') +
   '\nreturn { api, aimAt: v => { aim = v }, offAt, backendOff, billedKey, watchGuardOf, guardMachines }')(
-  async (rel, how) => { sent.push([rel, how && how.method]); return { ok: 'primary' } },
-  { hermesDesktop: { api: async req => { named.push(req); return { ok: req.connectionId } } } }, store)
+  async (rel, how) => { sent.push([rel, how && how.method]); return { ok: 'primary' } }, restProfile, store)
 const usage = { path: '/api/plugins/hermetic/usage?days=7' }
 check('a chat on the primary machine asks through the SDK', (await door.api(usage)).ok === 'primary' && sent.length === 1 && sent[0][0] === '/usage?days=7&profile=default&reading=1' && !named.length, JSON.stringify({ sent, named }))
 door.aimAt({ connectionId: 'c1', profile: 'default', target: 'default' })
@@ -307,7 +311,7 @@ await door.api({ path: '/api/plugins/hermetic/hdr/guard/answer', method: 'POST',
 check('and one for another machine goes there while this machine\'s chat is in front', named.length === namedBefore + 1 && named[named.length - 1].connectionId === 'c2' && sent.length === sentBefore + 1)
 door.watchGuardOf({ connectionId: 'c1', profile: 'default', target: 'ops' }, 'build-box')
 check('a machine with hermetic is remembered for its guard questions, across restarts', door.guardMachines.get('c1').name === 'build-box' && store.get('guardMachines').length === 1 && store.get('guardMachines')[0].target === 'ops')
-const again = new Function('pluginRest', 'window', 'store', "const OWN = '/api/plugins/hermetic'\n" + storeFns + grab('let aim = null', '// the last data each AAI') + '\nreturn { guardMachines }')(null, {}, store)
+const again = new Function('pluginRest', 'farRest', 'store', "const OWN = '/api/plugins/hermetic'\n" + storeFns + grab('let aim = null', '// the last data each AAI') + '\nreturn { guardMachines }')(null, null, store)
 check('and watched again after a restart', again.guardMachines.get('c1') && again.guardMachines.get('c1').target === 'ops')
 
 // an app without a way to ask by name: the machine is still the one in view, and is never asked as the primary one
@@ -321,12 +325,25 @@ check('its bill and its switch stay its own', door.billedKey() === 'billed@c3' &
 await door.api({ path: '/api/plugins/hermetic/hdr/guard/asks?wait=25', on: null })
 check('while the guard still asks the primary machine', sent.length === sentSoFar[0] + 1)
 
+// a Hermes without ctx.restProfile: no machine but the window's own is ever asked, whatever names it
+const sentOld = []
+const oldHost = new Function('pluginRest', 'farRest', 'store', "const OWN = '/api/plugins/hermetic'\n" + storeFns + grab('let aim = null', '// the last data each AAI') +
+  '\nreturn { api, aimAt: v => { aim = v } }')(async rel => { sentOld.push(rel); return { ok: 'primary' } }, null, new Map())
+oldHost.aimAt({ connectionId: 'c1', profile: 'default', target: 'default' })
+let oldRefused = null
+try { await oldHost.api(usage) } catch (e) { oldRefused = e }
+let oldGuard = null
+try { await oldHost.api({ path: '/api/plugins/hermetic/hdr/guard/asks?wait=25', on: { connectionId: 'c1', profile: 'default', target: 'default' } }) } catch (e) { oldGuard = e }
+check('without ctx.restProfile, another machine\'s chat is refused and this machine is not asked in its place', !!oldRefused && !!oldGuard && sentOld.length === 0, JSON.stringify(sentOld))
+await oldHost.api({ path: '/api/plugins/hermetic/hdr/guard/asks?wait=25', on: null })
+check('while this machine\'s own guard is still asked', sentOld.length === 1 && sentOld[0].startsWith('/hdr/guard/asks'))
+
 // a route an older hermetic lacks is asked once per machine, then left alone
 const asked = []
-const routes = new Function('pluginRest', 'window', "const OWN = '/api/plugins/hermetic'\nconst noRoute = e => /404|Not Found/i.test(String(e && e.message))\nconst sget = (k, fb) => fb\nconst sset = () => {}\n" + grab('let aim = null', '// the last data each AAI') +
+const routes = new Function('pluginRest', 'farRest', "const OWN = '/api/plugins/hermetic'\nconst noRoute = e => /404|Not Found/i.test(String(e && e.message))\nconst sget = (k, fb) => fb\nconst sset = () => {}\n" + grab('let aim = null', '// the last data each AAI') +
   '\nreturn { askRoute, missingRoutes, aimAt: v => { aim = v }, offAt }')(
   async rel => { asked.push(['here', rel]); throw new Error('404: {"detail":"Not Found"}') },
-  { hermesDesktop: { api: async req => { asked.push([req.connectionId, req.path]); if (req.connectionId === 'c1') throw new Error('404: {"detail":"Not Found"}'); return { models: [] } } } })
+  async (route, rel) => { asked.push([route.connectionId, '/api/plugins/hermetic' + rel]); if (route.connectionId === 'c1') throw new Error('404: {"detail":"Not Found"}'); return { models: [] } })
 const quality = { path: '/api/plugins/hermetic/quality' }
 routes.aimAt({ connectionId: 'c1', profile: 'default', target: 'default' })
 let gone = 0

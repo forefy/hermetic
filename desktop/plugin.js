@@ -12,8 +12,9 @@
  * focused chat's /usage report where the backend names no account), host.logs, host.profileRoutes,
  * host.listPersistedSessions, session.usage ticks, and this plugin's own backend under
  * /api/plugins/hermetic/ via ctx.rest. A chat on a second connection asks that machine's backend through
- * the app's own request function (window.hermesDesktop.api), which can name a connection. Public reads:
- * OpenRouter's model, provider and endpoint lists, and hermetic's plugin.yaml on GitHub (its latest version).
+ * ctx.restProfile where this Hermes has it, and is shown from Hermes' own records of that machine where it
+ * does not. Public reads: OpenRouter's model, provider and endpoint lists, and hermetic's version on GitHub
+ * and in the Hermes plugin catalog.
  * No API key ever reaches the renderer. OpenRouter-only parts hide when the profile
  * does not use OpenRouter.
  *
@@ -163,22 +164,19 @@ function carryOverLegacyStorage() {
 // home and secrets), so the active backend answers for every local profile.
 const OWN = '/api/plugins/hermetic'
 let pluginRest = null // ctx.rest, set in register()
-// The machine a request is for. The SDK sends a plugin's own requests to the window's primary connection
-// only, while a chat can belong to another one: a bot on a second connection, with its own hermetic, its
-// own config and its own bill. For such a chat the app's own request function is used (the one ctx.rest
-// wraps), because it takes the connection by name and the SDK has no call for that yet. `aim` is that
-// connection while such a chat is focused ({ connectionId, profile, target }), and null otherwise. An app
-// without that function leaves the machine named but unasked (`mute`): its requests fail instead of
-// going to the primary machine, whose numbers would then show for the wrong chat.
+let farRest = null // ctx.restProfile where this Hermes has it, set in register()
+// The machine a request is for. ctx.rest reaches the window's primary connection only, while a chat can
+// belong to another one: a bot on a second connection, with its own hermetic, its own config and its own
+// bill. Such a chat's requests go through ctx.restProfile, which names that connection. `aim` is that
+// connection while such a chat is focused ({ connectionId, profile, target }), and null otherwise. A Hermes
+// without ctx.restProfile leaves the machine named but unasked (`mute`): its requests fail instead of going
+// to the primary machine, whose numbers would then show for the wrong chat, and the chat is shown from
+// Hermes' own records of that machine.
 let aim = null
 const aimKey = to => (to ? to.connectionId : '')
 const offAt = new Set() // machines without a hermetic backend, by aimKey: see "chats the backend cannot answer for"
 const backendOff = () => offAt.has(aimKey(aim))
 const billedKey = () => 'billed' + (aim ? '@' + aim.connectionId : '') // each machine has its own bill
-const namedApi = () => {
-  const bridge = typeof window !== 'undefined' ? window.hermesDesktop : null
-  return bridge && typeof bridge.api === 'function' ? bridge.api : null
-}
 const inflight = new Map() // identical reads already on their way share one request
 // The first look after Hermes starts reads every recent chat once, which on a long history takes longer
 // than the app waits for one request. The backend then answers how far the read is and carries on, and
@@ -221,7 +219,7 @@ const api = req => {
   // `on`: that machine (null: the primary one), whatever chat is focused, for what belongs to one machine,
   // like a guard question and its answer
   const to = req.on !== undefined ? req.on : aim
-  if (to && to.mute) return Promise.reject(new Error('hermetic cannot ask this machine'))
+  if (to && (to.mute || !farRest)) return Promise.reject(new Error('hermetic cannot ask this machine'))
   const key = aimKey(to)
   // a machine without the backend is asked for its health only, once per refresh
   if (offAt.has(key) && !rel.startsWith('/health')) return Promise.reject(new Error('404: hermetic is not on this machine'))
@@ -235,7 +233,7 @@ const api = req => {
   }
   const how = { method: req.method, body: req.body, timeoutMs: req.timeoutMs }
   const go = to
-    ? suffix => namedApi()({ connectionId: to.connectionId, profile: to.profile, path: OWN + rel + suffix, ...how })
+    ? suffix => farRest({ connectionId: to.connectionId, profile: to.profile }, rel + suffix, how)
     : suffix => pluginRest(rel + suffix, how)
   if (req.method && String(req.method).toUpperCase() !== 'GET') { inflight.clear(); return go('') } // later reads see the write
   const id = key + ' ' + rel
@@ -258,7 +256,7 @@ const watchGuardOf = (to, name) => {
 // none), for their guard questions. At start and every ten minutes, so a bot on a server is asked like a
 // local one before any of its chats has been in front.
 async function findGuardMachines() {
-  if (!namedApi() || typeof host.profileRoutes !== 'function') return
+  if (!farRest || typeof host.profileRoutes !== 'function') return
   let list = []
   try {
     list = (await host.profileRoutes()) || []
@@ -432,7 +430,7 @@ const aimOf = owner => {
   if (!connectionId) return null
   const profile = owner.profile || 'default'
   const route = routeOf(connectionId, profile)
-  return { connectionId, profile, target: (route && route.targetProfile) || profile, mute: !namedApi() }
+  return { connectionId, profile, target: (route && route.targetProfile) || profile, mute: !farRest }
 }
 // A bot of another machine can sit next to this window's own, as a second connection: the focused chat's
 // machine when it is not the one the window is connected to, else null
@@ -1737,6 +1735,9 @@ const billOf = (account, period) => {
 const periodBill = (account, period, data) => {
   if (!account) return null
   if (period === 'today') return billOf(account, 'today')
+  // Hermes' chat list leaves a bot's own chat out, so a machine shown from it cannot say when the key's
+  // spend began there: its bill stands as it is
+  if (data && data.partial) return billOf(account, period)
   const first = firstChatDay(data)
   const covered = p => billOf(account, p) != null && (p === 'today' || (!!first && first <= accountWindowStart(p)))
   if (covered(period)) return billOf(account, period)
@@ -1804,7 +1805,7 @@ function useMeterData() {
       const apart = await apartMachine(focusRef.current.owner)
       if (dropped()) return
       aim = aimOf(focusRef.current.owner) // once more, with the routes that look just read
-      const blind = !!aim && aim.mute // another machine, and no way to ask it
+      const blind = !!aim && aim.mute // another machine, and no way to ask it: shown from Hermes' own records of it
       const wasOff = !blind && backendOff()
       // the health check tells whether that machine has the backend at all; what does not depend on it is
       // asked at the same time
@@ -1848,7 +1849,7 @@ function useMeterData() {
       // are asked here too, so they cost no extra wait: provider quality for a profile that may route through
       // OpenRouter, and the chat's own account report on a machine whose last look needed it.
       const chatAsk = () => loadChatAccount(apart ? focusRef.current.sid : sidRef.current, apart ? apart.route : null, apart ? apart.target : profile)
-      const chatEarly = !blind && chatAccountWanted.has(at)
+      const chatEarly = chatAccountWanted.has(at)
       const [analytics, sessionsResult, retries, toldAccount, routingAll, aux, billedHistory, limits, nousBilled, qualityEarly, chatAccount] = await Promise.all([
         loadAllAnalytics(shown, prices, own),
         loadSessions(shown, own),
@@ -1888,7 +1889,9 @@ function useMeterData() {
       if (orCfg === true) orNames.add(profile)
       // an OpenRouter profile whose machine's hermetic answered without an account: the chat's own Hermes is
       // asked (not where the backend gave no answer at all: that machine has enough to do)
-      const chatNeeded = orProfile && toldAccount === null
+      // (and a machine shown from Hermes' own records: its account comes from that report, as its hermetic
+      // cannot be asked)
+      const chatNeeded = (orProfile || blind) && toldAccount === null
       if (chatNeeded) chatAccountWanted.add(at)
       else chatAccountWanted.delete(at)
       const account = toldAccount || (chatNeeded ? (chatEarly ? chatAccount : await chatAsk()) : null)
@@ -1935,7 +1938,7 @@ function useMeterData() {
         loading: false,
         error: null,
         cheapest,
-        data: { ...analytics, sessions: sessionsResult.sessions.filter(x => inScope.has(x.profile)), sessionsComplete: sessionsResult.complete && !sessionsResult.live, liveChat: sessionsResult.live, at, routing, endpoints, aux, health, quality,
+        data: { ...analytics, sessions: sessionsResult.sessions.filter(x => inScope.has(x.profile)), sessionsComplete: sessionsResult.complete && !sessionsResult.live, liveChat: sessionsResult.live, partial: blind, at, routing, endpoints, aux, health, quality,
           orDaily: orAnalytics ? orAnalytics.daily : null, providerName: providerLabel(yaml), nousBilled },
         scope,
         profileCount: profiles.length,
@@ -1965,7 +1968,7 @@ function useMeterData() {
         orAny,
         // the OpenRouter account card belongs to OpenRouter profiles (or to the all-profiles total)
         // (the last account read stands in when a read fails, but never another machine's)
-        account: scope === 'all' || orProfile ? account || (before ? before.account : null) : null,
+        account: scope === 'all' || orProfile || blind ? account || (before ? before.account : null) : null,
         limits
       }
       seen.current.set(at, next)
@@ -2343,7 +2346,6 @@ const Scatter = ({ sessions, threshold, hover, onHover, currentId }) => {
   const biggest = pts.reduce((a, p) => (p.cost > a.cost ? p : a), pts[0])
   const bursts = pts.filter(p => p.kind === 'subagent' && p.ratePerHour >= 1.5)
   const burstTop = bursts.length ? bursts.reduce((a, p) => (p.ratePerHour > a.ratePerHour ? p : a), bursts[0]) : null
-  const bigLeft = x(biggest.ctxPerCall) > W / 2
   const label = p => p.title.replace(/^Subagent:\s*/i, '')
   return el(
     'svg',
@@ -2913,66 +2915,17 @@ const aSummary = summary =>
 // or the person closes it.
 const popPin = { on: false }
 
-// The scroll area of the chat that shows a session: its own tab, or the main chat when that has focus.
-const aaiChatView = sessionId => {
-  const tab = document.querySelector('[data-session-anchor="session-tile:' + CSS.escape(sessionId) + '"]')
-  const surface = tab || (host.state.focusedStoredSessionId.get() === sessionId ? document.querySelector('[data-session-anchor="workspace"]') : null)
-  return surface ? surface.querySelector('[data-slot="aui_thread-viewport"]') : null
-}
-
-// Scroll an open chat to one of your prompts, given its stored id. Hermes has no jump call for
-// plugins, so this sends the chat the request its own timeline sends, which also loads the page
-// around an old prompt. When any part of that is missing the chat stays where it opened.
-// A newer jump ends the one before it, so two never pull the same chat.
-let aaiJump = null
-async function aaiShowPrompt(sessionId, row) {
-  if (aaiJump) aaiJump.abort()
-  const stop = aaiJump = new AbortController()
-  let view = null, taken = false, finish
-  const shown = new Promise(done => { finish = done })
-  // the chat reads the signal as it takes the request, which tells a chat that listens from one still mounting
-  const detail = { id: 'history:' + row, rowId: row, complete: finish, get signal() { taken = true; return stop.signal } }
-  for (let i = 0; i < 40 && !taken && !stop.signal.aborted; i++) {
-    view = aaiChatView(sessionId)
-    if (view) view.dispatchEvent(new CustomEvent('hermes:timeline-reveal', { detail }))
-    if (!taken) await new Promise(next => setTimeout(next, 100))
-  }
-  if (!taken) return
-  const timer = setTimeout(() => { stop.abort(); finish(false) }, 15000)
-  const id = await shown
-  clearTimeout(timer)
-  const prompt = id && view.querySelector('[data-message-id="' + CSS.escape(id) + '"]')
-  if (!prompt) return
-  const turn = prompt.closest('[data-slot="aui_turn-pair"]') || prompt
-  // Turns the chat has not drawn yet stand in at a guessed height and move the prompt as they draw, so
-  // it is put back at the top until it holds still. The person moving the chat ends that at once.
-  for (const name of ['wheel', 'touchstart', 'pointerdown', 'keydown']) view.addEventListener(name, () => stop.abort(), { signal: stop.signal, passive: true })
-  let still = performance.now()
-  const end = still + 3000
-  while (!stop.signal.aborted && turn.isConnected && performance.now() < end && performance.now() - still < 300) {
-    const was = view.scrollTop
-    const off = turn.getBoundingClientRect().top - view.getBoundingClientRect().top - 8
-    if (Math.abs(off) > 1) view.scrollTop = was + off
-    if (view.scrollTop !== was) still = performance.now()
-    await new Promise(next => requestAnimationFrame(next))
-  }
-  stop.abort()
-}
-
-// Open the chat that holds a reply in a new tab, at the prompt the reply answered when that is known.
-async function aaiOpenAt(profile, sessionId, userId) {
+// Open the chat that holds a reply in a new tab. The SDK has no way yet to scroll it to one prompt.
+async function aaiOpen(profile, sessionId) {
   popPin.on = true
   try {
     await host.openSession(sessionId, { profile: profile && profile !== 'default' ? profile : undefined, awaitHydration: true, expectHistory: true, intent: 'tab' })
   } catch {
     popPin.on = false
-    return false
   }
-  if (Number.isSafeInteger(userId) && userId > 0) await aaiShowPrompt(sessionId, userId).catch(() => {})
-  return true
 }
-const AaiOpenLink = ({ profile, sessionId, userId, label }) =>
-  sessionId ? el(ALink, { onClick: () => aaiOpenAt(profile, sessionId, userId) }, label || 'open in chat') : null
+const AaiOpenLink = ({ profile, sessionId, label }) =>
+  sessionId ? el(ALink, { onClick: () => aaiOpen(profile, sessionId) }, label || 'open in chat') : null
 
 // One case opened: its reproduction record and drafted variations
 const AaiCaseRecord = ({ profile, id, onChanged }) => {
@@ -2999,7 +2952,7 @@ const AaiCaseRecord = ({ profile, id, onChanged }) => {
   return el(
     'div',
     { style: { background: 'var(--ui-bg-tertiary)', borderRadius: 6, padding: '7px 9px', margin: '4px 0 6px' } },
-    el('div', { style: { marginBottom: 4 } }, el(AaiOpenLink, { profile, sessionId: rec.session_id, userId: rec.user_id, label: 'open the chat' })),
+    el('div', { style: { marginBottom: 4 } }, el(AaiOpenLink, { profile, sessionId: rec.session_id, label: 'open the chat' })),
     line('replays', rec.case && rec.case.mode === 'reply' ? 'the reply you corrected, with the same tool results' : 'the first step after the request'),
     line('request', rec.request),
     line('reply', rec.reply),
@@ -3290,7 +3243,7 @@ const RateItem = ({ profile, item, onSaved, onSkip }) => {
         el(Clamped, { text: item.title && item.title !== 'untitled' ? item.title : 'Untitled chat', style: { minWidth: 0 } }),
         el('span', { style: { flex: 'none' } }, ago(item.ts)),
         el('span', { style: { flex: 1 } }),
-        el('span', { style: { flex: 'none' } }, el(AaiOpenLink, { profile, sessionId: item.session_id, userId: item.user_id }))),
+        el('span', { style: { flex: 'none' } }, el(AaiOpenLink, { profile, sessionId: item.session_id }))),
       item.request ? el(Clamped, { text: 'You asked: ' + item.request, lines: 2, style: { fontSize: 12, color: C.text, lineHeight: 1.45, marginTop: 5, overflowWrap: 'anywhere' } }) : null,
       el('div', { style: { borderLeft: '2px solid ' + C.stroke, paddingLeft: 8, marginTop: 6 } },
         el('div', { ref: prevRef, style: Object.assign({ fontSize: 11.5, color: C.sub, lineHeight: 1.45, overflowWrap: 'anywhere' }, more ? null : { display: '-webkit-box', WebkitLineClamp: 3, WebkitBoxOrient: 'vertical', overflow: 'hidden' }) }, preview + (item.cut ? '…' : '')),
@@ -3444,7 +3397,7 @@ const InboxTask = ({ profile, items, onRate, onGone }) => {
     items.slice(0, 4).map((it, i) =>
       el('div', { key: it.correction_id, style: { padding: '9px 0', borderTop: i ? '1px solid ' + C.stroke : 'none' } },
         el(Clamped, { text: '“' + it.text + '”', lines: 3, style: { fontSize: 12, color: C.text, lineHeight: 1.45, overflowWrap: 'anywhere' } }),
-        el('div', { style: { display: 'flex', gap: 10, alignItems: 'center', marginTop: 4, fontSize: 11, color: C.dim } }, it.skill || 'no skill loaded', el('span', null, ago(it.ts)), el(AaiOpenLink, { profile, sessionId: it.session_id, userId: it.user_id })),
+        el('div', { style: { display: 'flex', gap: 10, alignItems: 'center', marginTop: 4, fontSize: 11, color: C.dim } }, it.skill || 'no skill loaded', el('span', null, ago(it.ts)), el(AaiOpenLink, { profile, sessionId: it.session_id })),
         Row(el(BigBtn, { onClick: () => onRate(it) }, 'Rate'), el(BigBtn, { ghost: true, onClick: () => dismiss(it), disabled: busy === it.correction_id }, 'Dismiss')),
         err === it.correction_id ? el('div', { role: 'alert', style: { fontSize: 11, color: C.bad, marginTop: 6 } }, 'Could not dismiss.') : null)))
 }
@@ -3692,7 +3645,6 @@ const AaiView2 = ({ profile, period, yaml, orProfile, auxOn, onChanged }) => {
   const [cases, setCases] = useState(seen.cases || [])
   const [corr, setCorr] = useState(seen.corr || [])
   const [gate, setGate] = useState(seen.gate || [])
-  const [busy, setBusy] = useState(null)
   const [actionsTick, setActionsTick] = useState(0)
   const [flags, setFlags] = useState(seen.flags || [])
   const [verOpen, setVerOpen] = useState(null)
@@ -3724,7 +3676,6 @@ const AaiView2 = ({ profile, period, yaml, orProfile, auxOn, onChanged }) => {
   if (err) return el('div', { style: { fontSize: 11, color: C.faint, marginTop: 14 } }, err)
   if (!data) return el(ViewSkeleton)
 
-  const facts = configFacts(yaml)
   const recentCut = Date.now() / 1000 - 14 * 86400
   const unused = data.skills.filter(s => !s.disabled && !s.essential && !s.loads30 && !(s.created && s.created > recentCut))
   const alwaysOn = data.skills.filter(s => !s.disabled).reduce((a, s) => a + s.desc_tokens, 0)
@@ -3732,7 +3683,6 @@ const AaiView2 = ({ profile, period, yaml, orProfile, auxOn, onChanged }) => {
   const byProv = {}
   for (const e of limits) byProv[e.provider] = (byProv[e.provider] || 0) + 1
   const provList = Object.entries(byProv).sort((a, b) => b[1] - a[1])
-  const fallbackJob = orProfile && facts.allowFallbacks === false && limits.length >= 10
   const r = data.ratings
   const ratings = { total: r.total != null ? r.total : r.good + r.bad, low: r.low != null ? r.low : r.bad }
   const rateJob = ratings.total < 20 || ratings.low < 5
@@ -4202,7 +4152,7 @@ const RestartNote = ({ machine }) =>
 
 const AsideNote = ({ aside }) =>
   aside.apart
-    ? el(Notice, { tone: 'warn', tip: 'This Hermes cannot ask hermetic on ' + aside.machine }, 'Limited view, update Hermes for more')
+    ? el(Notice, { tone: 'warn', tip: 'This Hermes cannot ask hermetic on ' + aside.machine + ' yet, so this is what Hermes itself records' }, 'Limited view of ' + aside.machine)
     : el(Notice, { tone: 'warn', tip: el('span', { style: { whiteSpace: 'pre-line' } }, INSTALL_REQUEST), copy: INSTALL_REQUEST, copyLabel: 'Copy the request for its agent' }, 'Limited view, install hermetic on ' + aside.machine)
 
 const RanOutNote = ({ o }) =>
@@ -4358,7 +4308,8 @@ const Body = ({ meter, prices, threshold, retries, yaml, profile, profileLabel, 
   const inPeriod = new Set(m.series.map(r => r.day))
   const periodOR = meter.orDaily ? Array.from(meter.orDaily.values()).filter(r => (windowStart ? r.day >= windowStart : inPeriod.has(r.day))).reduce((a, r) => a + r.cost, 0) : periodHermes
   // A day's list cost is an estimate spread from session totals, against OpenRouter's UTC day: one day is noise.
-  const comparable = period !== 'today'
+  // Chats from Hermes' list miss a bot's own chat, so their cost says nothing next to the bill.
+  const comparable = period !== 'today' && !meter.partial
   const drift = comparable && acct != null && periodOR > 0.5 && acct > 0 ? acct / periodOR : null
   // Nous Portal: what it billed for this profile's calls against the same calls at its list prices
   const nousDays = meter.nousBilled ? (shown ? [shown] : m.days).map(d => meter.nousBilled[d]).filter(Boolean) : []
@@ -4577,10 +4528,13 @@ const Body = ({ meter, prices, threshold, retries, yaml, profile, profileLabel, 
   )
   // a column at least as tall as the card, so the footer sits at the bottom when a view is short
   const card = (...kids) => el('div', { style: cardStyle }, el('div', { style: { minHeight: '100%', display: 'flex', flexDirection: 'column' } }, ...kids))
-  if (aside && view !== 'costs') return card(head, el('div', { style: { fontSize: 11, color: C.faint, marginTop: 14 } }, VIEWS[vi][1] + ' needs ' + (aside.apart ? 'a newer Hermes' : 'hermetic on ' + aside.machine)), foot)
+  if (aside && view !== 'costs') return card(head, el('div', { style: { fontSize: 11, color: C.faint, marginTop: 14 } }, (aside.apart ? VIEWS[vi][1] + ' is not available for ' + aside.machine : VIEWS[vi][1] + ' needs hermetic on ' + aside.machine)), foot)
   // (keyed by machine: a view that showed one machine starts over for another)
   if (view === 'hdr') return card(head, el(HdrView, { key: 'hdr ' + at, profile, period }), foot)
   if (isAai) return card(head, el(AaiView2, { key: 'aai ' + at, profile, period, yaml, orProfile, auxOn: !!(meter.aux && meter.aux.enabled), onChanged: refresh }), foot)
+  // Another machine's chats come from what Hermes shares with plugins, which leaves a bot's own chat out:
+  // with none of them in the period the tiles below would only show dashes
+  const noChats = !!aside && !m.sessions.length
   return card(
     head,
     el(
@@ -4661,7 +4615,12 @@ const Body = ({ meter, prices, threshold, retries, yaml, profile, profileLabel, 
               : [el('span', { key: 'a' }, dayLabel(m.days[0])), el('span', { key: 'b' }, dayLabel(m.days[m.days.length - 1]))]
           )
         ),
-    el(
+    noChats
+      ? el('div', {
+          title: aside.apart ? 'Hermes leaves a bot\'s own chat out of the chat list it gives plugins, and hermetic cannot reach the hermetic there yet' : 'Install hermetic there for its full costs',
+          style: { fontSize: 11, color: C.faint, marginTop: 14 }
+        }, 'No chat costs from ' + aside.machine)
+      : el(
       'div',
       { style: { display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0,1fr))', gap: 8, marginTop: 14 } },
       el(Cell, { tone: bloatCell.tone, label: bloatCell.label, value: bloatCell.value, sub: bloatCell.sub, tip: bloatCell.tip }),
@@ -4719,8 +4678,8 @@ const Body = ({ meter, prices, threshold, retries, yaml, profile, profileLabel, 
         tip: m.top ? fmtUsd(m.top.cost) + ', ' + shortModel(m.top.model) + ', ' + m.top.calls + ' calls' : ''
       })
     ),
-    el(SessionsSection, { m, threshold, currentId }),
-    el(FlowSection, { m, drift }),
+    noChats ? null : el(SessionsSection, { m, threshold, currentId }),
+    noChats ? null : el(FlowSection, { m, drift }),
     off ? null : el(RoutingSection, {
       policyOn: orProfile,
       providerName: meter.providerName,
@@ -5462,7 +5421,6 @@ const RoutingSection = ({ policyOn = true, providerName, rows, since, recording,
   const facts = useMemo(() => configFacts(yaml), [yaml])
   const [sel, setSel] = useState(null)
   const [draft, setDraft] = useState(null)
-  const [preview, setPreview] = useState(false)
   const [busy, setBusy] = useState(false)
   const [err, setErr] = useState(null)
   const cur = useMemo(() => routingStateOf(facts, aux && aux.enabled), [facts, aux])
@@ -5472,7 +5430,6 @@ const RoutingSection = ({ policyOn = true, providerName, rows, since, recording,
   const set = patch => {
     const next = { ...st, ...patch }
     setDraft(same(next, cur) ? null : next)
-    setPreview(false)
   }
   const uniq = arr => Array.from(new Set(arr.filter(Boolean)))
   const allEps = useMemo(() => Object.values(endpoints || {}).flat(), [endpoints])
@@ -5565,7 +5522,6 @@ const RoutingSection = ({ policyOn = true, providerName, rows, since, recording,
       }
       if (auxChanged || (st.aux && wrote)) await syncAux(st.aux)
       setDraft(null)
-      setPreview(false)
       onApplied()
     } catch (e) {
       setErr((e && e.message) || 'write failed')
@@ -6460,6 +6416,7 @@ export default {
     carryOverLegacyStorage()
     store = ctx.storage
     pluginRest = ctx.rest
+    farRest = typeof ctx.restProfile === 'function' ? ctx.restProfile : null
     initResets()
     ctx.register({
       id: 'chip',

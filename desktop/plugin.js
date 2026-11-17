@@ -8,10 +8,12 @@
  *          kept as tests, replays on other versions, providers or models, and
  *          automatic tests when the background review changes a skill.
  *
- * Data comes through the desktop plugin SDK: host.profiles, host.request (config, and the focused
- * chat's /usage report where the backend names no account), host.logs, session.usage ticks, and
- * this plugin's own backend under /api/plugins/hermetic/ via ctx.rest; plus the public OpenRouter
- * /models list.
+ * Data comes through the desktop plugin SDK: host.profiles, host.request and host.requestProfile (the
+ * focused chat's /usage report where the backend names no account), host.logs, host.profileRoutes,
+ * host.listPersistedSessions, session.usage ticks, and this plugin's own backend under
+ * /api/plugins/hermetic/ via ctx.rest. A chat on a second connection asks that machine's backend through
+ * the app's own request function (window.hermesDesktop.api), which can name a connection. Public reads:
+ * OpenRouter's model, provider and endpoint lists, and hermetic's plugin.yaml on GitHub (its latest version).
  * No API key ever reaches the renderer. OpenRouter-only parts hide when the profile
  * does not use OpenRouter.
  *
@@ -217,8 +219,8 @@ const api = req => {
   if (!pluginRest) return Promise.reject(new Error('hermetic is still loading'))
   let rel = path.slice(OWN.length) || '/'
   // `on`: that machine (null: the primary one), whatever chat is focused, for what belongs to one machine,
-  // like a guard question and its answer. `here`: the primary machine.
-  const to = req.on !== undefined ? req.on : req.here ? null : aim
+  // like a guard question and its answer
+  const to = req.on !== undefined ? req.on : aim
   if (to && to.mute) return Promise.reject(new Error('hermetic cannot ask this machine'))
   const key = aimKey(to)
   // a machine without the backend is asked for its health only, once per refresh
@@ -263,7 +265,7 @@ async function findGuardMachines() {
   } catch {
     return
   }
-  const reach = (typeof host.activeConnectionId === 'function' && host.activeConnectionId()) || 'local'
+  const reach = primaryId()
   const seen = new Set()
   for (const r of list) {
     if (!r || !r.connectionId || r.connectionId === reach || seen.has(r.connectionId)) continue
@@ -282,12 +284,13 @@ async function findGuardMachines() {
 // reports another version. A whole backend that is missing is `offAt`'s, not this.
 const missingRoutes = new Set()
 const askRoute = async (name, req) => {
-  const key = aimKey(req.here ? null : aim) + ' ' + name
+  const to = req.on !== undefined ? req.on : aim // the machine asked, kept for the answer
+  const key = aimKey(to) + ' ' + name
   if (missingRoutes.has(key)) throw new Error('404: ' + name + ' is not on this machine')
   try {
-    return await api(req)
+    return await api({ ...req, on: to })
   } catch (e) {
-    if (noRoute(e) && !offAt.has(aimKey(req.here ? null : aim))) missingRoutes.add(key)
+    if (noRoute(e) && !offAt.has(aimKey(to))) missingRoutes.add(key)
     throw e
   }
 }
@@ -361,9 +364,9 @@ const usageOfChats = (rows, days) => {
 }
 // And what its /sessions answers: the chats with model calls in the last `days` days
 const sessionsOfChats = (rows, days) => {
-  const cutoff = Date.now() / 1000 - days * 86400
+  const first = lastNDays(days)[0]
   return rows
-    .filter(r => num(r.api_call_count) > 0 && (num(r.last_active) || num(r.started_at)) > cutoff)
+    .filter(r => num(r.api_call_count) > 0 && chatDay(r) >= first)
     .map(r => ({ ...r, by_day: { [chatDay(r)]: 1 } }))
 }
 // A bot's own chat is hidden from that list. The chat in front of the user is then counted from its live
@@ -403,20 +406,23 @@ const connectionOf = async id => {
     return null
   }
 }
+// The connection the window is connected to: its primary one ('local' is this computer)
+const primaryId = () => (typeof host.activeConnectionId === 'function' && host.activeConnectionId()) || 'local'
 // The machine the window is connected to when that is not this computer: its name, else null
 async function awayMachine() {
-  const id = typeof host.activeConnectionId === 'function' ? host.activeConnectionId() : null
-  if (!id || id === 'local') return null
+  const id = primaryId()
+  if (id === 'local') return null
   const row = await connectionOf(id)
   return row && row.kind === 'local' ? null : (row && row.label) || id
 }
-// A bot of another machine can sit next to this window's own, as a second connection: the focused chat's
-// machine when it is not the one the window is connected to, else null.
+// The window's profile routes (read at most every five minutes): which connection serves a profile, and by
+// which profile name that machine knows it
 let routes = { at: 0, list: [] }
+const routeOf = (connectionId, profile) => routes.list.find(r => r.connectionId === connectionId && r.profile === profile) || null
 // The machine a chat is on when that is not the one this window is connected to, by connection id, and ''
 // for the window's own. Everything on screen belongs to one of them.
 const machineOf = owner => {
-  const reach = (typeof host.activeConnectionId === 'function' && host.activeConnectionId()) || 'local'
+  const reach = primaryId()
   return owner && owner.connectionId && owner.connectionId !== reach ? owner.connectionId : ''
 }
 // Where a chat's requests go (see `aim`): null for the window's own machine, else its machine by name,
@@ -425,9 +431,11 @@ const aimOf = owner => {
   const connectionId = machineOf(owner)
   if (!connectionId) return null
   const profile = owner.profile || 'default'
-  const route = routes.list.find(r => r.connectionId === connectionId && r.profile === profile)
+  const route = routeOf(connectionId, profile)
   return { connectionId, profile, target: (route && route.targetProfile) || profile, mute: !namedApi() }
 }
+// A bot of another machine can sit next to this window's own, as a second connection: the focused chat's
+// machine when it is not the one the window is connected to, else null
 async function apartMachine(owner) {
   if (!machineOf(owner)) return null
   if (typeof host.profileRoutes === 'function' && Date.now() - routes.at > 300_000) {
@@ -438,7 +446,7 @@ async function apartMachine(owner) {
     }
   }
   const profile = owner.profile || 'default'
-  const route = routes.list.find(r => r.connectionId === owner.connectionId && r.profile === profile) || { connectionId: owner.connectionId, profile, targetProfile: profile }
+  const route = routeOf(owner.connectionId, profile) || { connectionId: owner.connectionId, profile, targetProfile: profile }
   const row = await connectionOf(owner.connectionId)
   const local = owner.connectionId === 'local' || !!(row && row.kind === 'local')
   return { route, profile, target: route.targetProfile || profile, name: local ? 'this computer' : (row && row.label) || owner.connectionId, local }
@@ -509,6 +517,9 @@ function loadFarProfiles(route) {
   return Promise.race([have.ask, new Promise(done => setTimeout(() => done(have.list || null), FAR_PROFILES_WAIT_MS))])
 }
 
+// the profile name the machine asked knows a profile by
+const profileName = p => p.target || (p.isDefault ? 'default' : p.name)
+
 async function loadAnalytics(profiles, days, prices, own) {
   const daily = new Map() // day -> merged record
   const aux = new Map() // model -> { task -> {input, output, cost} }
@@ -519,7 +530,7 @@ async function loadAnalytics(profiles, days, prices, own) {
   await Promise.all(
     profiles.map(async p => {
       try {
-        const name = p.target || (p.isDefault ? 'default' : p.name)
+        const name = profileName(p)
         let r
         if (own) {
           const { rows, live } = await ownRows(own, name)
@@ -632,25 +643,13 @@ async function loadSessions(profiles, own) {
   await Promise.all(
     (profiles || [{ name: 'default', isDefault: true }]).map(async p => {
       try {
-        const suffix = '?days=' + DEFAULT_DAYS + (p.isDefault ? '' : '&profile=' + encodeURIComponent(p.name))
-        let r = null
+        let r
         if (own) {
-          const mine = await ownRows(own, p.target || (p.isDefault ? 'default' : p.name))
+          const mine = await ownRows(own, profileName(p))
           if (mine.live.length) live = true
           r = { sessions: sessionsOfChats(mine.rows, DEFAULT_DAYS) }
-        }
-        for (const base of r ? [] : [OWN + '/sessions']) {
-          try {
-            const got = await api({ path: base + suffix })
-            if (got && Array.isArray(got.sessions)) {
-              r = got
-              break
-            }
-          } catch {
-            /* try the next source */
-          }
-        }
-        if (!r) throw new Error('no route')
+        } else r = await api({ path: OWN + '/sessions?days=' + DEFAULT_DAYS, profile: profileName(p) })
+        if (!(r && Array.isArray(r.sessions))) throw new Error('no chat list')
         for (const row of r.sessions) out.push(mapSessionRow(row, p.name))
       } catch {
         complete = false
@@ -894,7 +893,7 @@ async function loadRetries(sinceDay) {
   return a + b
 }
 
-// ---- OpenRouter account (server-side fetch, parsed from session.usage) -------
+// ---- provider account (from hermetic's backend, else the chat's own /usage report) -------
 
 const money = (re, text) => {
   const m = text.match(re)
@@ -987,8 +986,7 @@ async function loadRouting(profiles) {
   await Promise.all(
     (profiles || [{ name: 'default', isDefault: true }]).map(async p => {
       try {
-        const q = '/api/plugins/hermetic/routing?days=' + DEFAULT_DAYS + (p.isDefault ? '' : '&profile=' + encodeURIComponent(p.name))
-        const r = await api({ path: q })
+        const r = await api({ path: OWN + '/routing?days=' + DEFAULT_DAYS, profile: profileName(p) })
         if (!r || !Array.isArray(r.rows)) return
         reachable = true
         if (r.recording) recording = true
@@ -1016,7 +1014,7 @@ async function loadBilledHistory() {
 
 // The installed version, from the backend's plugin.yaml, shown small at the bottom of the popover, and the
 // branch and commit instead when hermetic runs from a git checkout rather than a catalog release
-const builds = new Map() // machine (aimKey) -> { version, checkout }
+const builds = new Map() // machine (aimKey) -> { version, checkout, updates, restart }
 
 // Hermes internals the backend plugin could not find (a Hermes update renamed them); fallbacks run.
 // Asked in every refresh along with the config: a 404 here means the machine asked has no hermetic
@@ -1029,7 +1027,7 @@ async function loadHealth() {
     offAt.delete(key)
     // another version may have the routes this one lacked
     if (r && r.version && (builds.get(key) || {}).version !== r.version) for (const k of Array.from(missingRoutes)) if (k.startsWith(key + ' ')) missingRoutes.delete(k)
-    builds.set(key, { version: (r && r.version) || (builds.get(key) || {}).version || null, checkout: (r && r.checkout) || null, updates: (r && r.updates) || null })
+    builds.set(key, { version: (r && r.version) || (builds.get(key) || {}).version || null, checkout: (r && r.checkout) || null, updates: (r && r.updates) || null, restart: !!(r && r.restart) })
     return (r && r.missing) || []
   } catch (e) {
     if (!noRoute(e)) return null
@@ -1154,32 +1152,58 @@ function parseAccountLines(lines) {
 }
 
 // What actually stops requests: the API key's cap, the prepaid credits or a workspace or guardrail
-// budget, whichever runs out first. With a period (today, 7d, 30d) the limit that resets on that
-// period (daily, weekly, monthly) comes first, else whichever runs out first. total picks among the
-// ones that never reset instead (credits, a key cap without reset, lifetime budgets). Credits bought
-// = this key's spend + the balance, exact while it is the only key spending. lowest is the smallest
-// share left of any of them, for the chip. canTotal: there is both kind to switch between.
+// budget. With a period (today, 7d, 30d) the limit that resets on that period (daily, weekly, monthly)
+// comes first, else whichever has least left. total picks among the ones that never reset instead
+// (credits, a key cap without reset, lifetime budgets). Any limit close to stopping requests takes over
+// (see limitDays). canTotal: there is both kind to switch between.
 const PERIOD_RESET = { today: 'daily', '7d': 'weekly', '30d': 'monthly' }
+// When a limit that resets on a calendar (OpenRouter's UTC day, week from Monday, month) next does
+const nextReset = interval => {
+  const d = new Date()
+  const day = Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate())
+  if (interval === 'daily') return day + 86400e3
+  if (interval === 'weekly') return day + (7 - ((d.getUTCDay() + 6) % 7)) * 86400e3
+  if (interval === 'monthly') return Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 1)
+  return null
+}
+// How many days a limit lasts at the recent pace (a day's spend: this week's average, or today's so far when
+// that is more), and Infinity when it resets first or nothing is being spent. What colors it: out or a day
+// left stops requests about now, three days left soon. A share of what was ever bought says nothing of when.
+const limitDays = (x, a) => {
+  if (x.left <= 0) return 0
+  const pace = Math.max(num(a.week) / 7, num(a.today))
+  if (!(pace > 0)) return Infinity
+  const days = x.left / pace
+  const reset = x.reset_at ? Date.parse(x.reset_at) : nextReset(x.interval)
+  return reset != null && !isNaN(reset) && (reset - Date.now()) / 86400e3 < days ? Infinity : days
+}
+const limitTone = days => (days <= 1 ? 'bad' : days <= 3 ? 'warn' : null)
 function spendLimit(a, period, total) {
   if (!a) return null
   const keyLeft = a.limit > 0 && a.remaining != null ? a.remaining : null
-  const credits = a.balance != null && a.total != null ? { left: a.balance, bought: a.total + a.balance } : null
+  // credits against what the period on screen spent (the bar), not against everything ever bought
+  const spentIn = PERIOD_RESET[period] ? billOf(a, period) : a.total
+  const credits = a.balance != null && a.total != null ? { left: a.balance, spent: spentIn != null ? spentIn : a.total } : null
   const budgets = (a.budgets || []).map(b => ({ used: b.spent, cap: b.limit, left: b.limit - b.spent, by: 'budget', label: b.label, interval: b.interval, reset_at: b.reset_at }))
-  const all = budgets.concat(credits ? [{ used: a.total, cap: credits.bought, left: credits.left, by: 'credits' }] : [], keyLeft != null ? [{ used: a.limit - a.remaining, cap: a.limit, left: keyLeft, by: 'key', interval: a.limitReset || null }] : [])
+  const all = budgets.concat(credits ? [{ used: credits.spent, cap: credits.spent + credits.left, left: credits.left, by: 'credits' }] : [], keyLeft != null ? [{ used: a.limit - a.remaining, cap: a.limit, left: keyLeft, by: 'key', interval: a.limitReset || null }] : [])
   if (!all.length) return null
   const want = PERIOD_RESET[period]
   const same = all.filter(x => want && x.interval === want)
   const lasting = all.filter(x => !x.interval || x.interval === 'lifetime')
   const canTotal = lasting.length > 0 && lasting.length < all.length
   const pool = total && lasting.length ? lasting : same.length ? same : all
-  const pick = pool.reduce((m, x) => (x.left < m.left ? x : m))
-  const line = x => x.by === 'credits' ? fmtUsd(x.left) + ' credits left (credits bought = spent + balance)'
+  for (const x of all) x.days = limitDays(x, a)
+  // the limit that stops requests first takes the line whatever the view, once it is close
+  const urgent = all.reduce((m, x) => (x.days < m.days ? x : m))
+  const pick = limitTone(urgent.days) ? urgent : pool.reduce((m, x) => (x.left < m.left ? x : m))
+  const line = x => (x.by === 'credits' ? fmtUsd(x.left) + ' credits left'
     : x.by === 'key' ? fmtUsd(x.left) + ' left on the API key cap of $' + Math.round(x.cap) + (x.interval ? ', resets ' + x.interval : '')
-    : x.label + ' ' + fmtUsd(Math.max(0, x.left)) + ' left of $' + Math.round(x.cap) + (x.reset_at ? ', resets ' + fmtReset(x.reset_at) : '')
-  const pace = a.week && pick.by !== 'budget' ? ', ~' + Math.max(0, pick.left / (a.week / 7)).toFixed(1) + ' days at this week\'s pace' : ''
-  const tip = [line(pick) + pace].concat(all.filter(x => x !== pick).map(line)).join('\n')
+    : x.label + ' ' + fmtUsd(Math.max(0, x.left)) + ' left of $' + Math.round(x.cap) + (x.reset_at ? ', resets ' + fmtReset(x.reset_at) : '')) +
+    (x.days > 0 && x.days < Infinity ? ', about ' + (x.days < 1.5 ? 'a day' : Math.round(x.days) + ' days') + ' at the recent pace' : '')
+  const tip = [line(pick)].concat(all.filter(x => x !== pick).map(line)).join('\n')
   const share = x => (x.cap > 0 ? Math.max(0, x.left) / x.cap : 0)
-  return { used: pick.used, cap: pick.cap, left: pick.left, by: pick.by, interval: pick.interval, reset_at: pick.reset_at, share: share(pick), lowest: Math.min.apply(null, all.map(share)), canTotal, tip }
+  return { used: pick.used, cap: pick.cap, left: pick.left, by: pick.by, interval: pick.interval, share: share(pick),
+    tone: limitTone(pick.days), worst: limitTone(urgent.days), canTotal, tip }
 }
 
 // The focused profile's plan limits or credits, for providers other than OpenRouter (whose bill and
@@ -1209,26 +1233,14 @@ async function loadNousBilled(profile) {
 
 // The account of the profile's provider as hermetic's backend tells it: that profile's own, as each
 // profile can have its own key. null: the backend answered, and there is none to tell. undefined: no answer.
-async function loadAccount(sid, profile) {
-  let answered = false
+async function loadAccount(profile) {
   try {
     const r = await api({ path: OWN + '/account/usage', profile, timeoutMs: 20_000 })
-    if (r && Array.isArray(r.lines)) {
-      answered = true
-      const parsed = parseAccountLines(r.lines)
-      if (parsed) return Object.assign(parsed, { budgets: (r.account && r.account.budgets) || [] })
-    }
+    if (!(r && Array.isArray(r.lines))) return undefined
+    const parsed = parseAccountLines(r.lines)
+    return parsed ? Object.assign(parsed, { budgets: (r.account && r.account.budgets) || [] }) : null
   } catch {
-    /* try the next source */
-  }
-  const none = answered ? null : undefined
-  if (!sid) return none
-  try {
-    const r = await host.request('session.usage', { session_id: sid }, 20_000)
-    const u = (r && (r.usage || r.result || r)) || {}
-    return parseAccountLines(Array.isArray(u.account_lines) ? u.account_lines : []) || none
-  } catch {
-    return none
+    return undefined
   }
 }
 
@@ -1236,10 +1248,10 @@ async function loadAccount(sid, profile) {
 // of the provider that chat really runs on. It stands in where the machine's hermetic names no account
 // (a config that says "auto", read by an older backend). `route` names another machine. Whatever comes
 // back is kept for a minute, so a machine is asked once a minute at most.
-const chatAccounts = new Map() // machine -> { at, account }
+const chatAccounts = new Map() // machine and profile -> { at, account }
 const chatAccountWanted = new Set() // machines whose last look needed the chat's own report
-async function loadChatAccount(sid, route) {
-  const key = route ? route.connectionId : ''
+async function loadChatAccount(sid, route, profile) {
+  const key = (route ? route.connectionId : '') + ' ' + (profile || 'default') // each profile can have its own key
   const have = chatAccounts.get(key)
   if (have && Date.now() - have.at < 60_000) return have.account
   if (!sid || (route && typeof host.requestProfile !== 'function')) return null
@@ -1700,21 +1712,35 @@ const keyShare = (meter, period) => {
   const all = sum(meter.orDaily)
   return all > 0 ? Math.min(1, sum(meter.daily) / all) : null
 }
-// The day of the first chat on record, among the chats loaded (the last 30 days).
+// The day of the first chat on record: the loaded chats (the last 30 days) of the profiles shown, or the
+// machine's first recorded OpenRouter call of any profile, as the bill covers the whole key
 const firstChatDay = data => {
-  let t = Infinity
+  let t = num(data && data.routing && data.routing.since) || Infinity
   for (const x of (data && data.sessions) || []) if (x.started > 0 && x.started < t) t = x.started
   return t < Infinity ? dateStr(new Date(t * 1000)) : null
 }
-// The key's bill for a period, or null where it cannot stand for the chats on record: a billing window
-// (OpenRouter's UTC week or month) that starts before the first of them also holds what the key spent
-// before, on another machine or app. A server set up today with a key used all month is one.
+// The key's bill for a period. A billing window (OpenRouter's UTC week or month) that starts before the
+// first chat on record also holds what the key spent before, on another machine or app, so then the
+// narrowest bill that the chats do cover counts, plus the list cost of the period's days before it: a server
+// set up this week with a key used all month shows this week's bill for both 7 and 30 days.
+const billOf = (account, period) => {
+  const v = period === 'today' ? account.today : period === '7d' ? account.week : account.month
+  return v == null ? null : v
+}
 const periodBill = (account, period, data) => {
   if (!account) return null
-  const v = period === 'today' ? account.today : period === '7d' ? account.week : account.month
-  if (v == null || period === 'today') return v == null ? null : v
+  if (period === 'today') return billOf(account, 'today')
   const first = firstChatDay(data)
-  return first && first <= accountWindowStart(period) ? v : null
+  const covered = p => billOf(account, p) != null && (p === 'today' || (!!first && first <= accountWindowStart(p)))
+  if (covered(period)) return billOf(account, period)
+  if (!first) return null // no chats on record: nothing to weigh the bill against
+  for (const p of period === '30d' ? ['7d', 'today'] : ['today']) {
+    if (!covered(p)) continue
+    const start = p === 'today' ? dateStr(new Date()) : accountWindowStart(p)
+    const before = lastNDays(period === '7d' ? 7 : DEFAULT_DAYS).filter(d => d < start)
+    return billOf(account, p) + before.reduce((a, d) => a + num(((data && data.daily && data.daily.get(d)) || {}).cost), 0)
+  }
+  return null
 }
 const periodSpend = (data, account, period, scope = 'all') => {
   const days = period === 'today' ? lastNDays(1) : period === '7d' ? lastNDays(7) : lastNDays(DEFAULT_DAYS)
@@ -1742,7 +1768,7 @@ const failedFor = (state, seen, at, error) => (state.at === undefined || state.a
 function useMeterData() {
   const [state, setState] = useState(NOTHING_YET)
   const seen = useRef(new Map()) // the last numbers shown for each machine, by its key
-  const busy = useRef(null) // the look that is running: { at }
+  const busy = useRef(null) // the look that is running: its machine, start time and profile
   const turn = useRef(0)
   const timer = useRef(null)
   const sidRef = useRef(null)
@@ -1755,9 +1781,9 @@ function useMeterData() {
     // Asked for while one runs for the same machine: run once more when it ends. A look for a machine that
     // is no longer in front is dropped at its next step, and this one starts at once.
     if (busy.current && busy.current.at === at) {
-      // asked again as it starts, for the same profile (the hook's effects fire together when the popover
-      // mounts): the running look covers it
-      if (Date.now() - busy.current.t < 300 && busy.current.profile === profileRef.current) return
+      // asked again in the same moment, for the same profile (the hook's effects fire together when the
+      // popover mounts): the running look covers it
+      if (Date.now() - busy.current.t < 50 && busy.current.profile === profileRef.current) return
       return void (again.current = true)
     }
     const mine = ++turn.current
@@ -1765,8 +1791,8 @@ function useMeterData() {
     again.current = false
     // Requests follow the chat in front (see `aim`), so a look goes on only while its machine is that one:
     // past this point its remaining requests would reach another machine.
-    const dropped = () => mine !== turn.current || machineOf(focusRef.current.owner) !== at
     const profile = profileRef.current
+    const dropped = () => mine !== turn.current || machineOf(focusRef.current.owner) !== at || profileRef.current !== profile
     try {
       const apart = await apartMachine(focusRef.current.owner)
       if (dropped()) return
@@ -1814,13 +1840,13 @@ function useMeterData() {
       // (retries). A machine that cannot be asked gets nothing asked. Two answers that only some looks use
       // are asked here too, so they cost no extra wait: provider quality for a profile that may route through
       // OpenRouter, and the chat's own account report on a machine whose last look needed it.
-      const chatAsk = () => loadChatAccount(apart ? focusRef.current.sid : sidRef.current, apart ? apart.route : null)
+      const chatAsk = () => loadChatAccount(apart ? focusRef.current.sid : sidRef.current, apart ? apart.route : null, apart ? apart.target : profile)
       const chatEarly = !blind && chatAccountWanted.has(at)
       const [analytics, sessionsResult, retries, toldAccount, routingAll, aux, billedHistory, limits, nousBilled, qualityEarly, chatAccount] = await Promise.all([
         loadAllAnalytics(shown, prices, own),
         loadSessions(shown, own),
         apart ? 0 : loadRetries(lastNDays(DEFAULT_DAYS)[0]),
-        blind || away ? null : loadAccount(apart ? null : sidRef.current, profile),
+        blind || away ? null : loadAccount(profile),
         blind ? { rows: [], since: null, recording: false, reachable: false } : loadRouting(profiles),
         blind ? null : loadAux(profile),
         blind ? {} : loadBilledHistory(),
@@ -1919,6 +1945,8 @@ function useMeterData() {
         at,
         fromMachine: apart && !blind && !off ? apart.name : null,
         fromBot: (apart && profiles[0].label) || null,
+        // that machine's hermetic has newer files than the code it runs: Hermes loads them when it starts again
+        restart: !off && !!(builds.get(at) || {}).restart,
         // that machine's hermetic is behind the latest and Hermes will not update it by itself
         outdated: (() => {
           const b = builds.get(at) || {}
@@ -1970,7 +1998,7 @@ function useMeterData() {
   // requests go to the machine of the chat in front from the moment that chat changes, whatever a look is
   // doing: a view opened or a change saved right after a switch must never reach the machine left behind
   aim = aimOf(owner || null)
-  const machine = ((owner && owner.connectionId) || '') + ' ' + ((typeof host.activeConnectionId === 'function' && host.activeConnectionId()) || '')
+  const machine = ((owner && owner.connectionId) || '') + ' ' + primaryId()
   const firstLook = useRef(true) // the first look is started by the effect below, every later machine change here
   useEffect(() => {
     if (!firstLook.current) refresh()
@@ -1994,8 +2022,7 @@ function useMeterData() {
   const setScope = v => {
     sset('scope', v)
     setState(s => ({ ...s, scope: v }))
-    if (busy.current) setTimeout(refresh, 900)
-    else refresh()
+    refresh()
   }
   return { ...shownFor(state, seen.current, machineOf(owner)), refresh, setScope }
 }
@@ -2173,7 +2200,10 @@ const fmtReset = iso => {
   if (mins <= 0) return 'now'
   if (mins < 60) return 'in ' + mins + 'm'
   if (mins < 24 * 60) return 'in ' + Math.floor(mins / 60) + 'h' + (mins % 60 ? ' ' + (mins % 60) + 'm' : '')
-  return new Date(t).toLocaleString(undefined, { weekday: 'short', hour: '2-digit', minute: '2-digit' })
+  // a weekday names the coming week only, later ones get their date ("Dec 1")
+  return mins < 6 * 24 * 60
+    ? new Date(t).toLocaleString(undefined, { weekday: 'short', hour: '2-digit', minute: '2-digit' })
+    : new Date(t).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
 }
 
 // A plan's limit windows (Anthropic, Codex) or credits (Nous), as Hermes reports them for this profile:
@@ -4135,10 +4165,6 @@ const CopyBtn = ({ text, label = 'Copy to clipboard', style }) => {
             ])))
 }
 
-// The chats on screen come from Hermes' own list, not hermetic's backend: says of which machine, and what
-// would show everything. For a machine without hermetic that is a request to copy for its agent, which
-// installs it there. `apart`: a chat on another connection in an app that cannot ask that connection by
-// name, where only making it the primary one helps.
 // The notices above the view, one look for all: a dot in the tone the rest of the popover uses, a few
 // words, the details in the tooltip, and a copy button when there is something to run.
 const Notice = ({ tone, tip, copy, copyLabel, children }) =>
@@ -4162,6 +4188,9 @@ const UpdateNote = ({ updates, latest, machine }) => {
   return el(Notice, { tone: 'warn', tip: request ? el('span', { style: { whiteSpace: 'pre-line' } }, request) : null, copy: request, copyLabel: machine ? 'Copy the request for its agent' : 'Copy the command' },
     machine ? 'Auto-update is off on ' + machine + ', update to ' + latest : 'Auto-update is off, update to ' + latest + ' manually')
 }
+
+const RestartNote = ({ machine }) =>
+  el(Notice, { tone: 'warn', tip: 'Hermes runs the hermetic it loaded when it started' }, machine ? 'Restart Hermes to load the update on ' + machine : 'Restart Hermes to load the hermetic update')
 
 const AsideNote = ({ aside }) =>
   aside.apart
@@ -4591,7 +4620,7 @@ const Body = ({ meter, prices, threshold, retries, yaml, profile, profileLabel, 
             ? el(
                 'span',
                 {
-                  style: { marginLeft: 'auto', whiteSpace: 'nowrap', color: lim.share <= 0.05 ? C.bad : lim.share < 0.15 ? C.warn : undefined },
+                  style: { marginLeft: 'auto', whiteSpace: 'nowrap', color: lim.tone === 'bad' ? C.bad : lim.tone === 'warn' ? C.warn : undefined },
                   title: lim.tip
                 },
                 // a limit that resets with the view shows its spend, one that never resets what is left of it
@@ -4603,7 +4632,7 @@ const Body = ({ meter, prices, threshold, retries, yaml, profile, profileLabel, 
         )
       : null,
     lim
-      ? el('div', { style: { marginTop: 8 }, title: lim.tip }, el(Track, { value: 1 - lim.share, height: 3, tone: lim.share <= 0.05 ? 'bad' : lim.share < 0.15 ? 'warn' : null }))
+      ? el('div', { style: { marginTop: 8 }, title: lim.tip }, el(Track, { value: 1 - lim.share, height: 3, tone: lim.tone }))
       : null,
     !lim && planLimits ? el(PlanLimits, { limits: planLimits }) : null,
     period === 'today'
@@ -6245,7 +6274,7 @@ const ContextGauge = ({ pct, used, max, threshold }) => {
 // ---- chip -------------------------------------------------------------------
 
 const Chip = () => {
-  const { loading, error, data, prices, threshold, retries, yaml, profile, profileLabel, refresh, account, limits, cheapest, orProfile, orAny, scope, profileCount, setScope, off, aside, at, fromMachine, fromBot, outdated } = useMeterData()
+  const { loading, error, data, prices, threshold, retries, yaml, profile, profileLabel, refresh, account, limits, cheapest, orProfile, orAny, scope, profileCount, setScope, off, aside, at, fromMachine, fromBot, outdated, restart } = useMeterData()
   const defaultModel = useValue(host.state.model) || ''
   const rates = useLive(prices, defaultModel).filter(r => r.at === (at || '')) // the shown machine's running chats
   const focusedUsage = useValue(host.state.focusedUsage)
@@ -6295,12 +6324,28 @@ const Chip = () => {
     const loop = async at => {
       running.add(at)
       let have = ''
+      const drop = () => {
+        // what that machine asked can no longer be answered from here, and its note is no longer current
+        setAsks(x => {
+          const next = x.filter(a => a.at !== at)
+          asksWaiting.current = next.length
+          return next
+        })
+        if (ranBy.delete(at)) setRanOut(Array.from(ranBy.values()).sort((a, b) => num(b.ts) - num(a.ts))[0] || null)
+      }
       while (live) {
+        // a machine that became the window's primary connection is asked by the primary loop
+        if (at && at === primaryId()) {
+          drop()
+          await sleep(30_000)
+          continue
+        }
         const far = at ? guardMachines.get(at) : null
         let r
         try {
           r = await api({ path: OWN + '/hdr/guard/asks?wait=25&have=' + encodeURIComponent(have), timeoutMs: 40_000, on: far })
         } catch (e) {
+          drop()
           // an older backend without this route: check again in a minute; a restarting one: in a few
           // seconds, another machine that cannot be reached: in half a minute
           await sleep(noRoute(e) ? 60_000 : at ? 30_000 : 5000)
@@ -6349,10 +6394,11 @@ const Chip = () => {
   const liveRate = rates.reduce((a, r) => a + r.rate, 0)
   const tone = liveRate >= 5 ? 'bad' : liveRate >= 1.5 ? 'warn' : null
   const running = rates.length > 0
-  // credits, the API key cap or a plan's own limit (a Nous spend cap) nearly used up: 5% or less left turns the spark red
-  const quotaLeft = spendLimit(account) ? spendLimit(account).lowest : null
+  // the limit that stops requests first, colored by how soon at the recent pace like the popover's line, or
+  // a plan's own limit (a Nous spend cap) nearly used up
+  const quotaTone = spendLimit(account) ? spendLimit(account).worst : null
   const planUsed = limits ? Math.max(0, ...limits.windows.filter(w => w.scope !== 'model' && w.used_percent != null).map(w => w.used_percent)) : 0
-  const quotaLow = (quotaLeft != null && quotaLeft <= 0.05) || planUsed >= 95 || !!(limits && limits.low)
+  const quotaLow = quotaTone === 'bad' || planUsed >= 95 || !!(limits && limits.low)
 
   // no number before the first answer: $0 would read as this machine's spend
   const label = error ? '-' : !data ? '' : running ? fmtRate(liveRate) : fmtUsd(spend)
@@ -6382,7 +6428,7 @@ const Chip = () => {
         },
         asks.length || ranNote ? el('span', { style: { width: 7, height: 7, borderRadius: 4, flex: 'none', background: asks.length ? C.warn : C.bad } }) : null,
         ctxPct != null ? el(ContextGauge, { pct: ctxPct, used: ctxSrc.context_used, max: ctxSrc.context_max, threshold }) : null,
-        el(Spark, { values: spark, tone: quotaLow ? 'bad' : tone, marks: resets.filter(r => r.cause === 'swap' && (r.at || '') === (at || '')) }),
+        el(Spark, { values: spark, tone: quotaLow ? 'bad' : tone || quotaTone, marks: resets.filter(r => r.cause === 'swap' && (r.at || '') === (at || '')) }),
         el('span', { style: { color: tone ? 'inherit' : C.text } }, label),
         sub ? el('span', { style: { color: tone ? 'inherit' : C.dim, opacity: tone ? 0.85 : 1 } }, sub) : null
       )
@@ -6393,7 +6439,7 @@ const Chip = () => {
       asks.length
         ? el(AskCard, { key: asks[0].at + ' ' + asks[0].id, ask: asks[0], more: asks.length - 1, onAnswered: id => { asksWaiting.current = Math.max(0, asks.length - 1); setAsks(x => x.filter(a => !(a.id === id && a.at === asks[0].at))); if (asks.length <= 1) setOpen(false) } })
         : data
-        ? el('div', null, ranNote ? el(RanOutNote, { o: ranNote }) : null, aside ? el(AsideNote, { aside }) : outdated ? el(UpdateNote, { updates: outdated.updates, latest: outdated.latest, machine: fromMachine }) : null, el(Body, { meter: data, prices, threshold, retries, yaml, profile, profileLabel, refresh, rates, defaultModel, account, planLimits: limits, cheapest, orProfile, orAny, onPeriod: setChipPeriod, view, onView: pickView, scope, profileCount, onScope: setScope, off, aside, at, fromMachine, fromBot }))
+        ? el('div', null, ranNote ? el(RanOutNote, { o: ranNote }) : null, aside ? el(AsideNote, { aside }) : restart ? el(RestartNote, { machine: fromMachine }) : outdated ? el(UpdateNote, { updates: outdated.updates, latest: outdated.latest, machine: fromMachine }) : null, el(Body, { meter: data, prices, threshold, retries, yaml, profile, profileLabel, refresh, rates, defaultModel, account, planLimits: limits, cheapest, orProfile, orAny, onPeriod: setChipPeriod, view, onView: pickView, scope, profileCount, onScope: setScope, off, aside, at, fromMachine, fromBot }))
         : el('div', { style: { padding: 16, fontSize: 12, color: C.sub, width: 240, fontVariantNumeric: 'tabular-nums' } }, error ? error : reads ? readingLine(reads) : 'Loading…')
     )
   )

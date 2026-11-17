@@ -243,14 +243,14 @@ await healthOf(async req => { healthAsk = req; return {} }).loadHealth()
 check('and is not waited for long', healthAsk && healthAsk.timeoutMs === 10000, JSON.stringify(healthAsk))
 
 // the backend's account: "none to tell" is not "no answer"
-const accountOf = (answer, rpc) => new Function('api', 'host', "const OWN = '/api/plugins/hermetic'\n" + grab('const money = ', 'function parseAccountLines(') + grab('function parseAccountLines(', '// What actually stops requests') + grab('async function loadAccount(sid, profile)', 'const chatAccounts = new Map()') +
-  '\nreturn { loadAccount }')(answer, { request: rpc || (async () => ({})) })
-check('the backend\'s account is read from its lines', (await accountOf(async () => ({ provider: 'openrouter', lines: billText.split('\n'), account: { budgets: [{ label: 'b' }] } })).loadAccount(null)).today === 1.21)
+const accountOf = answer => new Function('api', "const OWN = '/api/plugins/hermetic'\n" + grab('const money = ', 'function parseAccountLines(') + grab('function parseAccountLines(', '// What actually stops requests') + grab('async function loadAccount(profile)', 'const chatAccounts = new Map()') +
+  '\nreturn { loadAccount }')(answer)
+check('the backend\'s account is read from its lines', (await accountOf(async () => ({ provider: 'openrouter', lines: billText.split('\n'), account: { budgets: [{ label: 'b' }] } })).loadAccount('default')).today === 1.21)
 let accountAsk = null
-await accountOf(async req => { accountAsk = req; return { lines: [] } }).loadAccount(null, 'company-runner')
+await accountOf(async req => { accountAsk = req; return { lines: [] } }).loadAccount('company-runner')
 check('each profile is asked for its own account, as it can have its own key', accountAsk && accountAsk.profile === 'company-runner', JSON.stringify(accountAsk))
-check('a backend that answers without an account says so', (await accountOf(async () => ({ provider: 'auto', lines: [], account: null })).loadAccount(null)) === null)
-check('a backend that does not answer says nothing, so its machine is not asked more', (await accountOf(async () => { throw new Error('Timed out') }).loadAccount(null)) === undefined && (await accountOf(async () => { throw new Error('Timed out') }).loadAccount('run-1')) === undefined)
+check('a backend that answers without an account says so', (await accountOf(async () => ({ provider: 'auto', lines: [], account: null })).loadAccount('default')) === null)
+check('a backend that does not answer says nothing, so its machine is not asked more', (await accountOf(async () => { throw new Error('Timed out') }).loadAccount('default')) === undefined)
 
 // requests go to the machine of the focused chat: the primary one through the SDK, another one by name
 const sent = []
@@ -267,7 +267,7 @@ door.aimAt({ connectionId: 'c1', profile: 'default', target: 'default' })
 check('a chat on another connection asks that machine by name', (await door.api(usage)).ok === 'c1' && sent.length === 1 && named.length === 1 && named[0].connectionId === 'c1' && named[0].profile === 'default' && named[0].path === '/api/plugins/hermetic/usage?days=7&profile=default&reading=1', JSON.stringify(named))
 await door.api({ path: '/api/plugins/hermetic/config', method: 'PUT', body: { a: 1 } })
 check('changes go to that machine too', named.length === 2 && named[1].method === 'PUT' && named[1].body.a === 1 && named[1].path === '/api/plugins/hermetic/config?profile=default' && sent.length === 1, JSON.stringify(named[1]))
-await door.api({ path: '/api/plugins/hermetic/hdr/guard/asks?wait=25', here: true })
+await door.api({ path: '/api/plugins/hermetic/hdr/guard/asks?wait=25', on: null })
 check('the guard\'s questions stay with the primary machine', sent.length === 2 && sent[1][0].startsWith('/hdr/guard/asks') && named.length === 2, JSON.stringify(sent))
 check('each machine keeps its own bill', door.billedKey() === 'billed@c1')
 door.aimAt({ connectionId: 'c1', profile: 'default', target: 'ops' })
@@ -286,7 +286,7 @@ try { await door.api({ path: '/api/plugins/hermetic/config', method: 'PUT', body
 check('without a backend there, requests fail at once as a missing route', named.length === 4 && noRoute(refused) && noRoute(refusedWrite) && door.backendOff(), JSON.stringify({ n: named.length, refused: String(refused) }))
 await door.api({ path: '/api/plugins/hermetic/health' })
 check('except the health check, which notices the backend coming', named.length === 5 && named[4].path.startsWith('/api/plugins/hermetic/health'), JSON.stringify(named[4]))
-await door.api({ path: '/api/plugins/hermetic/hdr/guard/asks?wait=25&have=x', here: true })
+await door.api({ path: '/api/plugins/hermetic/hdr/guard/asks?wait=25&have=x', on: null })
 check('and the primary machine is still asked', sent.length === 3)
 door.aimAt(null)
 check('its own chats are not held back by the other machine', (await door.api({ path: '/api/plugins/hermetic/sessions?days=30' })).ok === 'primary' && !door.backendOff() && door.billedKey() === 'billed')
@@ -318,7 +318,7 @@ let unasked = null
 try { await door.api(usage) } catch (e) { unasked = e }
 check('a machine that cannot be asked gets no request, and neither does the primary one in its place', !!unasked && sent.length === sentSoFar[0] && named.length === sentSoFar[1], String(unasked))
 check('its bill and its switch stay its own', door.billedKey() === 'billed@c3' && !door.backendOff())
-await door.api({ path: '/api/plugins/hermetic/hdr/guard/asks?wait=25', here: true })
+await door.api({ path: '/api/plugins/hermetic/hdr/guard/asks?wait=25', on: null })
 check('while the guard still asks the primary machine', sent.length === sentSoFar[0] + 1)
 
 // a route an older hermetic lacks is asked once per machine, then left alone

@@ -467,6 +467,7 @@ def _calls_of(tool_calls):
 
 
 _ACCOUNT_CACHE: Dict[tuple, tuple] = {}
+_PROVIDER_CACHE: Dict[str, tuple] = {}  # profile -> (when, the provider its account belongs to)
 _ACCOUNT_TTL_S = 60.0
 
 
@@ -577,11 +578,16 @@ async def account_usage(profile: Optional[str] = None):
     from hermes_cli.config import load_config_readonly
 
     def _run():
-        provider = _account_provider(load_config_readonly() or {}, profile)
+        now = time.monotonic()
+        seen = _PROVIDER_CACHE.get(profile or "")
+        if seen and now - seen[0] < _ACCOUNT_TTL_S:
+            provider = seen[1]
+        else:  # for a config that says "auto" this lists the profile's recent chats
+            provider = _account_provider(load_config_readonly() or {}, profile)
+            _PROVIDER_CACHE[profile or ""] = (now, provider)
         if not provider:
             return {"provider": None, "lines": [], "account": None}
         key = (profile or "", provider)
-        now = time.monotonic()
         hit = _ACCOUNT_CACHE.get(key)
         if hit and now - hit[0] < _ACCOUNT_TTL_S:
             return {"provider": provider, "lines": list(hit[1]), "account": hit[2], "cached": True}
@@ -762,7 +768,8 @@ _CALL_FIELDS = ("ts", "session", "platform", "model", "upstream", "input", "outp
                 "secs", "finish", "empty", "mw", "gen")
 _CALL_SHARED = {"session", "platform", "model", "upstream", "finish"}
 (_C_TS, _C_SESSION, _C_PLATFORM, _C_MODEL, _C_UPSTREAM, _C_INPUT, _C_OUTPUT, _C_CACHE, _C_REASONING,
- _C_SECS, _C_FINISH, _C_EMPTY, _C_MW, _C_GEN) = range(len(_CALL_FIELDS))
+ _C_SECS) = range(10)
+_C_MW = _CALL_FIELDS.index("mw")
 _CALLS: Dict[str, tuple] = {}  # path -> (file id, bytes read, calls, its first bytes and those just before where reading stopped)
 _CALLS_LOCK = threading.Lock()
 
@@ -879,9 +886,6 @@ async def routing(days: int = Query(30, ge=1, le=365), profile: Optional[str] = 
 
 
 _AUX_SKIP = {"moa_reference", "moa_aggregator"}  # MoA routes per preset slot, not per task
-_ROUTING_KEYS = ("only", "ignore", "order", "sort", "require_parameters", "data_collection",
-                 "allow_fallbacks", "zdr", "enforce_distillable_text", "quantizations", "max_price",
-                 "preferred_min_throughput", "preferred_max_latency")
 
 
 def _state_path():
@@ -1149,25 +1153,54 @@ def _update_state():
         plugins = Path(get_hermes_home()) / "plugins"
         auto = bool(((load_config_readonly() or {}).get("plugins") or {}).get("auto_apply"))
         if (plugins / "hermetic").is_symlink():
-            return {"never": True, "why": "link", "auto": False, "fix": None}  # someone's own checkout
+            return {"never": True, "auto": False, "fix": None}  # someone's own checkout
         try:
             rec = _json.loads((plugins / ".install-metadata.json").read_text(encoding="utf-8-sig")).get("hermetic")
         except (OSError, ValueError, AttributeError):
             rec = None
         if not isinstance(rec, dict):
-            return {"never": False, "why": None, "auto": None, "fix": None}
+            return {"never": False, "auto": None, "fix": None}
         catalog = rec.get("catalog")
         if rec.get("pinned") is True and not (isinstance(catalog, dict) and catalog.get("pin")):
             if isinstance(catalog, dict):  # a catalog install held at a chosen commit: updating moves it back
-                return {"never": True, "why": "held", "auto": False, "fix": _UPDATE_CMD}
+                return {"never": True, "auto": False, "fix": _UPDATE_CMD}
             # a pin stays on a reinstall from the same source, so the install is removed first
             source = str(rec.get("source") or "")
             source = source.removesuffix(".git") if _SOURCE_RE.match(source) else "https://github.com/forefy/hermetic"
-            return {"never": True, "why": "pinned", "auto": False,
+            return {"never": True, "auto": False,
                     "fix": "hermes plugins remove hermetic && hermes plugins install " + source + " --enable --force"}
-        return {"never": False, "why": None, "auto": auto, "fix": _UPDATE_CMD}
+        return {"never": False, "auto": auto, "fix": _UPDATE_CMD}
     except Exception:
         return None
+
+
+# What this process loaded, so a newer copy on disk (an update, or an edit to a linked folder) is told apart
+# from what runs: Hermes keeps running the code it loaded until its backend starts again.
+_PLUGIN_ROOT = Path(__file__).resolve().parent.parent
+_PLUGIN_FILES = ("plugin.yaml", "__init__.py", "hdr_rules.py", "dashboard/plugin_api.py")
+
+
+def _plugin_files():
+    out = {}
+    for rel in _PLUGIN_FILES:
+        try:
+            out[rel] = (_PLUGIN_ROOT / rel).stat().st_mtime_ns
+        except OSError:
+            out[rel] = None
+    return out
+
+
+def _plugin_version():
+    try:
+        for line in (_PLUGIN_ROOT / "plugin.yaml").read_text().splitlines():
+            if line.startswith("version:"):
+                return line.split(":", 1)[1].strip().strip("\"'") or None
+    except OSError:
+        pass
+    return None
+
+
+_LOADED_FILES, _LOADED_VERSION = _plugin_files(), _plugin_version()
 
 
 @router.get("/health")
@@ -1188,16 +1221,9 @@ async def health():
                     missing.append(key)
             except Exception:
                 missing.append(key)
-        version = None
-        try:
-            for line in (Path(__file__).resolve().parent.parent / "plugin.yaml").read_text().splitlines():
-                if line.startswith("version:"):
-                    version = line.split(":", 1)[1].strip().strip("\"'") or None
-                    break
-        except OSError:
-            pass
-        return {"missing": sorted(set(missing) | _DEGRADED), "version": version, "checkout": _own_checkout(),
-                "updates": _update_state()}
+        # the version that runs, and whether newer files wait for the backend to start again
+        return {"missing": sorted(set(missing) | _DEGRADED), "version": _LOADED_VERSION, "checkout": _own_checkout(),
+                "updates": _update_state(), "restart": _plugin_files() != _LOADED_FILES}
 
     return await asyncio.to_thread(_run)
 
@@ -1212,7 +1238,7 @@ def _own_checkout(root=None):
     if own and time.time() - _CHECKOUT["at"] < 60:
         return _CHECKOUT["value"]
     import subprocess
-    root = Path(root or Path(__file__).resolve().parent.parent)
+    root = Path(root or _PLUGIN_ROOT)
     value = None
     if (root / ".git").exists():
         def git(*a):

@@ -83,6 +83,8 @@ hermes plugins install forefy/hermetic --enable --force
 
 Either way, restart Hermes afterwards as in step 1.
 
+The popover tells you, for this computer and for every other machine you chat with, when hermetic there is behind the latest version and Hermes will not update it by itself (`plugins.auto_apply` is off, or the install is held at one commit), and when an update waits for Hermes to restart.
+
 ## Remove
 
 ```bash

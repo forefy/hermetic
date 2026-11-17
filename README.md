@@ -48,7 +48,7 @@ Deep and analytical cost tracking especially when using multi-provider routing (
 - Spend analytics per day, per session and live $/hour while turns run
 - Cache hit rate: how much of each prompt came from the provider's cache, and what cache resets cost you.
 - Pricing drift: what you were billed compared with list prices, on OpenRouter and, call by call, on Nous Portal.
-- OpenRouter spend limits and workspace budgets, and Nous Portal spend caps, with warnings when close to hit limits
+- OpenRouter spend limits and workspace budgets, and Nous Portal spend caps, colored by how soon each one stops your requests at the recent pace
 - **Providers** (OpenRouter): which providers actually served your calls, where they are based, and your routing rules, with an extra verbose policy editor for them.
 - **Quality by provider** (OpenRouter): whether one provider's copy of a model answers worse than the others, judged by the replies you pushed back on. A box per day gives the quick look, with each provider's declared precision and when it changes, and one click skips a provider for that model. An optional daily check catches a model changed behind the same name.
 - **Improvement suggestions**: one-click config fixes, for example routing to the cheapest provider, running background tasks on a cheaper model, turning fallback on when calls fail on rate limits, or turning on Hermes' proactive prune of old tool output when, at the prices your chats were actually served, the re-sends it saves outweigh the full-price re-send each prune causes. Every fix shows the exact `config.yaml` change before it writes anything, and writes on top of the config as it is at that moment.

@@ -39,7 +39,7 @@ def installed(record=None, link=False):
 def test_a_linked_folder_never_updates():
     installed(link=True)
     s = api._update_state()
-    assert s["never"] and s["why"] == "link" and s["auto"] is False and s["fix"] is None, s
+    assert s["never"] and s["auto"] is False and s["fix"] is None, s
 
 
 def test_a_catalog_install_follows_the_catalog():
@@ -58,7 +58,7 @@ def test_a_tracked_github_install_is_updated():
 def test_an_install_at_a_fixed_commit_never_updates_and_is_reinstalled_unpinned():
     installed({"pinned": True, "revision": "bcb2cd19b6facfd8fbd1f53e4ae32a9925101823", "source": "https://github.com/someone/hermetic.git"})
     s = api._update_state()
-    assert s["never"] and s["why"] == "pinned" and s["auto"] is False, s
+    assert s["never"] and s["auto"] is False, s
     assert s["fix"] == "hermes plugins remove hermetic && hermes plugins install https://github.com/someone/hermetic --enable --force", s
 
 
@@ -70,7 +70,7 @@ def test_a_source_that_is_not_a_plain_repo_address_is_not_put_in_the_command():
 def test_a_catalog_install_held_at_a_chosen_commit_is_moved_by_an_update():
     installed({"pinned": True, "revision": "d" * 40, "source": "https://github.com/forefy/hermetic.git", "catalog": {"name": "hermetic", "pin": ""}})
     s = api._update_state()
-    assert s["never"] and s["why"] == "held" and s["auto"] is False and s["fix"] == "hermes plugins update hermetic", s
+    assert s["never"] and s["auto"] is False and s["fix"] == "hermes plugins update hermetic", s
 
 
 def test_an_install_hermes_can_move_follows_the_automatic_updates_switch():
@@ -82,6 +82,19 @@ def test_an_install_hermes_can_move_follows_the_automatic_updates_switch():
     installed({"pinned": True, "revision": "e" * 40, "source": "https://github.com/forefy/hermetic.git"})
     assert api._update_state()["auto"] is False, "a pinned install never moves, whatever the switch says"
     CONFIG.clear()
+
+
+def test_the_running_version_and_a_waiting_update_are_told():
+    import asyncio
+    out = asyncio.run(api.health())
+    assert out["version"] == api._LOADED_VERSION and out["restart"] is False, out
+    saved = dict(api._LOADED_FILES)
+    try:
+        api._LOADED_FILES["dashboard/plugin_api.py"] = 1  # as if the file on disk changed after it was loaded
+        assert asyncio.run(api.health())["restart"] is True, "newer files on disk wait for a restart"
+    finally:
+        api._LOADED_FILES.clear()
+        api._LOADED_FILES.update(saved)
 
 
 def test_no_record_says_nothing():

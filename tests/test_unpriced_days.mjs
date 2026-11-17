@@ -10,7 +10,7 @@ const load = usage => new Function('usage', 'PRICES', [
   "const OWN = ''", 'const num = v => { const n = Number(v); return Number.isFinite(n) ? n : 0 }',
   'const api = async () => usage', 'const loadVendorPrices = async () => {}',
   'const priceOf = (prices, model) => prices[model] || null', "const priceSource = (prices, model) => 'list price of ' + model",
-  src.match(/^const costAt = .*\n.*$/m)[0], grabFn('loadAnalytics'),
+  src.match(/^const costAt = .*\n.*$/m)[0], src.match(/^const profileName = .*$/m)[0], grabFn('loadAnalytics'),
   "return loadAnalytics([{ name: 'default', isDefault: true }], 7, PRICES)"].join('\n'))(usage, PRICES)
 
 let failed = 0

@@ -548,18 +548,44 @@ def _snapshot_fields(snap, extra=None):
                          "detail": w.detail, "scope": w.scope} for w in snap.windows] + ([extra["window"]] if extra.get("window") else [])}
 
 
-def _account_provider(cfg, profile):
-    """The provider whose account a profile's calls are charged to. A config can leave the choice to Hermes
-    (``provider: auto``, or none at all): then the endpoint it names tells, and failing that where the
-    profile's latest chat was billed."""
-    model_cfg = cfg.get("model") if isinstance(cfg.get("model"), dict) else {}
-    provider = str(model_cfg.get("provider") or "").strip()
-    if provider.lower() not in ("", "auto"):
-        return provider
-    host = urlparse(str(model_cfg.get("base_url") or "")).hostname or ""
+def _known_site(url):
+    """"openrouter" or "nous" when an address is on that provider's own site, else ""."""
+    host = urlparse(str(url or "")).hostname or ""
     for site, name in (("openrouter.ai", "openrouter"), ("nousresearch.com", "nous")):
         if host == site or host.endswith("." + site):
             return name
+    return ""
+
+
+def _own_provider_url(cfg, provider):
+    """The address of a provider the config defines itself under ``providers:`` (or the older
+    ``custom_providers:`` list), matched by name whatever the case; "" for a built-in one."""
+    want = str(provider or "").strip().lower()
+    own = (cfg or {}).get("providers")
+    if want and isinstance(own, dict):
+        for key, entry in own.items():
+            if str(key).strip().lower() == want and isinstance(entry, dict):
+                return str(entry.get("base_url") or entry.get("api") or "")
+    legacy = (cfg or {}).get("custom_providers")
+    for entry in legacy if want and isinstance(legacy, list) else []:
+        if isinstance(entry, dict) and str(entry.get("name") or "").strip().lower() == want:
+            return str(entry.get("base_url") or "")
+    return ""
+
+
+def _account_provider(cfg, profile):
+    """The provider whose account a profile's calls are charged to. A config can leave the choice to Hermes
+    (``provider: auto``, or none at all): then the endpoint it names tells, and failing that where the
+    profile's latest chat was billed. A provider the config defines itself on OpenRouter's or Nous
+    Portal's address is that provider's account."""
+    model_cfg = cfg.get("model") if isinstance(cfg.get("model"), dict) else {}
+    provider = str(model_cfg.get("provider") or "").strip()
+    named = provider.lower() not in ("", "auto")
+    # a provider the config defines itself (say a Nous Portal API key as "nous-key"): its address tells
+    base_url = _own_provider_url(cfg, provider) if named else str(model_cfg.get("base_url") or "")
+    known = _known_site(base_url)
+    if known or named:
+        return known or provider
     try:
         db = _open_sessions_db(profile)
         try:

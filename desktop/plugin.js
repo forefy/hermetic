@@ -746,11 +746,31 @@ function modelKey(yaml, key) {
   return m ? m[1].trim() : ''
 }
 
-const configUsesNous = yaml => modelKey(yaml, 'provider').toLowerCase() === 'nous' || /nousresearch\.com/i.test(modelKey(yaml, 'base_url'))
+// Where the main model's calls go: model.base_url, else the address of the provider the config defines
+// itself under providers: (say a Nous Portal API key added as "nous-key"), matched by name whatever the case.
+function modelBaseUrl(yaml) {
+  const own = modelKey(yaml, 'base_url')
+  const name = modelKey(yaml, 'provider').toLowerCase()
+  if (own || !name || name === 'auto') return own
+  const block = yamlBlock(yaml, 'providers')
+  const first = block.find(x => /^\s+\S/.test(x))
+  const depth = first ? first.match(/^\s+/)[0] : '  '
+  const start = block.findIndex(x => x.startsWith(depth) && !/^\s/.test(x.slice(depth.length)) && x.slice(depth.length).split(':')[0].replace(/['"]/g, '').trim().toLowerCase() === name)
+  if (start < 0) return ''
+  const entry = []
+  for (let j = start + 1; j < block.length && !(block[j].startsWith(depth) && /^\S/.test(block[j].slice(depth.length))); j++) entry.push(block[j])
+  const inner = (entry.find(x => /^\s+\S/.test(x)) || '').match(/^\s*/)[0]
+  const value = key => { const l = entry.find(x => x.startsWith(inner + key + ':')); return l ? l.split(':').slice(1).join(':').replace(/#.*$/, '').replace(/['"]/g, '').trim() : '' }
+  return value('base_url') || value('api')
+}
+
+function configUsesNous(yaml) {
+  return modelKey(yaml, 'provider').toLowerCase() === 'nous' || /nousresearch\.com/i.test(modelBaseUrl(yaml))
+}
 
 function configUsesOpenRouter(yaml) {
   const provider = modelKey(yaml, 'provider').toLowerCase()
-  if (provider === 'openrouter' || /openrouter\.ai/i.test(modelKey(yaml, 'base_url'))) return true
+  if (provider === 'openrouter' || /openrouter\.ai/i.test(modelBaseUrl(yaml))) return true
   if (!provider || provider === 'auto') return null
   return false
 }
@@ -786,7 +806,8 @@ function providerLabel(yaml) {
   const prov = modelKey(yaml, 'provider').toLowerCase()
   const known = { nous: 'Nous Portal', anthropic: 'Anthropic', openai: 'OpenAI', gemini: 'Google', google: 'Google' }[prov]
   if (known) return known
-  const host = (/\/\/([^/:]+)/.exec(modelKey(yaml, 'base_url')) || [])[1]
+  if (configUsesNous(yaml)) return 'Nous Portal'
+  const host = (/\/\/([^/:]+)/.exec(modelBaseUrl(yaml)) || [])[1]
   if (host) return host.replace(/^(api|inference-api|inference)\./, '')
   return prov && prov !== 'auto' && prov !== 'custom' ? prov : 'Hermes'
 }

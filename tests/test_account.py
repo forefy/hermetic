@@ -123,6 +123,16 @@ def test_the_account_is_found_when_the_config_leaves_the_provider_to_hermes():
     assert _provider({"provider": "auto", "base_url": "https://not-openrouter.ai.example/v1"}) == "", "a look-alike address is not OpenRouter"
 
 
+def test_a_provider_the_config_defines_itself_is_found_by_its_address():
+    # a Nous Portal API key added as its own provider: model.provider names it, the address sits under providers:
+    nous_key = {"nous-key": {"name": "nous-key", "base_url": "https://inference-api.nousresearch.com/v1", "key_env": "NOUS_PORTAL_KEY"}}
+    assert api._account_provider({"model": {"provider": "nous-key"}, "providers": nous_key}, None) == "nous"
+    assert api._account_provider({"model": {"provider": "NOUS-KEY"}, "providers": nous_key}, None) == "nous", "names match whatever the case"
+    own = {"mine": {"base_url": "https://api.example-llm.ai/v1"}}
+    assert api._account_provider({"model": {"provider": "mine"}, "providers": own}, None) == "mine", "any other address keeps its name"
+    assert api._account_provider({"model": {"provider": "anthropic"}, "providers": nous_key}, None) == "anthropic", "a built-in provider is taken as it is"
+
+
 def test_without_an_endpoint_the_latest_chat_tells_where_calls_are_billed():
     rows = [{"id": "new", "billing_provider": "openrouter"}, {"id": "old", "billing_provider": "nous"}, {"id": "draft", "billing_provider": None}]
     assert _provider({"provider": "auto"}, rows) == "openrouter"

@@ -5,8 +5,8 @@ import { fileURLToPath } from 'url'
 
 const src = fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'desktop', 'plugin.js'), 'utf8')
 const grab = name => { const a = src.indexOf('function ' + name + '('); return src.slice(a, src.indexOf('\n}\n', a) + 2) }
-const { configUsesOpenRouter, providerLabel } = new Function(
-  ['yamlBlock', 'modelKey', 'configUsesOpenRouter', 'providerLabel'].map(grab).join('\n') + '\nreturn { configUsesOpenRouter, providerLabel }'
+const { configUsesOpenRouter, configUsesNous, providerLabel } = new Function(
+  ['yamlBlock', 'modelKey', 'modelBaseUrl', 'configUsesNous', 'configUsesOpenRouter', 'providerLabel'].map(grab).join('\n') + '\nreturn { configUsesOpenRouter, configUsesNous, providerLabel }'
 )()
 
 const cases = [
@@ -19,7 +19,17 @@ const cases = [
   ['custom endpoint', 'model:\n    provider: custom\n    base_url: https://api.example-llm.ai/v1', false, 'example-llm.ai'],
   ['known provider', 'model:\n  provider: nous\n  base_url: https://inference-api.nousresearch.com/v1', false, 'Nous Portal'],
   ['nested key not read', 'model:\n  extra:\n    provider: openrouter\n  provider: anthropic', false, 'Anthropic'],
-  ['no model block', 'other:\n  a: 1', null, 'Hermes']
+  ['no model block', 'other:\n  a: 1', null, 'Hermes'],
+  // a provider the config defines itself: its address sits under providers:, not under model:
+  ['own provider on Nous', 'model:\n  provider: nous-key\nproviders:\n  nous-key:\n    api: https://inference-api.nousresearch.com/v1\n    models:\n      - a/b\n    base_url: https://inference-api.nousresearch.com/v1', false, 'Nous Portal'],
+  ['own provider on OpenRouter', 'model:\n  provider: My-OR\nproviders:\n  other:\n    base_url: https://api.example-llm.ai/v1\n  my-or:\n    base_url: "https://openrouter.ai/api/v1"', true, 'OpenRouter'],
+  ["another provider's address not read", 'model:\n  provider: mine\nproviders:\n  mine:\n    name: mine\n  other:\n    base_url: https://openrouter.ai/api/v1', false, 'mine']
+]
+const nousCases = [
+  ['provider nous', 'model:\n  provider: nous', true],
+  ['own provider on Nous', 'model:\n  provider: nous-key\nproviders:\n  nous-key:\n    base_url: https://inference-api.nousresearch.com/v1', true],
+  ['own provider elsewhere', 'model:\n  provider: mine\nproviders:\n  mine:\n    base_url: https://api.example-llm.ai/v1', false],
+  ['openrouter', 'model:\n  provider: openrouter', false]
 ]
 // price lookup: a custom endpoint's model name finds the same model on OpenRouter's list
 const grabConst = name => { const a = src.indexOf('const ' + name + ' = '); return src.slice(a, src.indexOf('\n}\n', a) + 2) }
@@ -43,5 +53,10 @@ for (const [name, yaml, uses, label] of cases) {
   const ok = got[0] === uses && got[1] === label
   if (!ok) failed++
   console.log(ok ? 'ok  ' : 'FAIL', name, ok ? '' : JSON.stringify(got))
+}
+for (const [name, yaml, want] of nousCases) {
+  const got = configUsesNous(yaml)
+  if (got !== want) failed++
+  console.log(got === want ? 'ok  ' : 'FAIL', 'nous: ' + name, got === want ? '' : JSON.stringify(got))
 }
 process.exit(failed ? 1 : 0)

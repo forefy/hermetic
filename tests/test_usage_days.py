@@ -139,6 +139,50 @@ def test_only_zero_cost_sessions_with_tokens_and_a_model_are_handed_over():
     assert "unpriced" not in r["daily"][0], r["daily"][0].get("unpriced")
 
 
+class GuardedDb(FakeDb):
+    """Newer Hermes: SessionDB refuses every method the plugin guide does not list."""
+
+    auxiliary_usage_by_task = property(lambda self: (_ for _ in ()).throw(AttributeError("hermes_state.SessionDB has no attribute 'auxiliary_usage_by_task'")))
+
+
+def test_background_tasks_come_from_the_store_when_session_db_refuses_them():
+    import sqlite3
+    import tempfile
+    store = Path(tempfile.mkdtemp()) / "state.db"
+    conn = sqlite3.connect(store)
+    conn.execute("CREATE TABLE session_model_usage (session_id TEXT, task TEXT, api_call_count INT, input_tokens INT, output_tokens INT, estimated_cost_usd REAL)")
+    conn.executemany("INSERT INTO session_model_usage VALUES (?,?,?,?,?,?)", [
+        ("chat", "", 40, 9000, 900, 2.0),  # the chat's own calls: not a background task
+        ("chat", "title_generation", 1, 300, 20, 0.01),
+        ("chat", "compression", 2, 5000, 400, 0.25),
+        ("chat", "compression", 1, 2000, 100, 0.05),
+    ])
+    conn.commit()
+    conn.close()
+    api._SESSION_CACHE.clear()
+    db = GuardedDb([session("chat", 0, replies(0, 0))])
+    api._open_sessions_db = lambda profile: db
+    api._sessions_store = lambda profile: str(store)
+    r = asyncio.run(api.usage(days=1, profile=None))
+    assert abs(r["daily"][0]["estimated_cost"] - 10.0) < 1e-9, "the day's cost is there despite SessionDB refusing"
+    bg = next(m for m in r["by_model"] if m["model"] == "background tasks")
+    tasks = {t["task"]: t for t in bg["aux_tasks"]}
+    assert set(tasks) == {"title_generation", "compression"}
+    assert tasks["compression"]["api_calls"] == 3 and abs(tasks["compression"]["estimated_cost"] - 0.30) < 1e-9
+
+
+def test_unreadable_background_tasks_never_fail_the_route():
+    api._SESSION_CACHE.clear()
+    db = GuardedDb([session("chat", 0, replies(0))])
+    api._open_sessions_db = lambda profile: db
+    api._sessions_store = lambda profile: "/nonexistent/state.db"
+    r = asyncio.run(api.usage(days=1, profile=None))
+    assert abs(r["daily"][0]["estimated_cost"] - 10.0) < 1e-9
+    assert all(m["model"] != "background tasks" for m in r["by_model"])
+    assert "aux_usage" in api._DEGRADED
+    api._DEGRADED.discard("aux_usage")
+
+
 async def _sessions_for(sessions):
     api._SESSION_CACHE.clear()
     db = FakeDb(sessions)

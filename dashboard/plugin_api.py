@@ -425,6 +425,33 @@ def _light_sessions(db, store, rows, kind):
     return out
 
 
+_AUX_SQL = """SELECT task, COALESCE(SUM(api_call_count), 0), COALESCE(SUM(input_tokens), 0),
+                     COALESCE(SUM(output_tokens), 0), COALESCE(SUM(estimated_cost_usd), 0)
+                FROM session_model_usage WHERE session_id = ? AND task != '' GROUP BY task"""
+
+
+def _aux_tasks(db, store, sid, conns):
+    """{task: usage} of a session's background calls (titles, compression, vision, ...). Older Hermes hands
+    them out through SessionDB; newer Hermes keeps that method from plugins, so they are then read from
+    its session_model_usage table, the way Hermes sums them. Background costs are a detail of the Costs
+    view: when neither works they are left out and /health says so, instead of failing the whole route."""
+    try:
+        return db.auxiliary_usage_by_task(sid) or {}
+    except AttributeError:
+        pass
+    try:
+        if not conns:
+            import sqlite3
+            conns.append(sqlite3.connect(Path(store).resolve().as_uri() + "?mode=ro", uri=True, timeout=5))
+        rows = conns[0].execute(_AUX_SQL, (sid,)).fetchall()
+    except Exception:
+        _DEGRADED.add("aux_usage")
+        return {}
+    _DEGRADED.discard("aux_usage")
+    return {task: {"api_calls": calls, "input_tokens": i, "output_tokens": o, "estimated_cost_usd": cost}
+            for task, calls, i, o, cost in rows}
+
+
 # The first look after Hermes starts reads every recent session once. On a long history that takes
 # longer than the app waits for one request (30 seconds), however quick each read is. So a route that
 # reads sessions answers within a few seconds either way: with its answer, or with how far the read is
@@ -655,6 +682,7 @@ async def usage(days: int = Query(30, ge=1, le=365), profile: Optional[str] = No
     replies per day, so a chat started last week and still running counts today too."""
     def _run():
         db = _open_sessions_db(profile)
+        aux_conn = []  # the read-only connection _aux_tasks opens, if it needs one
         try:
             first_day = time.strftime("%Y-%m-%d", time.localtime(time.time() - (days - 1) * 86400))
             start = time.mktime(time.strptime(first_day, "%Y-%m-%d"))
@@ -705,7 +733,7 @@ async def usage(days: int = Query(30, ge=1, le=365), profile: Optional[str] = No
                 # background tasks are summed over a whole chain, so ask once per chain (at its start)
                 if started < start:
                     continue
-                for task, t in ({} if r.get("parent_session_id") else db.auxiliary_usage_by_task(r["id"]) or {}).items():
+                for task, t in ({} if r.get("parent_session_id") else _aux_tasks(db, store, r["id"], aux_conn)).items():
                     a = aux.setdefault(task, {"task": task, "input_tokens": 0, "output_tokens": 0, "estimated_cost": 0.0, "api_calls": 0})
                     a["input_tokens"] += int(t.get("input_tokens") or 0)
                     a["output_tokens"] += int(t.get("output_tokens") or 0)
@@ -720,6 +748,8 @@ async def usage(days: int = Query(30, ge=1, le=365), profile: Optional[str] = No
                                  "api_calls": sum(a["api_calls"] for a in tasks), "aux_tasks": tasks})
             return {"daily": [daily[k] for k in sorted(daily)], "by_model": by_model, "period_days": days}
         finally:
+            for c in aux_conn:
+                c.close()
             db.close()
     return await _answer(("usage", profile, days), _run, reading)
 

@@ -353,6 +353,14 @@ _LIGHT_TURNS = """
 # the chat the long way, and so does this.
 _LIGHT_NO_PLACES = ("SELECT 1 FROM messages WHERE session_id = ? AND (active = 1 OR compacted = 1)"
                     " AND (display_order IS NULL OR display_identity IS NULL) LIMIT 1")
+def _loaded_calls(msgs):
+    """The replies with tool calls among loaded messages, one of each stored copy the way the quick read
+    picks it: newer Hermes hands every copy compaction and rewind left behind to a full listing too."""
+    return _quick_tool_calls([(m.get("id") or 0, 1 if m.get("active", 1) else 0, m.get("timestamp"), m.get("tool_call_id"),
+                               m.get("tool_calls"), m.get("tool_name"), m.get("content"), m.get("display_metadata"))
+                              for m in msgs if m.get("role") == "assistant" and m.get("tool_calls")])
+
+
 #   kind: (SQL for one session's rows, SQL that finds a session only Hermes can list, the kind from
 #          those rows, the kind from loaded messages, SessionDB flags for loading them)
 _LIGHT = {
@@ -361,9 +369,11 @@ _LIGHT = {
     "bulk": ("SELECT role, CASE WHEN role = 'tool' THEN length(content) ELSE 0 END FROM messages"
              " WHERE session_id = ? AND active = 1 AND timestamp > 0 ORDER BY id", None, _session_bulk,
              lambda msgs: _session_bulk([(m.get("role"), len(str(m.get("content") or "")) if m.get("role") == "tool" else 0) for m in msgs]), {}),
-    "calls": (_LIGHT_CALLS + " ORDER BY id", None, lambda rows: _session_calls(_quick_tool_calls(rows)), _session_calls, {"every": True}),
+    "calls": (_LIGHT_CALLS + " ORDER BY id", None, lambda rows: _session_calls(_quick_tool_calls(rows)),
+              lambda msgs: _session_calls(_loaded_calls(msgs)), {"every": True}),
     "skills": (_LIGHT_CALLS + " AND tool_calls LIKE '%skill_view%' ORDER BY id", None,
-               lambda rows: _session_skills(_quick_tool_calls(rows)), _session_skills, {"every": True}),
+               lambda rows: _session_skills(_quick_tool_calls(rows)),
+               lambda msgs: _session_skills(_loaded_calls(msgs)), {"every": True}),
     "shown_turns": (_LIGHT_TURNS, _LIGHT_NO_PLACES, _quick_turns, _session_turns, {"shown": True}),
 }
 _LIGHT_LOCKS = {kind: threading.Lock() for kind in _LIGHT}

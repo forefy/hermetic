@@ -6,6 +6,7 @@ import asyncio
 import importlib.util
 import json
 import shutil
+import sqlite3
 import sys
 import tempfile
 import time
@@ -31,12 +32,17 @@ def store():
         sid = "chat-%d" % i
         db.create_session(sid, "desktop", model="z-ai/glm-5.3")
         call = {"id": "call_%d" % i, "type": "function", "function": {"name": "terminal", "arguments": json.dumps({"command": "curl https://example.com/%d" % i})}}
-        db.append_messages_batch(sid, [{"role": "user", "content": "go", "timestamp": NOW - 60},
-                                       {"role": "assistant", "content": "", "timestamp": NOW - 50, "tool_calls": [call]},
-                                       {"role": "tool", "content": "ok", "tool_call_id": call["id"], "tool_name": "terminal", "timestamp": NOW - 49},
-                                       {"role": "assistant", "content": "Done.", "timestamp": NOW - 40}])
-        db.update_token_counts(sid, input_tokens=10, output_tokens=5, model="z-ai/glm-5.3", api_call_count=2, absolute=True)
+        for m in [{"role": "user", "content": "go", "timestamp": NOW - 60},
+                  {"role": "assistant", "content": "", "timestamp": NOW - 50, "tool_calls": [call]},
+                  {"role": "tool", "content": "ok", "tool_call_id": call["id"], "tool_name": "terminal", "timestamp": NOW - 49},
+                  {"role": "assistant", "content": "Done.", "timestamp": NOW - 40}]:
+            db.append_message(sid, **m)  # SessionDB hands plugins single appends only
     db.close()
+    # and no token counters: those are the store's own columns here
+    raw = sqlite3.connect(folder / "state.db")
+    raw.execute("UPDATE sessions SET input_tokens = 10, output_tokens = 5, api_call_count = 2")
+    raw.commit()
+    raw.close()
     return folder
 
 

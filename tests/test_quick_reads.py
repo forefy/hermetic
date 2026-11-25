@@ -45,7 +45,8 @@ def real_store(extra=()):
                      "tool_name": made["function"]["name"], "timestamp": ts + 1})
     msgs.append({"role": "assistant", "content": "All done.", "timestamp": NOON + 400})
     msgs.append({"role": "user", "content": "no, that is wrong, you forgot the tests", "timestamp": NOON + 500})
-    db.append_messages_batch("chat", msgs + list(extra))
+    for m in msgs + list(extra):  # SessionDB hands plugins single appends only
+        db.append_message("chat", **m)
     db.close()
     return folder, path
 

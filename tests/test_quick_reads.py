@@ -13,6 +13,9 @@ import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+from _store import add_chat, add_messages, writer  # noqa: E402
+
 spec = importlib.util.spec_from_file_location("plugin_api", HERE.parent / "dashboard" / "plugin_api.py")
 api = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(api)
@@ -31,11 +34,9 @@ def real_store(extra=()):
     """A real Hermes session store with one chat over two days: a request, 31 tool rounds (a big tool
     result first, one round loads a skill), a closing reply and a complaint about it. ``extra`` adds
     messages at the end."""
-    from hermes_state import SessionDB
     folder = Path(tempfile.mkdtemp(prefix="hermetic-quick-"))
     path = folder / "state.db"
-    db = SessionDB(db_path=path)
-    db.create_session("chat", "desktop", model="z-ai/glm-5.3")
+    db = writer(path)
     msgs = [{"role": "user", "content": "go", "timestamp": NOON - DAY}]
     for i in range(31):
         ts = NOON - DAY + 10 * i if i < 12 else NOON + 10 * i
@@ -45,8 +46,7 @@ def real_store(extra=()):
                      "tool_name": made["function"]["name"], "timestamp": ts + 1})
     msgs.append({"role": "assistant", "content": "All done.", "timestamp": NOON + 400})
     msgs.append({"role": "user", "content": "no, that is wrong, you forgot the tests", "timestamp": NOON + 500})
-    for m in msgs + list(extra):  # SessionDB hands plugins single appends only
-        db.append_message("chat", **m)
+    add_chat(db, "chat", msgs + list(extra))
     db.close()
     return folder, path
 
@@ -60,8 +60,7 @@ def copy_row(raw, row_id, active, compacted, **changed):
 
 
 def listed(path):
-    from hermes_state import SessionDB
-    db = SessionDB(path, read_only=True)
+    db = api._StoreReader(path)
     return db, [r for r in api._db_sessions(db) if r["id"] == "chat"]
 
 
@@ -192,21 +191,20 @@ def test_hdr_works_out_paths_for_the_period_on_screen_only():
 
 
 def test_it_reads_beside_a_store_hermes_is_writing():
-    from hermes_state import SessionDB
     folder, path = real_store()
     try:
-        writer = SessionDB(db_path=path)  # Hermes keeps its own connection open in the same process
+        hermes = writer(path)  # Hermes keeps its own connection open in the same process
         reader, rows = listed(path)
         api._SESSION_CACHE.clear()
         before = api._light_sessions(reader, str(path), rows, "days")["chat"]
-        writer.append_message("chat", "assistant", "done", timestamp=NOON + 900)
+        add_messages(hermes, "chat", [{"role": "assistant", "content": "done", "timestamp": NOON + 900}])
         reader.close()
         reader, rows = listed(path)
         after = api._light_sessions(reader, str(path), rows, "days")["chat"]
         assert sum(after.values()) == sum(before.values()) + 1, (before, after)
-        writer.append_message("chat", "user", "thanks", timestamp=NOON + 901)  # and Hermes can still write
+        add_messages(hermes, "chat", [{"role": "user", "content": "thanks", "timestamp": NOON + 901}])  # and Hermes can still write
         reader.close()
-        writer.close()
+        hermes.close()
     finally:
         shutil.rmtree(folder, ignore_errors=True)
 

@@ -139,7 +139,7 @@ Network calls are only done to supported providers (e.g. OpenRouter) to get late
 
 We gave hermetic just enough power to provide extended security, while limiting anything that is not needed for these ops.
 
-- Hermes' session database (read-only, through Hermes' `SessionDB`). For Costs, HDR and AAI it also reads a few columns of each message straight from that database, read-only (role, time, tool output size, tool calls, the start of your messages and replies), so a big history loads without opening every message. On Hermes builds that keep background task usage from plugins, Costs reads those usage rows (task, calls, tokens, cost) from the same database, read-only.
+- Hermes' session database (read-only, through Hermes' storage interface, or `SessionDB` on Hermes builds from before it). For Costs, HDR and AAI it also reads a few columns of each message straight from that database, read-only (role, time, tool output size, tool calls, the start of your messages and replies), so a big history loads without opening every message.
 - `config.yaml`
 - the skills and their change history
 - scheduled jobs

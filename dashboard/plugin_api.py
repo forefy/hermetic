@@ -131,12 +131,56 @@ class _NoSessions:
         pass
 
 
+class _StoreReader:
+    """The few reads hermetic makes of a session store, through Hermes' storage interface: a read-only handle
+    from persistence_assembly, answering in the row dicts SessionDB gave. Hermes deprecated SessionDB for it
+    and removes SessionDB in v0.27."""
+
+    def __init__(self, path):
+        from contextlib import ExitStack
+        from persistence_assembly import open_persistence_reader
+        self._stack = ExitStack()
+        self._store = self._stack.enter_context(open_persistence_reader(Path(path)))
+
+    def list_sessions_rich(self, limit=20, include_children=False, include_archived=False, include_hidden=False,
+                           include_subagents=False, compact_rows=False):
+        from persistence.conversation.sessions import SessionQuery, SessionWindow
+        query = SessionQuery(include_children=include_children, include_archived=include_archived,
+                             include_hidden=include_hidden, include_subagents=include_subagents)
+        entries = self._store.sessions.list_sessions(query, SessionWindow(limit=limit), compact_rows=compact_rows)
+        return [e.as_list_row() for e in entries]
+
+    def get_messages(self, session_id, include_inactive=False, include_compacted=False):
+        from persistence.conversation.messages import TranscriptRead, TranscriptView
+        view = TranscriptView.ALL if include_inactive else TranscriptView.DISPLAY if include_compacted else TranscriptView.ACTIVE
+        return [row.as_wire_row() for row in self._store.messages.read_transcript(session_id, TranscriptRead(view=view))]
+
+    def get_session(self, session_id):
+        record = self._store.sessions.get(session_id)
+        return None if record is None else record.as_session_row()
+
+    def auxiliary_usage_by_task(self, session_id):
+        return {task: {"api_calls": u.api_call_count, "input_tokens": u.tokens.input_tokens,
+                       "output_tokens": u.tokens.output_tokens, "estimated_cost_usd": u.estimated_cost_usd}
+                for task, u in self._store.usage.auxiliary_usage_by_task(session_id).items()}
+
+    def close(self):
+        self._stack.close()
+
+
 def _open_sessions_db(profile):
-    """The profile's session store, read-only, through Hermes' public SessionDB."""
-    from hermes_state import SessionDB
+    """The profile's session store, read-only: through Hermes' storage interface, or on a Hermes from before
+    it (no persistence_assembly) through SessionDB."""
     _name, home = _profile_home(profile)
     path = home / "state.db"
-    return SessionDB(path, read_only=True) if path.exists() else _NoSessions()
+    if not path.exists():
+        return _NoSessions()
+    try:
+        import persistence_assembly  # noqa: F401
+    except ImportError:
+        from hermes_state import SessionDB
+        return SessionDB(path, read_only=True)
+    return _StoreReader(path)
 
 
 def _db_sessions(db, since=0.0):
@@ -267,7 +311,7 @@ def _session_bulk(marks):
 # on, how big its old tool output is, the tool calls it made, the turns of the conversation. None of them
 # needs the text of a tool result, which is most of a store, so each is read as a few columns straight
 # from the messages table, a session at a time. That table is a Hermes internal: when it cannot be read
-# this way the messages are loaded through SessionDB instead, and /health says so.
+# this way the messages are loaded through Hermes' storage interface instead, and /health says so.
 
 def _model_only(notes):
     """Whether a message's display notes mark it as one only the model sees: Hermes lists none of those."""
@@ -362,7 +406,7 @@ def _loaded_calls(msgs):
 
 
 #   kind: (SQL for one session's rows, SQL that finds a session only Hermes can list, the kind from
-#          those rows, the kind from loaded messages, SessionDB flags for loading them)
+#          those rows, the kind from loaded messages, flags for loading them)
 _LIGHT = {
     "days": ("SELECT role, timestamp FROM messages WHERE session_id = ? AND role = 'assistant' AND timestamp > 0", None,
              _session_days, lambda msgs: _session_days([(m.get("role"), m.get("timestamp")) for m in msgs]), {"every": True}),
@@ -435,31 +479,16 @@ def _light_sessions(db, store, rows, kind):
     return out
 
 
-_AUX_SQL = """SELECT task, COALESCE(SUM(api_call_count), 0), COALESCE(SUM(input_tokens), 0),
-                     COALESCE(SUM(output_tokens), 0), COALESCE(SUM(estimated_cost_usd), 0)
-                FROM session_model_usage WHERE session_id = ? AND task != '' GROUP BY task"""
-
-
-def _aux_tasks(db, store, sid, conns):
-    """{task: usage} of a session's background calls (titles, compression, vision, ...). Older Hermes hands
-    them out through SessionDB; newer Hermes keeps that method from plugins, so they are then read from
-    its session_model_usage table, the way Hermes sums them. Background costs are a detail of the Costs
-    view: when neither works they are left out and /health says so, instead of failing the whole route."""
+def _aux_tasks(db, sid):
+    """{task: usage} of a session's background calls (titles, compression, vision, ...). They are a detail of
+    the Costs view: a store that cannot say leaves them out, and /health says so, instead of failing the route."""
     try:
-        return db.auxiliary_usage_by_task(sid) or {}
-    except AttributeError:
-        pass
-    try:
-        if not conns:
-            import sqlite3
-            conns.append(sqlite3.connect(Path(store).resolve().as_uri() + "?mode=ro", uri=True, timeout=5))
-        rows = conns[0].execute(_AUX_SQL, (sid,)).fetchall()
+        tasks = db.auxiliary_usage_by_task(sid) or {}
     except Exception:
         _DEGRADED.add("aux_usage")
         return {}
     _DEGRADED.discard("aux_usage")
-    return {task: {"api_calls": calls, "input_tokens": i, "output_tokens": o, "estimated_cost_usd": cost}
-            for task, calls, i, o, cost in rows}
+    return tasks
 
 
 # The first look after Hermes starts reads every recent session once. On a long history that takes
@@ -692,7 +721,6 @@ async def usage(days: int = Query(30, ge=1, le=365), profile: Optional[str] = No
     replies per day, so a chat started last week and still running counts today too."""
     def _run():
         db = _open_sessions_db(profile)
-        aux_conn = []  # the read-only connection _aux_tasks opens, if it needs one
         try:
             first_day = time.strftime("%Y-%m-%d", time.localtime(time.time() - (days - 1) * 86400))
             start = time.mktime(time.strptime(first_day, "%Y-%m-%d"))
@@ -743,7 +771,7 @@ async def usage(days: int = Query(30, ge=1, le=365), profile: Optional[str] = No
                 # background tasks are summed over a whole chain, so ask once per chain (at its start)
                 if started < start:
                     continue
-                for task, t in ({} if r.get("parent_session_id") else _aux_tasks(db, store, r["id"], aux_conn)).items():
+                for task, t in ({} if r.get("parent_session_id") else _aux_tasks(db, r["id"])).items():
                     a = aux.setdefault(task, {"task": task, "input_tokens": 0, "output_tokens": 0, "estimated_cost": 0.0, "api_calls": 0})
                     a["input_tokens"] += int(t.get("input_tokens") or 0)
                     a["output_tokens"] += int(t.get("output_tokens") or 0)
@@ -758,8 +786,6 @@ async def usage(days: int = Query(30, ge=1, le=365), profile: Optional[str] = No
                                  "api_calls": sum(a["api_calls"] for a in tasks), "aux_tasks": tasks})
             return {"daily": [daily[k] for k in sorted(daily)], "by_model": by_model, "period_days": days}
         finally:
-            for c in aux_conn:
-                c.close()
             db.close()
     return await _answer(("usage", profile, days), _run, reading)
 
@@ -1249,18 +1275,21 @@ async def health():
     def _run():
         checks = {
             "profiles": ("hermes_cli.profiles", "list_profiles"),
-            "sessions_db": ("hermes_state", "SessionDB"),
+            # the storage interface, or SessionDB on a Hermes from before it
+            "sessions_db": [("persistence_assembly", "open_persistence_reader"), ("hermes_state", "SessionDB")],
             "routing_hook": ("hermes_cli.middleware", "apply_llm_request_middleware"),
             "per_model_routing": ("hermes_constants", "resolve_per_model_provider_routing"),
             "account_usage": ("agent.account_usage", "fetch_account_usage"),
         }
         missing = []
         import importlib
-        for key, (mod, attr) in checks.items():
+        def has(mod, attr):
             try:
-                if not hasattr(importlib.import_module(mod), attr):
-                    missing.append(key)
+                return hasattr(importlib.import_module(mod), attr)
             except Exception:
+                return False
+        for key, want in checks.items():
+            if not any(has(mod, attr) for mod, attr in (want if isinstance(want, list) else [want])):
                 missing.append(key)
         # the version that runs, and whether newer files wait for the backend to start again
         return {"missing": sorted(set(missing) | _DEGRADED), "version": _LOADED_VERSION, "checkout": _own_checkout(),

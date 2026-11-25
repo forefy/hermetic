@@ -13,6 +13,9 @@ import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+from _store import add_chat, writer  # noqa: E402
+
 spec = importlib.util.spec_from_file_location("plugin_api", HERE.parent / "dashboard" / "plugin_api.py")
 api = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(api)
@@ -25,20 +28,17 @@ CHATS = 12
 
 def store():
     """A real Hermes session store with a dozen short chats, each with one tool call."""
-    from hermes_state import SessionDB
     folder = Path(tempfile.mkdtemp(prefix="hermetic-reading-"))
-    db = SessionDB(db_path=folder / "state.db")
+    db = writer(folder / "state.db")
     for i in range(CHATS):
         sid = "chat-%d" % i
-        db.create_session(sid, "desktop", model="z-ai/glm-5.3")
         call = {"id": "call_%d" % i, "type": "function", "function": {"name": "terminal", "arguments": json.dumps({"command": "curl https://example.com/%d" % i})}}
-        for m in [{"role": "user", "content": "go", "timestamp": NOW - 60},
-                  {"role": "assistant", "content": "", "timestamp": NOW - 50, "tool_calls": [call]},
-                  {"role": "tool", "content": "ok", "tool_call_id": call["id"], "tool_name": "terminal", "timestamp": NOW - 49},
-                  {"role": "assistant", "content": "Done.", "timestamp": NOW - 40}]:
-            db.append_message(sid, **m)  # SessionDB hands plugins single appends only
+        add_chat(db, sid, [{"role": "user", "content": "go", "timestamp": NOW - 60},
+                           {"role": "assistant", "content": "", "timestamp": NOW - 50, "tool_calls": [call]},
+                           {"role": "tool", "content": "ok", "tool_call_id": call["id"], "tool_name": "terminal", "timestamp": NOW - 49},
+                           {"role": "assistant", "content": "Done.", "timestamp": NOW - 40}])
     db.close()
-    # and no token counters: those are the store's own columns here
+    # the token counters are the store's own columns: set here as a finished chat has them
     raw = sqlite3.connect(folder / "state.db")
     raw.execute("UPDATE sessions SET input_tokens = 10, output_tokens = 5, api_call_count = 2")
     raw.commit()
